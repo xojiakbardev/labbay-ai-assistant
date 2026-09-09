@@ -8,7 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.conversations.models import Conversation, Message
 
-HISTORY_LIMIT = 10
+# Instagram DM is a burst medium: people split one thought across three short
+# messages, so ten messages is barely three exchanges and a conversation loses
+# its thread almost immediately. Twenty covers a realistic sales conversation;
+# anything older is carried by the lead's known_facts/summary (CUSTOMER PROFILE)
+# and the conversation's working_state instead of by raw history.
+HISTORY_LIMIT = 20
 
 
 async def get_or_create_conversation(

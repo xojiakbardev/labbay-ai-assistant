@@ -1,16 +1,64 @@
-"""Product retrieval service — full-text + structured filters, no vector DB
-(plan §7). This is what the AI's search_products tool calls in Phase 7; it never
-returns more than `limit` rows and never the whole catalog."""
+"""Product retrieval — lexical tiers fused with semantic search.
+
+This is what the AI's search_products tool calls. It never returns more than
+`limit` rows and never the whole catalog.
+
+Four retrievers, in increasing order of how far they can stretch:
+
+1. full-text (tsvector), strict AND — the customer used the catalog's words
+2. full-text, OR + synonyms — the words are spread across different products
+3. trigram over normalized text — Cyrillic/Latin, apostrophes, typos
+4. embeddings — the customer described what they want instead of naming it
+
+The first three can only match words the catalog already contains, which is why
+"qishga issiq narsa kerak" used to return nothing at all: no product literally
+says "qish". The customer was expected to guess the catalog's vocabulary. The
+semantic tier is what removes that expectation.
+
+The lexical cascade is unchanged and still runs first — an exact keyword match
+is a stronger signal than a similar-sounding one, and the tiers each exist
+because of a specific bug. Semantics is fused on top with weighted RRF, so it
+adds recall without outranking precision, and it disappears entirely when
+embeddings aren't configured.
+"""
+import logging
 import re
 import uuid
+from collections import OrderedDict
 
 from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.ai.embeddings.base import EmbeddingError, EmbeddingProvider
+from app.ai.embeddings.factory import get_embedding_provider
+from app.core.config import get_settings
 from app.products.models import Product, ProductVariant
 
+logger = logging.getLogger("app.products.search")
+
 DEFAULT_LIMIT = 5
+
+# Reciprocal Rank Fusion's damping constant. 60 is the value from the original
+# paper and the usual default: high enough that rank 1 doesn't dominate, low
+# enough that deep results stop mattering.
+_RRF_K = 60
+
+# How many candidates each retriever contributes to the fusion. Wider than
+# `limit` so a product ranked 6th lexically and 1st semantically can still win.
+_CANDIDATE_POOL = 20
+
+# Cosine distance above which a "nearest" product isn't actually related.
+# Vector search always returns its N closest rows, however far away they are —
+# without this, a query matching nothing would still come back full of
+# confident-looking rubbish, which is worse than an honest empty result.
+# Tune against the eval suite (`python -m evals.run`), not by intuition.
+_SEMANTIC_MAX_DISTANCE = 0.62
+
+# Query embeddings are hit repeatedly — the same customer phrasing recurs across
+# retries and tool calls within one turn. Small, process-local, best-effort.
+_QUERY_VECTOR_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+_QUERY_VECTOR_CACHE_MAX = 256
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -136,6 +184,89 @@ async def _run(db, business_id, *, ts_query, price_max, only_available, limit, c
     return list(result.scalars().unique().all())
 
 
+
+async def _embed_query(provider: EmbeddingProvider, query: str) -> list[float]:
+    key = (provider.model, query.strip().lower())
+    cached = _QUERY_VECTOR_CACHE.get(key)
+    if cached is not None:
+        _QUERY_VECTOR_CACHE.move_to_end(key)
+        return cached
+
+    vector = await provider.embed_query(query)
+    _QUERY_VECTOR_CACHE[key] = vector
+    if len(_QUERY_VECTOR_CACHE) > _QUERY_VECTOR_CACHE_MAX:
+        _QUERY_VECTOR_CACHE.popitem(last=False)
+    return vector
+
+
+async def _semantic_candidates(
+    db, business_id, *, query, price_max, only_available, limit, color, size
+) -> list[Product]:
+    """Products whose meaning is close to the query, nearest first.
+
+    Returns [] — never raises — whenever embeddings can't help: not configured,
+    the API is down, nothing embedded yet. Semantic search is an enhancement on
+    top of the lexical tiers, and a customer waiting on a reply must not lose
+    their answer because an embedding call timed out.
+    """
+    provider = get_embedding_provider()
+    if provider is None or not query or not query.strip():
+        return []
+
+    try:
+        vector = await _embed_query(provider, query)
+    except EmbeddingError as exc:
+        logger.warning("[search] semantic tier skipped, embedding failed: %s", exc)
+        return []
+
+    distance = Product.embedding.cosine_distance(vector)
+    stmt = (
+        select(Product)
+        .options(selectinload(Product.variants), selectinload(Product.images))
+        .where(
+            Product.business_id == business_id,
+            Product.embedding.is_not(None),
+            # Vectors from a different model live in a different space, so
+            # comparing them is meaningless — ignore them until re-embedded.
+            Product.embedding_model == provider.model,
+            distance < _SEMANTIC_MAX_DISTANCE,
+        )
+    )
+    if only_available:
+        stmt = stmt.where(Product.availability.is_(True))
+    if price_max is not None:
+        stmt = stmt.where(Product.price.is_not(None), Product.price <= price_max)
+    if color:
+        stmt = stmt.where(_variant_filter("color", color))
+    if size:
+        stmt = stmt.where(_variant_filter("size", size))
+
+    stmt = stmt.order_by(distance).limit(limit)
+    try:
+        result = await db.execute(stmt)
+    except Exception as exc:  # noqa: BLE001 — a missing extension/column must not break search
+        logger.warning("[search] semantic tier skipped, query failed: %s", exc)
+        return []
+    return list(result.scalars().unique().all())
+
+
+def _rrf_fuse(rankings: list[tuple[list[Product], float]], limit: int) -> list[Product]:
+    """Reciprocal Rank Fusion: score(d) = sum over lists of weight / (k + rank).
+
+    Ranks rather than scores, because a ts_rank and a cosine distance aren't on
+    any common scale and normalising them is guesswork. A product both tiers
+    agree on rises above one that only a single tier found, which is exactly
+    the behaviour worth having.
+    """
+    scores: dict[uuid.UUID, float] = {}
+    products: dict[uuid.UUID, Product] = {}
+    for ranked, weight in rankings:
+        for rank, product in enumerate(ranked, start=1):
+            products.setdefault(product.id, product)
+            scores[product.id] = scores.get(product.id, 0.0) + weight / (_RRF_K + rank)
+    ordered = sorted(scores, key=lambda pid: scores[pid], reverse=True)
+    return [products[pid] for pid in ordered[:limit]]
+
 async def search_products(
     db: AsyncSession,
     business_id: uuid.UUID,
@@ -202,7 +333,23 @@ async def search_products(
             only_available=False, limit=limit, color=None, size=None,
         )
 
-    return matches
+    # The semantic tier runs regardless of whether the lexical ones found
+    # anything: it's the only one that can bridge "qishga issiq narsa" to a
+    # winter coat, and it also promotes a product the keyword tiers ranked low.
+    semantic = await _semantic_candidates(
+        db, business_id, query=query, price_max=price_max,
+        only_available=only_available, limit=_CANDIDATE_POOL, color=color, size=size,
+    )
+    if not semantic:
+        return matches
+    if not matches:
+        # Nothing matched the words but something matches the meaning. This is
+        # the case the whole tier exists for.
+        return semantic[:limit]
+
+    return _rrf_fuse(
+        [(matches, 1.0), (semantic, get_settings().semantic_fusion_weight)], limit
+    )
 
 
 async def get_product_by_id(db: AsyncSession, business_id: uuid.UUID, product_id: uuid.UUID) -> Product | None:

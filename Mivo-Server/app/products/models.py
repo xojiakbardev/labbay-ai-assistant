@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import Boolean, Computed, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 
 _SEARCH_VECTOR_EXPR = (
     "to_tsvector('simple', coalesce(name, '') || ' ' || coalesce(description, '') "
@@ -10,7 +11,14 @@ _SEARCH_VECTOR_EXPR = (
 )
 
 from app.common.mixins import TimestampMixin, UUIDPk
+from app.core.config import get_settings
 from app.core.db import Base
+
+
+# Pinned at import time rather than read per-query: the column width is part of
+# the schema, so it must match whatever the migration created, not whatever the
+# environment happens to say today.
+EMBEDDING_DIMENSIONS = get_settings().embedding_dimensions
 
 
 class Product(Base, UUIDPk, TimestampMixin):
@@ -40,6 +48,17 @@ class Product(Base, UUIDPk, TimestampMixin):
 
     # Normalized text for fuzzy cross-alphabet (Cyrillic <-> Latin) & typo matching
     search_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Semantic search vector. Null is normal and safe: a business without
+    # embeddings configured, or a product written while the embedding API was
+    # down, simply doesn't take part in the semantic tier (app/products/search.py).
+    # Width is pinned by EMBEDDING_DIMENSIONS — changing it needs a migration
+    # and a full re-embed, which is what embedding_hash detects.
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(EMBEDDING_DIMENSIONS), nullable=True
+    )
+    embedding_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # GENERATED ALWAYS ... STORED (DDL owned by the Alembic migration — this
     # Computed() mirror just tells the ORM to never include it in INSERT/UPDATE,

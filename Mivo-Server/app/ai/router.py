@@ -321,6 +321,10 @@ async def reset_sandbox(
 
     await db.execute(delete(Message).where(Message.conversation_id == conversation.id))
     conversation.status = "active"
+    # The sale-in-progress outlives the messages it came from, so a reset that
+    # only clears the transcript would leave the AI still holding the previous
+    # run's focus product, prices and open question.
+    conversation.working_state = {}
 
     if lead:
         await db.execute(delete(Lead).where(Lead.id == lead.id))

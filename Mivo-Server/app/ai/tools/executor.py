@@ -5,8 +5,15 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.conversation_state import fact_snapshot
 from app.conversations.models import Conversation
 from app.discounts.models import Discount
+from app.products.discovery import (
+    browse_products,
+    list_categories,
+    popular_products,
+    similar_products,
+)
 from app.products.media import get_display_image_url
 from app.products.models import Product
 from app.products.search import check_availability, get_product_by_id, search_products
@@ -50,6 +57,19 @@ def _product_summary(product: Product) -> dict:
     return summary
 
 
+# A model that never saw a real product UUID this turn (e.g. it's working from a
+# product name mentioned earlier in the chat text, not from a search_products
+# result it just got back) sometimes invents an ID-shaped string instead of
+# admitting it doesn't have one. A bare "invalid product_id" doesn't tell it what
+# to do next, so it has reported that literal error to the customer before —
+# spell out the fix so it self-corrects within the same turn instead.
+_INVALID_PRODUCT_ID = {
+    "error": "invalid product_id — this must be a real UUID from a search_products "
+    "result, not a name or invented ID. Call search_products first to get it, then "
+    "retry with the returned id."
+}
+
+
 def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: Conversation):
     """Returns (execute, escalation_state) — escalation_state is a plain dict
     the caller (run_turn) reads AFTER the turn to know whether request_human
@@ -64,7 +84,17 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
         "reason": None,
         "executed_tools": [],
         "active_discounts": [],
+        # product_id -> compact fact snapshot, recorded straight off the tool
+        # results so the conversation state carries prices the catalog actually
+        # returned rather than ones the model remembered
+        # (app/ai/conversation_state.py).
+        "product_facts": {},
     }
+
+    def _record_facts(*summaries: dict) -> None:
+        for summary in summaries:
+            if summary and summary.get("id"):
+                escalation_state["product_facts"][summary["id"]] = fact_snapshot(summary)
 
     async def execute(tool_name: str, arguments: dict[str, Any]) -> dict:
         escalation_state["executed_tools"].append({"name": tool_name, "arguments": arguments})
@@ -79,7 +109,9 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                 size=requested_size,
                 price_max=arguments.get("price_max"),
             )
-            response: dict[str, Any] = {"products": [_product_summary(p) for p in products]}
+            summaries = [_product_summary(p) for p in products]
+            _record_facts(*summaries)
+            response: dict[str, Any] = {"products": summaries}
 
             # search_products() falls back to the query/price match alone when
             # the exact size/color isn't carried on anything, so the model still
@@ -118,18 +150,49 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                 )
             return response
 
-        # A model that never saw a real product UUID this turn (e.g. it's
-        # working from a product name mentioned earlier in the chat text, not
-        # from a search_products result it just got back) sometimes invents
-        # an ID-shaped string instead of admitting it doesn't have one. A bare
-        # "invalid product_id" doesn't tell it what to do next, so it has
-        # reported that literal error to the customer before — spell out the
-        # fix so it self-corrects within the same turn instead.
-        _INVALID_PRODUCT_ID = {
-            "error": "invalid product_id — this must be a real UUID from a search_products "
-            "result, not a name or invented ID. Call search_products first to get it, then "
-            "retry with the returned id."
-        }
+        if tool_name == "browse_catalog":
+            categories = await list_categories(db, business_id)
+            sort_by = arguments.get("sort_by")
+            category = arguments.get("category")
+            price_max = arguments.get("price_max")
+
+            if sort_by == "popular" and not category and price_max is None:
+                products = await popular_products(db, business_id)
+            else:
+                products = await browse_products(
+                    db, business_id, category=category, price_max=price_max
+                )
+
+            summaries = [_product_summary(p) for p in products]
+            _record_facts(*summaries)
+            browse_response: dict[str, Any] = {
+                "categories": categories,
+                "products": summaries,
+            }
+            if category and not products:
+                # Don't let the model report an empty category as "we have
+                # nothing" — the categories list right there says otherwise.
+                browse_response["note"] = (
+                    f"Nothing available in '{category}' right now. Offer one of the other "
+                    "categories listed instead of telling the customer the shop is empty."
+                )
+            elif not categories and products:
+                browse_response["note"] = (
+                    "This business hasn't categorised its products, so the category list is "
+                    "empty. Describe what you can see in the products instead of asking the "
+                    "customer to pick a category."
+                )
+            return browse_response
+
+        if tool_name == "get_similar_products":
+            try:
+                anchor_id = uuid.UUID(str(arguments["product_id"]))
+            except (KeyError, ValueError):
+                return _INVALID_PRODUCT_ID
+            products = await similar_products(db, business_id, anchor_id)
+            summaries = [_product_summary(p) for p in products]
+            _record_facts(*summaries)
+            return {"products": summaries}
 
         if tool_name == "get_product":
             try:
@@ -137,7 +200,10 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
             except (KeyError, ValueError):
                 return _INVALID_PRODUCT_ID
             product = await get_product_by_id(db, business_id, product_id)
-            return {"product": _product_summary(product) if product else None}
+            summary = _product_summary(product) if product else None
+            if summary:
+                _record_facts(summary)
+            return {"product": summary}
 
         if tool_name == "check_product_availability":
             try:

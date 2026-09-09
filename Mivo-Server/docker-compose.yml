@@ -1,7 +1,9 @@
 
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector, not stock postgres: products.embedding needs the vector
+    # extension and its HNSW index (see the f5a6b7c8d9e0 migration).
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-mivo}

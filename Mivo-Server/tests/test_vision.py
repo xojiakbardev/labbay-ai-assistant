@@ -8,7 +8,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
-from app.ai.context.builder import build_message_history, _BASE_SYSTEM_PROMPT
+from app.ai.context.builder import MAX_MULTIMODAL_IMAGES, build_message_history, _BASE_SYSTEM_PROMPT
 from app.ai.orchestrator import run_turn
 from app.ai.provider.base import LLMProvider, LLMProviderError
 from app.businesses.models import Business
@@ -56,22 +56,54 @@ def test_build_message_history_multimodal_latest_and_token_saving_history():
         message_type="text",
     )
 
-    # 2. In turn 2, msg1 is now HISTORICAL (not latest)
-    # It must NOT include image_url to prevent inflating token costs!
+    # 2. In turn 2, msg1 is no longer the latest message — but "Narxi qancha?"
+    # is a question ABOUT that photo, so the image stays attached. Dropping it
+    # here (which is what this used to do, to save tokens) meant the model
+    # answered a question about a picture it could no longer see.
     history_turn2 = build_message_history([msg1, msg2, msg3])
     assert len(history_turn2) == 3
 
-    # Historical msg1 should now be plain text, preserving context without image_url
-    assert isinstance(history_turn2[0]["content"], str)
-    assert "[Mijoz rasm yubordi]" in history_turn2[0]["content"]
-    assert "https://cdn.instagram.com/p1.jpg" not in str(history_turn2[0]["content"])
-    assert "image_url" not in str(history_turn2[0]["content"])
+    assert isinstance(history_turn2[0]["content"], list)
+    assert history_turn2[0]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://cdn.instagram.com/p1.jpg"},
+    }
 
     # AI reply
     assert history_turn2[1]["content"] == "Ha, bu modelimiz mavjud!"
 
     # Latest message is text
     assert history_turn2[2]["content"] == "Narxi qancha?"
+
+
+def test_build_message_history_attaches_only_the_most_recent_images():
+    """Images are the expensive part of a multimodal context, so the window is
+    capped: anything older than MAX_MULTIMODAL_IMAGES degrades to a text marker."""
+    conv_id = uuid.uuid4()
+
+    def _image(name: str) -> Message:
+        return Message(
+            id=uuid.uuid4(),
+            conversation_id=conv_id,
+            sender_type="customer",
+            content=f"Shundan bormi? ({name})",
+            message_type="image",
+            attachment_url=f"https://cdn.instagram.com/{name}.jpg",
+            attachment_type="image",
+        )
+
+    first, second, third = _image("p1"), _image("p2"), _image("p3")
+    mapped = build_message_history([first, second, third])
+
+    assert MAX_MULTIMODAL_IMAGES == 2
+    # Oldest falls out of the window: text marker only, no image payload.
+    assert isinstance(mapped[0]["content"], str)
+    assert "[Mijoz rasm yubordi]" in mapped[0]["content"]
+    assert "p1.jpg" not in mapped[0]["content"]
+    # The two most recent stay attached.
+    for idx, name in ((1, "p2"), (2, "p3")):
+        assert isinstance(mapped[idx]["content"], list)
+        assert mapped[idx]["content"][1]["image_url"]["url"].endswith(f"{name}.jpg")
 
 
 def test_meta_webhook_payload_image_extraction():
@@ -120,10 +152,12 @@ def test_meta_webhook_payload_image_extraction():
 
 
 def test_system_prompt_includes_vision_instructions():
-    """Verify _BASE_SYSTEM_PROMPT contains the vision instructions."""
-    assert "If the customer's message includes an image" in _BASE_SYSTEM_PROMPT
+    """Verify _BASE_SYSTEM_PROMPT still instructs the model on inbound images:
+    inspect it, search the catalog from what it shows, and never claim to see
+    detail it isn't sure about."""
+    assert "Customer sends an image" in _BASE_SYSTEM_PROMPT
     assert "search_products" in _BASE_SYSTEM_PROMPT
-    assert "Never claim to see details you're not actually confident about" in _BASE_SYSTEM_PROMPT
+    assert "Never claim to see details you aren't confident about" in _BASE_SYSTEM_PROMPT
 
 
 class FailingVisionProvider(LLMProvider):
@@ -147,6 +181,7 @@ async def test_image_processing_error_falls_back_to_text_request(monkeypatch):
     conversation.id = uuid.uuid4()
     conversation.business_id = business.id
     conversation.customer_id = uuid.uuid4()
+    conversation.working_state = {}
 
     image_msg = Message(
         id=uuid.uuid4(),
@@ -160,7 +195,7 @@ async def test_image_processing_error_falls_back_to_text_request(monkeypatch):
     async def mock_get_recent_messages(db, conv_id, limit=10):
         return [image_msg]
 
-    async def mock_build_system_prompt(db, biz, cust_id):
+    async def mock_build_system_prompt(db, biz, cust_id, working_state=None):
         return "System prompt"
 
     monkeypatch.setattr("app.ai.orchestrator.get_recent_messages", mock_get_recent_messages)

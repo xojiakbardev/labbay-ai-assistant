@@ -54,6 +54,44 @@ class Settings(BaseSettings):
     openrouter_model: str = "google/gemini-2.5-flash"
     llm_request_timeout_seconds: float = 30.0
 
+    # A customer-facing sales reply and the bookkeeping that goes with it
+    # (lead score, trilingual summaries, extracted facts) are two different
+    # jobs, and forcing one model to do both inside one JSON schema is what
+    # made replies read as form-filling rather than selling. They now run as
+    # two calls, so each gets the model and sampling temperature it actually
+    # wants: the writer needs room to sound human, the analyst needs to be
+    # boringly deterministic. Both default to OPENROUTER_MODEL — set
+    # LLM_WRITER_MODEL to a stronger model (prose quality, and Uzbek fluency
+    # in particular, is where the small/cheap tier is weakest) and leave
+    # LLM_ANALYST_MODEL cheap.
+    llm_writer_model: str = ""
+    llm_analyst_model: str = ""
+    llm_writer_temperature: float = 0.75
+    llm_analyst_temperature: float = 0.0
+
+    # Semantic product search. Lexical search can only match words the catalog
+    # already contains, so "qishga issiq narsa kerak" finds nothing unless some
+    # product literally says "qish" — the customer has to guess the catalog's
+    # vocabulary. Embeddings close that gap.
+    #
+    # OpenRouter has no embeddings endpoint, so this is a separate key (OpenAI
+    # by default). Leave it unset and search falls back to full-text + trigram
+    # exactly as before — nothing breaks, it just can't bridge wording.
+    #
+    # `embedding_dimensions` is capped at 1536 because pgvector cannot build an
+    # HNSW index above 2000, and it must match the products.embedding column:
+    # changing either means a migration and a full re-embed.
+    embedding_enabled: bool = True
+    embedding_provider: str = "openai"
+    embedding_api_key: str = ""
+    embedding_model: str = "text-embedding-3-large"
+    embedding_dimensions: int = 1536
+    embedding_request_timeout_seconds: float = 15.0
+    # How much the semantic tier counts against the lexical one when both
+    # return results. Below 1.0 because an exact keyword match is still the
+    # stronger signal — semantics adds recall, it doesn't outrank precision.
+    semantic_fusion_weight: float = 0.6
+
     # Instagram / Meta
     meta_app_id: str = ""
     meta_app_secret: str = ""

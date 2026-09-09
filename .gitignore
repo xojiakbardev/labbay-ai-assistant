@@ -1,0 +1,17 @@
+# OS / editor cruft — the subprojects ignore these, the repo root didn't,
+# which is how .DS_Store ended up committed.
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Local env
+.env
+.env.local

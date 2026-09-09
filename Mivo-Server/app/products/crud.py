@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.products.embeddings import refresh_product_embedding
 from app.products.models import Product, ProductImage, ProductVariant
 from app.products.schemas import ProductCreate, ProductUpdate
 from app.products.search_normalize import normalize_for_search
@@ -71,6 +72,7 @@ async def create_product(
     db.add(product)
     await db.commit()
     await db.refresh(product, attribute_names=["variants", "images"])
+    await refresh_product_embedding(db, product)
     return product
 
 
@@ -129,6 +131,7 @@ async def update_product(db: AsyncSession, product: Product, data: ProductUpdate
 
     await db.commit()
     await db.refresh(product, attribute_names=["variants", "images"])
+    await refresh_product_embedding(db, product)
     return product
 
 

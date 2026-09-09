@@ -39,6 +39,12 @@ from app.webhooks.models import WebhookEvent
 # monkeypatch this to 0 so they don't pay the wall-clock cost.
 DEBOUNCE_SECONDS = 1.5
 
+# A reply that reads as two short messages is sent as two short messages
+# (app/ai/reply_parts.py). Delivering them back-to-back in the same
+# millisecond gives the game away, so there's a beat between them — the pause
+# a person spends typing the next line. Set to 0 to disable; tests do.
+PART_DELAY_SECONDS = 0.9
+
 # Conversation statuses under which the AI should stay silent — the business
 # owner (or a prior escalation) has taken this conversation off autopilot, so
 # a new inbound message must still be recorded for them to see, but must NOT
@@ -418,13 +424,6 @@ async def process_incoming_message(
             await db.commit()
             return
 
-        result = await run_turn(db, provider, business, conversation)
-        await db.commit()
-
-        lead, became_hot = await apply_qualification(
-            db, business.id, customer.id, conversation.id, result, raw_message_text=message_text
-        )
-
         access_token = decrypt_secret(account.access_token_encrypted)
 
         # Fetch / update customer Instagram profile (username/name) if not set
@@ -441,26 +440,47 @@ async def process_incoming_message(
             except Exception as e:
                 print(f"[InstagramService] Failed to fetch customer IG profile: {e}")
 
-        try:
-            ai_resp = await meta_client.send_message(
-                ig_business_id=account.ig_business_id,
-                access_token=access_token,
-                recipient_id=customer_ig_scoped_id,
-                text=result.reply,
-            )
-            if isinstance(ai_resp, dict) and ai_resp.get("message_id"):
-                latest_ai_msg = await db.scalar(
-                    select(Message).where(
-                        Message.conversation_id == conversation.id,
-                        Message.sender_type == "ai",
-                    ).order_by(Message.created_at.desc()).limit(1)
+        async def _deliver(messages: list[Message]) -> None:
+            """Called by run_turn the moment the reply is written and guarded —
+            before the analysis pass, which the customer has no reason to wait
+            for. Raising here fails the turn and lets Meta's retry have another
+            go, which is why the send is the one thing in this pipeline that
+            isn't swallowed."""
+            for index, message in enumerate(messages):
+                if index and PART_DELAY_SECONDS > 0:
+                    await asyncio.sleep(PART_DELAY_SECONDS)
+                ai_resp = await meta_client.send_message(
+                    ig_business_id=account.ig_business_id,
+                    access_token=access_token,
+                    recipient_id=customer_ig_scoped_id,
+                    text=message.content,
                 )
-                if latest_ai_msg is not None:
-                    latest_ai_msg.external_message_id = ai_resp["message_id"]
+                # Recording the ID per message is what stops Meta's echo of our
+                # own send coming back as a duplicate inbound one.
+                if isinstance(ai_resp, dict) and ai_resp.get("message_id"):
+                    message.external_message_id = ai_resp["message_id"]
                     await db.commit()
+
+        turn_state: dict = {}
+        try:
+            result = await run_turn(
+                db, provider, business, conversation,
+                escalation_state_out=turn_state, deliver=_deliver,
+            )
         except Exception as e:
             print(f"[InstagramService] Failed to send AI reply to {customer_ig_scoped_id}: {e}")
             raise
+        await db.commit()
+
+        if turn_state.get("analysis_failed"):
+            # The reply went out; only the scoring failed. Leaving the lead as
+            # it was beats overwriting a real assessment with a placeholder.
+            print(f"[InstagramService] Analysis failed after delivery for conversation {conversation.id}")
+            lead, became_hot = None, False
+        else:
+            lead, became_hot = await apply_qualification(
+                db, business.id, customer.id, conversation.id, result, raw_message_text=message_text
+            )
 
         if result.image_product_ids:
             image_urls = await resolve_sendable_images(db, business.id, result.image_product_ids)
