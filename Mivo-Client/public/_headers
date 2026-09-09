@@ -1,0 +1,31 @@
+# Cloudflare Pages reads this file and applies these headers to every
+# response it serves — see https://developers.cloudflare.com/pages/configuration/headers/
+#
+# This is an auth-gated dashboard with no first-party content worth indexing
+# or embedding, so the policy below is deliberately strict: no framing, no
+# unused browser APIs, a locked-down CSP.
+#
+# connect-src/img-src use `https:` (any HTTPS host) rather than a fixed
+# domain because the backend API and R2 media host are only known via
+# NUXT_PUBLIC_API_BASE / R2_PUBLIC_BASE_URL at deploy time, not at build time
+# of this file. Once you know your real api.yourbusiness.com and R2/CDN
+# domains, replace `https:` in both directives with the exact host(s) —
+# that's meaningfully tighter than any-HTTPS.
+#
+# script-src needs 'unsafe-inline': `npm run generate`'s output
+# (`ssr:false`, static SPA) ships two small inline <script> tags — an
+# importmap and the __NUXT__ hydration-config blob — and both embed a
+# per-build hash/buildId, so a static sha256- allowlist here would break on
+# every deploy. There's no v-html/innerHTML anywhere in this app (verified),
+# so this doesn't open an obvious injection sink today; the fully-correct fix
+# is a nonce-based CSP minted per-request, which needs an edge function (e.g.
+# a Cloudflare Pages _worker.js) in front of the static output — worth doing
+# if this ever needs to defend against a real XSS-injection surface.
+
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests

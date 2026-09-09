@@ -1,0 +1,12 @@
+## Production override — referenced by README's deploy instructions:
+##   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+##
+## docker-compose.yml alone is tuned for local dev (bind-mounted source +
+## --reload). This file removes both for prod: the image should run the code
+## baked in at build time, not whatever happens to be on the host, and
+## uvicorn shouldn't be watching the filesystem in a long-running deploy.
+
+services:
+  api:
+    volumes: !reset []
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

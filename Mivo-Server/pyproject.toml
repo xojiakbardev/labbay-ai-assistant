@@ -1,0 +1,37 @@
+[project]
+name = "mivo-server"
+version = "0.1.0"
+description = "Mivo AI backend — FastAPI + PostgreSQL AI sales assistant for Instagram DMs."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.10.4",
+    "email-validator==2.2.0",
+    "pydantic-settings==2.7.1",
+    "sqlalchemy==2.0.36",
+    "greenlet==3.1.1",
+    "alembic==1.14.0",
+    "psycopg[binary]==3.2.3",
+    "asyncpg==0.30.0",
+    "bcrypt==5.0.0",
+    "pyjwt==2.10.1",
+    "cryptography==44.0.0",
+    "boto3==1.35.90",
+    "httpx==0.28.1",
+    "python-multipart==0.0.20",
+    "apscheduler>=3.11.3",
+    "pywebpush>=2.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.1",
+    "pytest-cov==6.0.0",
+    "aiosqlite==0.20.0",
+    "respx==0.22.0",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,575 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn-vue/tailwind.css";
+@plugin "tailwindcss-animate";
+
+@custom-variant dark (&:where(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-heading: var(--font-sans);
+}
+
+@layer base {
+  :root {
+    --background: 240 10% 98%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 243 75% 59%;
+    --radius: 0.75rem;
+
+    --hot: #ef4444;
+    --hot-soft: rgba(239, 68, 68, 0.1);
+    --warm: #f59e0b;
+    --warm-soft: rgba(245, 158, 11, 0.1);
+    --cold: #64748b;
+    --cold-soft: rgba(100, 116, 139, 0.1);
+  }
+
+  .dark, [data-theme="dark"] {
+    --background: 240 10% 4%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 6%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 6%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 3.7% 12%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 12%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 12%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15%;
+    --input: 240 3.7% 15%;
+    --ring: 243 75% 59%;
+
+    --hot: #f87171;
+    --hot-soft: rgba(248, 113, 113, 0.12);
+    --warm: #fbbf24;
+    --warm-soft: rgba(251, 191, 36, 0.12);
+    --cold: #94a3b8;
+    --cold-soft: rgba(148, 163, 184, 0.12);
+  }
+
+  * {
+    @apply border-border outline-ring/50;
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100vh;
+  }
+}
+
+/* Base Utility Layout Classes */
+.app-layout {
+  @apply flex w-full min-h-screen bg-background text-foreground;
+}
+
+.sidebar {
+  @apply w-[250px] min-w-[250px] max-w-[250px] bg-card border-r border-border flex flex-col p-5 h-screen sticky top-0 shrink-0 z-40 justify-between;
+}
+
+.desktop-top-header {
+  @apply hidden md:flex h-14 items-center justify-between px-6 border-b border-border bg-card/60 backdrop-blur-md sticky top-0 z-30 shrink-0;
+}
+
+.content {
+  @apply flex-1 min-w-0 p-6 md:p-8 min-h-screen bg-background box-border !m-0;
+}
+
+.content:has(.conversations-page) {
+  @apply !p-0 overflow-hidden h-full max-h-full md:h-[calc(100vh-3.5rem)] md:min-h-0 flex flex-col;
+}
+
+/* Page Containers */
+.products-page,
+.leads-page,
+.ai-settings-page,
+.integrations-page,
+.superadmin-dashboard-page,
+.superadmin-businesses-page {
+  @apply w-full max-w-[1400px] m-0 box-border;
+}
+
+.conversations-page {
+  @apply w-full h-full max-w-full;
+}
+
+.page-header h1 {
+  @apply text-2xl font-bold text-foreground tracking-tight m-0;
+}
+
+.page-header p {
+  @apply text-sm text-muted-foreground mt-1;
+}
+
+/* Sidebar Navigation Links */
+.nav-link {
+  @apply flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-muted-foreground font-medium text-sm transition-all duration-200 border border-transparent hover:text-foreground hover:bg-accent;
+}
+
+.nav-link.active {
+  @apply bg-primary/10 text-primary border-primary/20 font-semibold shadow-sm;
+}
+
+.nav-link.active svg {
+  @apply text-primary;
+}
+
+/* Mobile Top Header (hidden on desktop) */
+.mobile-top-header {
+  @apply hidden fixed top-0 inset-x-0 z-40 items-center justify-between px-3.5 py-2.5 bg-card/95 backdrop-blur-md border-b border-border;
+}
+
+/* Mobile Bottom Navigation (hidden on desktop) */
+.mobile-bottom-bar {
+  @apply hidden fixed bottom-0 inset-x-0 z-40 items-center justify-around bg-card/95 backdrop-blur-md border-t border-border px-1 py-1 pb-[max(0.375rem,env(safe-area-inset-bottom))];
+}
+
+.mobile-nav-item {
+  @apply flex flex-col items-center justify-center gap-0.5 px-1 py-1 rounded-lg text-muted-foreground text-[0.65rem] font-medium border border-transparent transition-all duration-200 flex-1 min-w-0 text-center;
+}
+
+.mobile-nav-item.active {
+  @apply text-primary font-semibold;
+}
+
+@media (max-width: 900px) {
+  .mobile-top-header,
+  .mobile-bottom-bar {
+    @apply flex;
+  }
+
+  .sidebar {
+    @apply hidden;
+  }
+
+  .content {
+    @apply !pt-[4.5rem] !pb-[4.75rem] !px-3.5 sm:!px-6;
+  }
+
+  /* Beats the base rule's !p-0 (both !important, later in source wins) so the
+     chat actually sits below the fixed mobile top navbar and above the fixed
+     bottom tab bar instead of running under either. 4rem clears the ~61px
+     rendered header height with a little headroom. */
+  .content:has(.conversations-page) {
+    @apply !pt-14 !pb-16 h-dvh max-h-dvh overflow-hidden flex flex-col box-border min-h-0;
+  }
+
+  .content:has(.conversations-page.mobile-thread-active) {
+    @apply !p-0 !pt-0 !pb-0 h-dvh max-h-dvh overflow-hidden flex flex-col box-border min-h-0;
+  }
+
+  body:has(.mobile-thread-active) .mobile-top-header,
+  body:has(.mobile-thread-active) .mobile-bottom-bar,
+  main:has(.mobile-thread-active) .mobile-top-header,
+  main:has(.mobile-thread-active) .mobile-bottom-bar,
+  .mobile-top-header.chat-open,
+  .mobile-bottom-bar.chat-open,
+  .mobile-top-header.\!hidden,
+  .mobile-bottom-bar.\!hidden {
+    display: none !important;
+  }
+
+  .content:has(.conversations-page) .split-view {
+    height: 100%;
+    max-height: 100%;
+    min-height: 0;
+  }
+}
+
+/* Modal Dialog Backdrop */
+.modal-backdrop {
+  @apply fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4;
+}
+
+.modal-box {
+  @apply bg-card text-card-foreground border border-border shadow-xl rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 relative animate-in fade-in-0 zoom-in-95;
+}
+
+.modal-header {
+  @apply flex items-center justify-between mb-4 pb-3 border-b border-border;
+}
+
+.modal-title {
+  @apply text-lg font-semibold text-foreground m-0 tracking-tight flex items-center gap-2;
+}
+
+.modal-close {
+  @apply p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors duration-200 border border-transparent;
+}
+
+/* Form Elements */
+.form {
+  @apply flex flex-col gap-4;
+}
+
+.form-group {
+  @apply flex flex-col gap-1.5;
+}
+
+.form-group label {
+  @apply block text-sm font-medium text-foreground text-left;
+}
+
+.form-group input[type="text"],
+.form-group input[type="number"],
+.form-group input:not([type="file"]):not([type="checkbox"]),
+.form-group textarea,
+.form-group select {
+  @apply w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-normal text-foreground transition-all duration-200 placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring;
+}
+
+.form-group input[type="file"] {
+  @apply w-full text-sm text-muted-foreground file:mr-3 file:rounded-md file:border-0 file:bg-secondary file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-secondary-foreground;
+}
+
+.form-group textarea {
+  @apply resize-y min-h-[80px];
+}
+
+.grid-2 {
+  @apply grid grid-cols-1 sm:grid-cols-2 gap-4;
+}
+
+.file-dropzone {
+  @apply flex flex-col items-center justify-center gap-2 w-full rounded-lg border border-dashed border-border bg-muted/30 p-8 text-center cursor-pointer transition-all duration-200 hover:border-primary/40 hover:bg-muted/50;
+}
+
+/* Status Banners */
+.error {
+  @apply flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm font-medium text-destructive;
+}
+
+.success {
+  @apply flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-600 dark:text-emerald-400;
+}
+
+.muted {
+  @apply text-muted-foreground;
+}
+
+/* Generic Card (legacy alias for UiCard styling) */
+.card {
+  @apply bg-card text-card-foreground border border-border shadow-sm rounded-xl p-6 transition-all duration-200;
+}
+
+.card-icon {
+  @apply w-11 h-11 rounded-lg flex items-center justify-center;
+}
+
+/* Accordion Sections */
+.accordion-section {
+  @apply bg-card text-card-foreground border border-border shadow-sm rounded-xl overflow-hidden transition-all duration-200;
+}
+
+.accordion-header {
+  @apply flex items-center justify-between cursor-pointer select-none transition-colors duration-200 hover:bg-accent/50;
+}
+
+.accordion-header h3 {
+  @apply text-foreground font-semibold;
+}
+
+.accordion-content {
+  @apply border-t border-border flex flex-col gap-4 animate-in fade-in-0;
+}
+
+/* Toggle Switch */
+.switch-label {
+  @apply flex items-center justify-between gap-4 cursor-pointer;
+}
+
+.switch {
+  @apply relative inline-flex h-6 w-11 shrink-0 items-center;
+}
+
+.switch input {
+  @apply absolute inset-0 opacity-0 cursor-pointer m-0;
+}
+
+.switch .slider {
+  @apply absolute inset-0 rounded-full bg-muted border border-border transition-all duration-200;
+}
+
+.switch .slider::before {
+  content: "";
+  @apply absolute left-[3px] top-1/2 -translate-y-1/2 h-[18px] w-[18px] rounded-full bg-white shadow transition-all duration-200;
+}
+
+.switch input:checked + .slider {
+  @apply bg-primary border-primary;
+}
+
+.switch input:checked + .slider::before {
+  transform: translate(20px, -50%);
+}
+
+/* Connected Pill */
+.connected-pill {
+  @apply inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400;
+}
+
+/* Product Cards & Grid */
+.grid-cards {
+  @apply grid w-full;
+}
+
+.product-card {
+  @apply bg-card border border-border rounded-xl overflow-hidden flex flex-col justify-between transition-all duration-200 hover:shadow-md;
+}
+
+.product-category-tag {
+  @apply inline-block rounded-md bg-muted px-2 py-1 text-xs font-semibold text-muted-foreground border border-border;
+}
+
+.product-price {
+  @apply text-sm font-bold text-foreground;
+}
+
+.stock-badge {
+  @apply inline-flex items-center gap-1 rounded-md bg-red-500/90 backdrop-blur-sm px-2 py-1 text-[10px] font-semibold text-white border border-transparent whitespace-nowrap;
+}
+
+/* Product Variant Rows (size/color/stock editor) */
+.variant-row {
+  @apply grid grid-cols-[1fr_1fr_72px_auto_auto] items-center gap-2 mb-2;
+}
+
+.variant-input {
+  @apply h-9 w-full rounded-md border border-input bg-background px-2.5 text-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring placeholder:text-muted-foreground;
+}
+
+.variant-input-sm {
+  @apply px-2;
+}
+
+.variant-remove {
+  @apply flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive;
+}
+
+.variant-add {
+  @apply inline-flex items-center gap-1.5 rounded-md border border-dashed border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary hover:text-primary;
+}
+
+/* Table */
+.table-container {
+  @apply w-full overflow-x-auto rounded-xl border border-border bg-card;
+}
+
+.data-table {
+  @apply w-full border-collapse text-sm;
+}
+
+.data-table thead th {
+  @apply text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground bg-muted/50 px-4 py-3 border-b border-border;
+}
+
+.data-table tbody td {
+  @apply px-4 py-3 border-b border-border align-middle text-foreground last:border-b-0;
+}
+
+.data-table tbody tr:last-child td {
+  @apply border-b-0;
+}
+
+.data-table tbody tr:hover {
+  @apply bg-accent/40;
+}
+
+/* Lead Cards */
+.lead-card {
+  @apply bg-card border border-border rounded-xl transition-all duration-200 hover:shadow-md;
+}
+
+.lead-badge {
+  @apply border;
+}
+
+.lead-badge-hot {
+  background: var(--hot-soft);
+  color: var(--hot);
+  border-color: color-mix(in srgb, var(--hot) 30%, transparent);
+}
+
+.lead-badge-warm {
+  background: var(--warm-soft);
+  color: var(--warm);
+  border-color: color-mix(in srgb, var(--warm) 30%, transparent);
+}
+
+.lead-badge-cold {
+  background: var(--cold-soft);
+  color: var(--cold);
+  border-color: color-mix(in srgb, var(--cold) 30%, transparent);
+}
+
+.status-badge {
+  @apply inline-flex items-center rounded-full border font-semibold;
+}
+
+/* Messenger Split View */
+.split-view {
+  @apply grid grid-cols-[320px_1fr] md:grid-cols-[360px_1fr] w-full h-full max-h-full min-h-0 bg-card overflow-hidden;
+}
+
+.conversation-sidebar {
+  @apply flex flex-col border-r border-border bg-card h-full max-h-full min-h-0 overflow-hidden;
+}
+
+.thread-area {
+  @apply flex flex-col h-full max-h-full min-h-0 bg-background overflow-hidden relative;
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(155, 155, 155, 0.25) transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(155, 155, 155, 0.25);
+  border-radius: 9999px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(155, 155, 155, 0.45);
+}
+
+.conversation-item {
+  @apply flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-border/60 transition-all duration-200 border-l-2 border-l-transparent hover:bg-accent/50;
+}
+
+.conversation-item.active {
+  @apply bg-primary/5 border-l-primary;
+}
+
+.conversation-item-title {
+  @apply text-sm font-semibold text-foreground;
+}
+
+.avatar {
+  @apply flex items-center justify-center w-10 h-10 rounded-full bg-primary/10 text-primary font-bold text-sm shrink-0;
+}
+
+.bubble {
+  @apply rounded-xl px-4 py-3 shadow-sm border transition-all duration-200;
+  content-visibility: auto;
+  contain-intrinsic-size: 0 65px;
+}
+
+.bubble-customer {
+  @apply self-start bg-muted text-foreground border-border rounded-tl-sm;
+}
+
+.bubble-ai {
+  @apply self-end bg-primary/10 text-foreground border-primary/20 rounded-tr-sm;
+}
+
+.bubble-human {
+  @apply self-end bg-blue-500/10 text-foreground border-blue-500/25 rounded-tr-sm;
+}
+
+.ai-feedback-bar {
+  @apply flex items-center gap-1.5 mt-2 pt-2 border-t border-border/60;
+}
+
+.feedback-action-btn {
+  @apply inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground border border-transparent transition-all duration-200 hover:bg-accent hover:text-foreground;
+}
+
+.feedback-toast {
+  @apply fixed bottom-6 right-6 z-[60] flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-3 text-sm font-medium text-foreground shadow-xl animate-in fade-in-0 slide-in-from-bottom-2;
+}
+
+.mobile-back-btn {
+  display: none !important;
+}
+
+@media (max-width: 900px) {
+  .split-view {
+    @apply grid-cols-1;
+  }
+
+  .conversation-sidebar.mobile-hidden {
+    @apply hidden;
+  }
+
+  .thread-area {
+    @apply hidden;
+  }
+
+  .thread-area.mobile-visible {
+    @apply flex;
+  }
+
+  .mobile-back-btn {
+    display: inline-flex !important;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
