@@ -113,9 +113,9 @@ Rules that hold across the codebase:
   stay off in production.
 - **Auth**: refresh tokens are persisted (`refresh_tokens`) and rotate on use;
   reuse of a rotated token revokes the user's whole family. `/auth/logout` revokes.
-  Failed logins are throttled per email (`app/core/rate_limit.py`). Soft-deleting a
-  business revokes its owner's refresh tokens and `get_current_business` refuses it
-  immediately. The SSE stream authenticates with a 60-second `sse` ticket
+  Failed logins are throttled per email (`app/core/rate_limit.py`). A business with
+  `deleted_at` set (legacy soft delete) is refused by `get_current_business`; the
+  superadmin now deletes for real, owner account included. The SSE stream authenticates with a 60-second `sse` ticket
   (`POST /notifications/stream-ticket`), never the access token in a URL.
 - **Instagram OAuth** is session-bound: the callback only parks the code under a
   one-time completion id (`oauth_states`); the owner's logged-in dashboard finishes
@@ -397,12 +397,19 @@ the whole catalog is never handed to the model.
 - No self-serve signup. Businesses are created from `/superadmin/*`; the first
   superadmin is bootstrapped with `create_superadmin.py`, later ones by SQL.
   Payments are recorded manually (`Payment` model) — there is no payment gateway.
-- Plans (`app/billing`): the superadmin edits them (`/superadmin/plans`; never
-  deleted, switched off with `is_active`; one `is_default` plan goes to new
-  businesses) and sets a business's plan while extending its subscription
-  (`plan_id` changes only when sent; null = no plan, no limit). An Instagram AI
-  turn that recorded a reply counts once in `ai_reply_usage` (calendar month,
-  `BILLING_UTC_OFFSET_HOURS`); the sandbox, follow-ups and ready-made lines don't.
+- Plans (`app/billing`): the superadmin edits them (`/superadmin/plans`; one
+  `is_default` plan goes to new businesses; a plan can be deleted only while no
+  business is on it). A business gets its plan when created and on
+  `POST /superadmin/businesses/{id}/renew`, which starts it again *today*
+  (`billing.start_plan`: `plan_started_at` = now, subscription = now + months,
+  the reply count starts over). Null plan = no limit. An Instagram AI turn that
+  recorded a reply counts once in `ai_reply_usage`, keyed by the start of the
+  plan's current month (`billing_period`: months from `plan_started_at`, calendar
+  months in `BILLING_UTC_OFFSET_HOURS` without one); the sandbox, follow-ups and
+  ready-made lines don't count.
+- Deleting a business is a hard delete: its owner's user row goes and ON DELETE
+  CASCADE takes everything with it; `payments` and `ai_usage_logs` are SET NULL
+  so the platform's income and cost history stay.
   The owner is alerted (`plan_limit`) at `PLAN_WARN_FRACTION`, at the limit and
   when the AI stops (`PLAN_GRACE_FRACTION` past it); `limits.limit_reason` then
   hands conversations to a person. Owners see it on `GET /billing/usage`.

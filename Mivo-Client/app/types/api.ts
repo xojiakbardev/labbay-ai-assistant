@@ -273,9 +273,12 @@ export interface SuperadminBusiness {
   cost_last_30d_usd: number;
   plan_id: string | null;
   plan_name: string | null;
-  // This month; a null limit means unlimited.
-  ai_replies_this_month: number;
+  plan_started_at: string | null;
+  // The plan's current month (it runs from plan_started_at); a null limit
+  // means unlimited.
+  ai_replies_used: number;
   ai_replies_limit: number | null;
+  usage_period_end: string;
 }
 
 // A tariff the superadmin edits; monthly_ai_replies null = unlimited.

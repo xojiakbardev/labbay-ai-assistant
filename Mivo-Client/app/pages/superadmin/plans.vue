@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Plus, Check, Pencil, Tags } from "@lucide/vue";
+import { Plus, Check, Pencil, Star, Tags, Trash2 } from "@lucide/vue";
 import type { Plan, PlanInput } from "~/types/api";
 
 definePageMeta({ layout: "superadmin" });
@@ -74,6 +74,25 @@ function openEdit(plan: Plan) {
   showForm.value = true;
 }
 
+// --- Delete: only a plan no business is on ---
+const deleteTarget = ref<Plan | null>(null);
+const deleting = ref(false);
+
+async function confirmDelete() {
+  if (!deleteTarget.value) return;
+  deleting.value = true;
+  error.value = null;
+  try {
+    await api.deletePlan(deleteTarget.value.id);
+    deleteTarget.value = null;
+    await load();
+  } catch (err) {
+    error.value = errorText(err, "superadmin.plans.deleteError");
+  } finally {
+    deleting.value = false;
+  }
+}
+
 async function submit() {
   saving.value = true;
   error.value = null;
@@ -101,6 +120,7 @@ async function submit() {
 </script>
 
 <template>
+  <TooltipProvider :delay-duration="200">
   <div class="superadmin-plans-page">
     <div class="page-header mb-5 flex items-start justify-between flex-wrap gap-3">
       <div class="max-w-2xl">
@@ -135,31 +155,70 @@ async function submit() {
             <TableHead>{{ t("superadmin.plans.price") }}</TableHead>
             <TableHead>{{ t("superadmin.plans.limit") }}</TableHead>
             <TableHead>{{ t("superadmin.plans.businesses") }}</TableHead>
-            <TableHead>{{ t("superadmin.plans.status") }}</TableHead>
-            <TableHead class="text-right"></TableHead>
+            <TableHead class="text-center">{{ t("superadmin.plans.status") }}</TableHead>
+            <TableHead class="w-24"><span class="sr-only">{{ t("superadmin.plans.actions") }}</span></TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           <TableRow v-for="p in plans" :key="p.id" :class="{ 'opacity-60': !p.is_active }">
             <TableCell>
-              <div class="flex items-center gap-2 flex-wrap">
+              <div class="flex items-center gap-2">
                 <span class="font-semibold text-foreground">{{ p.name }}</span>
-                <Badge v-if="p.is_default" variant="outline" class="text-[11px] font-medium">
-                  {{ t("superadmin.plans.defaultBadge") }}
-                </Badge>
+                <Tooltip v-if="p.is_default">
+                  <TooltipTrigger as-child>
+                    <Star :size="14" class="text-amber-500 fill-amber-500 shrink-0" :aria-label="t('superadmin.plans.defaultBadge')" />
+                  </TooltipTrigger>
+                  <TooltipContent>{{ t("superadmin.plans.defaultBadge") }}</TooltipContent>
+                </Tooltip>
               </div>
             </TableCell>
-            <TableCell class="font-mono text-sm">{{ fmtPrice(p) }}</TableCell>
-            <TableCell class="font-mono text-sm">{{ fmtLimit(p.monthly_ai_replies) }}</TableCell>
-            <TableCell class="text-sm">{{ p.businesses_count }}</TableCell>
-            <TableCell class="text-sm" :class="p.is_active ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'">
-              {{ p.is_active ? t("superadmin.plans.active") : t("superadmin.plans.inactive") }}
+            <TableCell class="font-mono text-sm tabular-nums">{{ fmtPrice(p) }}</TableCell>
+            <TableCell class="font-mono text-sm tabular-nums">{{ fmtLimit(p.monthly_ai_replies) }}</TableCell>
+            <TableCell class="text-sm tabular-nums">{{ p.businesses_count }}</TableCell>
+            <TableCell class="text-center">
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <span
+                    class="inline-block size-2.5 rounded-full cursor-default"
+                    :class="p.is_active ? 'bg-emerald-500' : 'bg-muted-foreground/40'"
+                    role="img"
+                    :aria-label="p.is_active ? t('superadmin.plans.active') : t('superadmin.plans.inactive')"
+                  />
+                </TooltipTrigger>
+                <TooltipContent>{{ p.is_active ? t("superadmin.plans.active") : t("superadmin.plans.inactive") }}</TooltipContent>
+              </Tooltip>
             </TableCell>
-            <TableCell class="text-right">
-              <Button variant="outline" size="sm" class="gap-1.5 h-8 text-xs" @click="openEdit(p)">
-                <Pencil :size="14" />
-                <span>{{ t("superadmin.plans.edit") }}</span>
-              </Button>
+            <TableCell>
+              <div class="flex items-center justify-end gap-1">
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Button variant="ghost" size="icon" class="h-8 w-8" :aria-label="t('superadmin.plans.edit')" @click="openEdit(p)">
+                      <Pencil :size="15" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{{ t("superadmin.plans.edit") }}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <!-- A disabled button gets no hover events; the span carries the tooltip. -->
+                    <span class="inline-flex">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        class="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                        :disabled="p.businesses_count > 0"
+                        :aria-label="t('superadmin.plans.delete')"
+                        @click="deleteTarget = p"
+                      >
+                        <Trash2 :size="15" />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {{ p.businesses_count > 0 ? t("superadmin.plans.deleteBlocked") : t("superadmin.plans.delete") }}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
             </TableCell>
           </TableRow>
         </TableBody>
@@ -221,5 +280,22 @@ async function submit() {
         </form>
       </DialogContent>
     </Dialog>
+
+    <Dialog :open="!!deleteTarget" @update:open="(v) => { if (!v) deleteTarget = null }">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle class="text-destructive">{{ t("superadmin.plans.deleteTitle") }}</DialogTitle>
+        </DialogHeader>
+        <p class="text-sm text-foreground">{{ t("superadmin.plans.deleteConfirm", { name: deleteTarget?.name ?? "" }) }}</p>
+        <div class="flex items-center justify-end gap-3 mt-2">
+          <Button variant="outline" @click="deleteTarget = null">{{ t("common.cancel") }}</Button>
+          <Button variant="destructive" class="gap-2" :disabled="deleting" @click="confirmDelete">
+            <Trash2 :size="16" />
+            {{ deleting ? t("superadmin.plans.deleting") : t("superadmin.plans.delete") }}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   </div>
+  </TooltipProvider>
 </template>

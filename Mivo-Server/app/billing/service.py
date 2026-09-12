@@ -1,6 +1,8 @@
 """Plans and the monthly AI-reply count behind them. A reply is one AI turn on
 Instagram (however many parts it's split into); the sandbox, follow-ups and
-ready-made lines don't count."""
+ready-made lines don't count. A plan's months run from the day it was started
+or renewed; a business without a start date counts calendar months."""
+import calendar
 import datetime as dt
 import logging
 import math
@@ -21,20 +23,34 @@ _settings = get_settings()
 _TZ = dt.timezone(dt.timedelta(hours=_settings.billing_utc_offset_hours))
 
 
-def billing_period(now: dt.datetime | None = None) -> tuple[dt.date, dt.date]:
-    """(first day of this month, first day of the next) in the billing zone."""
-    today = (now or dt.datetime.now(dt.timezone.utc)).astimezone(_TZ).date()
-    start = today.replace(day=1)
-    end = (start + dt.timedelta(days=32)).replace(day=1)
-    return start, end
+def add_months(moment: dt.datetime, months: int) -> dt.datetime:
+    """Same day and time, `months` later; the 31st becomes the month's last day."""
+    total = moment.month - 1 + months
+    year, month = moment.year + total // 12, total % 12 + 1
+    return moment.replace(year=year, month=month, day=min(moment.day, calendar.monthrange(year, month)[1]))
+
+
+def billing_period(anchor: dt.datetime | None, now: dt.datetime | None = None) -> tuple[dt.datetime, dt.datetime]:
+    """(start, end) of the month `now` falls in, counted from `anchor` (the
+    plan's start); without one, the calendar month in the billing zone."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if anchor is None:
+        local = now.astimezone(_TZ)
+        start = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, add_months(start, 1)
+    months = max(0, (now.year - anchor.year) * 12 + now.month - anchor.month)
+    start = add_months(anchor, months)
+    if start > now and months > 0:
+        start = add_months(anchor, months - 1)
+    return start, add_months(start, 1)
 
 
 @dataclass
 class Usage:
     plan: Plan | None
     used: int
-    period_start: dt.date
-    period_end: dt.date
+    period_start: dt.datetime
+    period_end: dt.datetime
 
     @property
     def limit(self) -> int | None:
@@ -59,7 +75,7 @@ class Usage:
 
 
 async def usage(db: AsyncSession, business: Business, now: dt.datetime | None = None) -> Usage:
-    start, end = billing_period(now)
+    start, end = billing_period(business.plan_started_at, now)
     plan = await db.get(Plan, business.plan_id) if business.plan_id else None
     used = await db.scalar(
         select(AiReplyUsage.replies).where(
@@ -69,19 +85,23 @@ async def usage(db: AsyncSession, business: Business, now: dt.datetime | None = 
     return Usage(plan=plan, used=int(used or 0), period_start=start, period_end=end)
 
 
-async def usage_by_business(db: AsyncSession) -> dict[uuid.UUID, int]:
-    """This month's replies for every business that has any."""
-    start, _ = billing_period()
+async def used_by_business(db: AsyncSession, businesses: list[Business]) -> dict[uuid.UUID, int]:
+    """Each business's replies in its own current month."""
+    starts = {b.id: billing_period(b.plan_started_at)[0] for b in businesses}
+    if not starts:
+        return {}
     rows = await db.execute(
-        select(AiReplyUsage.business_id, AiReplyUsage.replies).where(AiReplyUsage.period_start == start)
+        select(AiReplyUsage.business_id, AiReplyUsage.period_start, AiReplyUsage.replies).where(
+            AiReplyUsage.business_id.in_(starts), AiReplyUsage.period_start >= min(starts.values())
+        )
     )
-    return {business_id: replies for business_id, replies in rows.all()}
+    return {bid: replies for bid, start, replies in rows.all() if starts.get(bid) == start}
 
 
 async def record_ai_reply(db: AsyncSession, business: Business) -> Usage:
     """Counts one AI reply; the usage right after it (exact even with other
     conversations counting at the same time). Commits."""
-    start, end = billing_period()
+    start, end = billing_period(business.plan_started_at)
     total = (
         await db.execute(
             insert(AiReplyUsage)
@@ -130,6 +150,15 @@ def crossing_alert(current: Usage) -> tuple[str, str] | None:
             f"Bu oy {used} / {limit} AI javob ishlatildi.",
         )
     return None
+
+
+def start_plan(business: Business, plan_id: uuid.UUID | None, months: int, now: dt.datetime | None = None) -> None:
+    """The plan starts now: a new month of replies and the subscription runs
+    `months` from today, whatever was left of the old one."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    business.plan_id = plan_id
+    business.plan_started_at = now
+    business.subscription_expires_at = add_months(now, months)
 
 
 async def default_plan(db: AsyncSession) -> Plan | None:

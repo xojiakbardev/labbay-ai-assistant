@@ -57,6 +57,9 @@ class Business(Base, UUIDPk, TimestampMixin):
     plan_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("plans.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # When the plan was last started or renewed: its months (and the reply
+    # count) run from here. Null = calendar months.
+    plan_started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Soft delete: superadmin "deleting" a business/owner. Row stays (leads,
     # conversations, usage history all reference it) — deleted_at set instead.

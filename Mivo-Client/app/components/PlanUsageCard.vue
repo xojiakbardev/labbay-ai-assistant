@@ -11,8 +11,7 @@ const { t, locale } = useI18n();
 onMounted(refresh);
 
 const fmt = (n: number) => new Intl.NumberFormat("uz-UZ").format(n);
-// Dates come as "YYYY-MM-DD"; noon keeps them on the same day in any zone.
-const fmtDay = (day: string) => formatFullDate(`${day}T12:00:00`, locale.value);
+const fmtDay = (iso: string) => formatFullDate(iso, locale.value);
 
 const percent = computed(() => {
   const u = usage.value;

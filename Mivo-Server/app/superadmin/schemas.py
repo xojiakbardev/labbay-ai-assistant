@@ -19,7 +19,10 @@ class CreateBusinessRequest(BaseModel):
     # form, which is exactly why there isn't one — see module docstring).
     password: str = Field(min_length=1, max_length=72)
     business_name: str = Field(min_length=1, max_length=255)
+    # How long the subscription runs from today.
     trial_days: int = Field(default=14, ge=0, le=365)
+    # Not sent: the default plan. Null: no plan (no limit).
+    plan_id: uuid.UUID | None = None
 
     @field_validator("password")
     @classmethod
@@ -44,22 +47,23 @@ class SuperadminBusinessOut(BaseModel):
     cost_last_30d_usd: float
     plan_id: uuid.UUID | None
     plan_name: str | None
-    # This month; limit null = unlimited.
-    ai_replies_this_month: int
+    plan_started_at: dt.datetime | None
+    # The plan's current month; limit null = unlimited.
+    ai_replies_used: int
     ai_replies_limit: int | None
+    usage_period_end: dt.datetime
 
 
-class ExtendSubscriptionRequest(BaseModel):
-    """Extends/sets the expiry date. Optionally records the payment that
-    prompted it and sets the plan — all in one call since in practice a
-    superadmin only ever touches this screen because someone just paid.
-    `plan_id` changes the plan only when sent; null = no plan (unlimited)."""
+class RenewPlanRequest(BaseModel):
+    """Someone paid: the plan (null = none, no limit) starts again today for
+    `months`, and the payment is recorded — one call, because a superadmin
+    only opens this because money arrived."""
 
-    subscription_expires_at: dt.datetime
+    plan_id: uuid.UUID | None
+    months: int = Field(default=1, ge=1, le=24)
     payment_amount: float | None = Field(default=None, gt=0)
     payment_currency: str = Field(default="UZS", min_length=3, max_length=3)
     payment_note: str | None = Field(default=None, max_length=500)
-    plan_id: uuid.UUID | None = None
 
 
 class BusinessAiSuspendRequest(BaseModel):

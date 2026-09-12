@@ -1,7 +1,7 @@
 import datetime as dt
 import uuid
 
-from sqlalchemy import Boolean, Date, ForeignKey, Index, Integer, Numeric, String, false, text, true
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, false, text, true
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,12 +30,13 @@ class Plan(Base, UUIDPk, TimestampMixin):
 
 
 class AiReplyUsage(Base):
-    """AI replies a business received on Instagram in one billing month."""
+    """AI replies a business received on Instagram in one billing month (from
+    the plan's start, see app/billing/service.py:billing_period)."""
 
     __tablename__ = "ai_reply_usage"
 
     business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), primary_key=True
     )
-    period_start: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    period_start: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     replies: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")

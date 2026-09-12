@@ -14,7 +14,7 @@ from app.superadmin import service
 from app.superadmin.schemas import (
     BusinessAiSuspendRequest,
     CreateBusinessRequest,
-    ExtendSubscriptionRequest,
+    RenewPlanRequest,
     RevenuePoint,
     StatsOut,
     SuperadminBusinessOut,
@@ -33,8 +33,13 @@ async def create_business(
     """Onboards a business owner. Returns tokens purely as a convenience (e.g.
     to hand the owner a working session immediately) — the superadmin's own
     session is untouched."""
+    plan_chosen = "plan_id" in body.model_fields_set
+    if body.plan_id is not None and await db.get(Plan, body.plan_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
     try:
-        user = await service.create_business(db, body.email, body.password, body.business_name, body.trial_days)
+        user = await service.create_business(
+            db, body.email, body.password, body.business_name, body.trial_days, body.plan_id, plan_chosen
+        )
     except auth_service.AuthError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     access, refresh = await auth_service.issue_tokens(db, user.id)
@@ -49,29 +54,21 @@ async def list_businesses(
     return await service.list_businesses(db)
 
 
-@router.patch("/businesses/{business_id}/subscription", response_model=SuperadminBusinessOut)
-async def extend_subscription(
+@router.post("/businesses/{business_id}/renew", response_model=SuperadminBusinessOut)
+async def renew_plan(
     business_id: uuid.UUID,
-    body: ExtendSubscriptionRequest,
+    body: RenewPlanRequest,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(get_current_superadmin),
 ) -> dict:
     business = await service.get_business_or_404(db, business_id)
     if business is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Business not found.")
-    change_plan = "plan_id" in body.model_fields_set
-    if change_plan and body.plan_id is not None and await db.get(Plan, body.plan_id) is None:
+    if body.plan_id is not None and await db.get(Plan, body.plan_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
-    await service.extend_subscription(
-        db,
-        business,
-        admin.id,
-        body.subscription_expires_at,
-        body.payment_amount,
-        body.payment_currency,
-        body.payment_note,
-        plan_id=body.plan_id,
-        change_plan=change_plan,
+    await service.renew_plan(
+        db, business, admin.id, body.plan_id, body.months,
+        body.payment_amount, body.payment_currency, body.payment_note,
     )
     return await service.get_business_detail(db, business_id)
 
@@ -100,12 +97,24 @@ async def update_plan(
     db: AsyncSession = Depends(get_db),
     _admin: User = Depends(get_current_superadmin),
 ) -> dict:
-    """A plan is never deleted (businesses and payments point at it) —
-    switch it off with is_active instead."""
     plan = await db.get(Plan, plan_id)
     if plan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
     return await service.update_plan(db, plan, body)
+
+
+@router.delete("/plans/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_plan(
+    plan_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_current_superadmin),
+) -> None:
+    """Only a plan no business is on; otherwise move them first."""
+    plan = await db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
+    if not await service.delete_plan(db, plan):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Businesses are still on this plan.")
 
 
 @router.patch("/businesses/{business_id}/ai", response_model=SuperadminBusinessOut)
@@ -128,12 +137,12 @@ async def delete_business(
     db: AsyncSession = Depends(get_db),
     _admin: User = Depends(get_current_superadmin),
 ) -> None:
-    """Soft delete — see Business.deleted_at. Blocks the owner's login and AI
-    auto-replies; existing leads/conversations/usage history are untouched."""
+    """Hard delete of the business, its owner and all its data — see
+    service.delete_business. There is no undo."""
     business = await service.get_business_or_404(db, business_id)
-    if business is None or business.deleted_at is not None:
+    if business is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Business not found.")
-    await service.soft_delete_business(db, business)
+    await service.delete_business(db, business)
 
 
 @router.get("/stats", response_model=StatsOut)

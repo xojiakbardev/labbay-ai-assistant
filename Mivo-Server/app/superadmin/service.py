@@ -5,7 +5,7 @@ import datetime as dt
 import uuid
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.models import AiUsageLog, Payment
@@ -29,15 +29,24 @@ def _day_start(now: dt.datetime) -> dt.datetime:
 
 
 async def create_business(
-    db: AsyncSession, email: str, password: str, business_name: str, trial_days: int
+    db: AsyncSession,
+    email: str,
+    password: str,
+    business_name: str,
+    days: int,
+    plan_id: uuid.UUID | None,
+    plan_chosen: bool,
 ) -> User:
-    """A new business starts on the default plan, if one is set."""
-    user = await auth_service.signup(db, email, password, business_name, trial_days=trial_days)
-    plan = await billing.default_plan(db)
-    if plan is not None:
-        business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
-        business.plan_id = plan.id
-        await db.commit()
+    """The chosen plan (not chosen: the default one) starts today and the
+    subscription runs `days` from today."""
+    user = await auth_service.signup(db, email, password, business_name, trial_days=days)
+    if not plan_chosen:
+        default = await billing.default_plan(db)
+        plan_id = default.id if default else None
+    business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
+    business.plan_id = plan_id
+    business.plan_started_at = dt.datetime.now(dt.timezone.utc)
+    await db.commit()
     return user
 
 
@@ -47,13 +56,15 @@ def _to_out(
     cost_last_30d: float,
     now: dt.datetime,
     plan: Plan | None = None,
-    replies_this_month: int = 0,
+    replies_used: int = 0,
 ) -> dict:
     return {
         "plan_id": business.plan_id,
         "plan_name": plan.name if plan else None,
-        "ai_replies_this_month": replies_this_month,
+        "plan_started_at": business.plan_started_at,
+        "ai_replies_used": replies_used,
         "ai_replies_limit": plan.monthly_ai_replies if plan else None,
+        "usage_period_end": billing.billing_period(business.plan_started_at, now)[1],
         "id": business.id,
         "name": business.name,
         "owner_email": owner_email,
@@ -92,7 +103,7 @@ async def list_businesses(db: AsyncSession) -> list[dict]:
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
     cost_by_business = await _cost_since(db, since)
-    replies = await billing.usage_by_business(db)
+    replies = await billing.used_by_business(db, [business for business, _, _ in rows])
     now = dt.datetime.now(dt.timezone.utc)
 
     return [
@@ -125,20 +136,19 @@ async def get_business_or_404(db: AsyncSession, business_id: uuid.UUID) -> Busin
     return await db.get(Business, business_id)
 
 
-async def extend_subscription(
+async def renew_plan(
     db: AsyncSession,
     business: Business,
     admin_user_id: uuid.UUID,
-    new_expires_at: dt.datetime,
+    plan_id: uuid.UUID | None,
+    months: int,
     payment_amount: float | None,
     payment_currency: str,
     payment_note: str | None,
-    plan_id: uuid.UUID | None = None,
-    change_plan: bool = False,
 ) -> Business:
-    business.subscription_expires_at = new_expires_at
-    if change_plan:
-        business.plan_id = plan_id
+    """Someone paid: the plan starts again today (billing.start_plan), and the
+    payment is recorded."""
+    billing.start_plan(business, plan_id, months)
     if payment_amount:
         db.add(
             Payment(
@@ -216,15 +226,26 @@ async def set_ai_suspended(db: AsyncSession, business: Business, ai_suspended: b
     return business
 
 
-async def soft_delete_business(db: AsyncSession, business: Business) -> None:
-    """Marks the business (and its owner's access) deleted without touching
-    any row a lead/conversation/usage-log foreign key points at — see
-    Business.deleted_at. The owner's sessions end now: their refresh tokens
-    are revoked, and get_current_business refuses the business outright."""
-    business.deleted_at = dt.datetime.now(dt.timezone.utc)
-    business.ai_suspended = True
-    await auth_service.revoke_all_refresh_tokens(db, business.owner_user_id)
+async def delete_business(db: AsyncSession, business: Business) -> None:
+    """Hard delete: the owner's account goes, and with it (ON DELETE CASCADE)
+    the business and everything in it — catalog, customers, conversations,
+    leads, integrations. Payments and AI cost logs stay for the platform's
+    books, detached from it."""
+    owner = await db.get(User, business.owner_user_id)
+    if owner is not None and owner.is_superadmin:
+        await db.delete(business)  # never the platform's own admin account
+    else:
+        await db.execute(delete(User).where(User.id == business.owner_user_id))
     await db.commit()
+
+
+async def delete_plan(db: AsyncSession, plan: Plan) -> bool:
+    """False, and nothing deleted, while a business is on it."""
+    if await db.scalar(select(func.count()).select_from(Business).where(Business.plan_id == plan.id)):
+        return False
+    await db.delete(plan)
+    await db.commit()
+    return True
 
 
 async def get_openrouter_balance() -> tuple[float | None, float | None]:

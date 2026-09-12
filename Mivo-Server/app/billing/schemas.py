@@ -62,8 +62,8 @@ class PlanUpdate(BaseModel):
 
 class UsageOut(BaseModel):
     plan: PlanOut | None
-    period_start: dt.date
-    period_end: dt.date
+    period_start: dt.datetime
+    period_end: dt.datetime
     ai_replies_used: int
     # Null = unlimited. The AI stops at the hard limit (limit + grace).
     ai_replies_limit: int | None

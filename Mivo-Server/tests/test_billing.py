@@ -8,17 +8,34 @@ from app.billing import service as billing
 from tests.conftest import create_superadmin_and_headers
 
 
-def test_months_are_counted_in_tashkent_time() -> None:
-    late_utc = dt.datetime(2026, 9, 30, 20, 0, tzinfo=dt.timezone.utc)  # 1 Oct, 01:00 in Tashkent
-    assert billing.billing_period(late_utc) == (dt.date(2026, 10, 1), dt.date(2026, 11, 1))
-    assert billing.billing_period(dt.datetime(2026, 12, 15, tzinfo=dt.timezone.utc)) == (
-        dt.date(2026, 12, 1), dt.date(2027, 1, 1),
+UTC = dt.timezone.utc
+TASHKENT = dt.timezone(dt.timedelta(hours=5))
+
+
+def test_without_a_plan_start_months_are_calendar_months_in_tashkent() -> None:
+    late_utc = dt.datetime(2026, 9, 30, 20, 0, tzinfo=UTC)  # 1 Oct, 01:00 in Tashkent
+    assert billing.billing_period(None, late_utc) == (
+        dt.datetime(2026, 10, 1, tzinfo=TASHKENT), dt.datetime(2026, 11, 1, tzinfo=TASHKENT),
+    )
+
+
+def test_a_plan_month_runs_from_the_day_it_started() -> None:
+    started = dt.datetime(2026, 1, 31, 10, 0, tzinfo=UTC)
+    assert billing.billing_period(started, dt.datetime(2026, 2, 15, tzinfo=UTC)) == (
+        started, dt.datetime(2026, 2, 28, 10, 0, tzinfo=UTC),  # no 31st in February
+    )
+    assert billing.billing_period(started, dt.datetime(2026, 3, 31, 9, 0, tzinfo=UTC))[0] == dt.datetime(
+        2026, 2, 28, 10, 0, tzinfo=UTC
+    )
+    assert billing.billing_period(started, dt.datetime(2026, 3, 31, 11, 0, tzinfo=UTC))[0] == dt.datetime(
+        2026, 3, 31, 10, 0, tzinfo=UTC
     )
 
 
 def _usage(used: int, limit: int | None) -> billing.Usage:
     plan = SimpleNamespace(monthly_ai_replies=limit) if limit is not None else None
-    return billing.Usage(plan=plan, used=used, period_start=dt.date(2026, 9, 1), period_end=dt.date(2026, 10, 1))
+    start = dt.datetime(2026, 9, 1, tzinfo=UTC)
+    return billing.Usage(plan=plan, used=used, period_start=start, period_end=billing.add_months(start, 1))
 
 
 @pytest.mark.parametrize(
@@ -40,7 +57,7 @@ def test_the_ai_stops_after_the_grace(monkeypatch) -> None:
     assert billing.crossing_alert(_usage(10_000, None)) is None
 
 
-def test_superadmin_edits_plans_and_sets_one_when_extending(client) -> None:
+def test_superadmin_edits_plans_and_renews_onto_one(client) -> None:
     admin = create_superadmin_and_headers()
     trial = client.post(
         "/superadmin/plans", json={"name": "Sinov", "price": 0, "monthly_ai_replies": 50, "is_default": True},
@@ -62,22 +79,17 @@ def test_superadmin_edits_plans_and_sets_one_when_extending(client) -> None:
     assert (usage["plan"]["name"], usage["ai_replies_used"], usage["ai_replies_limit"]) == ("Sinov", 0, 50)
 
     business_id = client.get("/business", headers=owner).json()["id"]
-    expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=30)).isoformat()
-    row = client.patch(
-        f"/superadmin/businesses/{business_id}/subscription",
-        json={"subscription_expires_at": expiry, "payment_amount": 99, "payment_currency": "USD", "plan_id": paid["id"]},
+    row = client.post(
+        f"/superadmin/businesses/{business_id}/renew",
+        json={"plan_id": paid["id"], "months": 1, "payment_amount": 99, "payment_currency": "USD"},
         headers=admin,
     ).json()
-    assert (row["plan_name"], row["ai_replies_limit"], row["ai_replies_this_month"]) == ("Biznes", 5000, 0)
+    assert (row["plan_name"], row["ai_replies_limit"], row["ai_replies_used"]) == ("Biznes", 5000, 0)
+    started = dt.datetime.fromisoformat(row["plan_started_at"])
+    assert abs((dt.datetime.now(dt.timezone.utc) - started).total_seconds()) < 60  # starts today
 
-    # Extending without plan_id keeps the plan; plan_id null removes it.
-    kept = client.patch(
-        f"/superadmin/businesses/{business_id}/subscription", json={"subscription_expires_at": expiry}, headers=admin
-    ).json()
-    assert kept["plan_name"] == "Biznes"
-    cleared = client.patch(
-        f"/superadmin/businesses/{business_id}/subscription",
-        json={"subscription_expires_at": expiry, "plan_id": None}, headers=admin,
+    cleared = client.post(
+        f"/superadmin/businesses/{business_id}/renew", json={"plan_id": None, "months": 1}, headers=admin
     ).json()
     assert cleared["plan_name"] is None and cleared["ai_replies_limit"] is None
 
@@ -86,6 +98,28 @@ def test_superadmin_edits_plans_and_sets_one_when_extending(client) -> None:
     plans = {p["name"]: p for p in client.get("/superadmin/plans", headers=admin).json()}
     assert plans["Biznes"]["is_default"] and not plans["Sinov"]["is_default"]
     assert plans["Biznes"]["monthly_ai_replies"] is None
+
+
+def test_a_plan_in_use_cannot_be_deleted(client) -> None:
+    admin = create_superadmin_and_headers()
+    plan = client.post("/superadmin/plans", json={"name": "Pro", "price": 199, "monthly_ai_replies": 12000}, headers=admin).json()
+    spare = client.post("/superadmin/plans", json={"name": "Eski", "price": 5}, headers=admin).json()
+    client.post(
+        "/superadmin/businesses",
+        json={"email": "p@test.com", "password": "supersecret1", "business_name": "P", "plan_id": plan["id"], "trial_days": 30},
+        headers=admin,
+    )
+    assert client.delete(f"/superadmin/plans/{plan['id']}", headers=admin).status_code == 409
+    assert client.delete(f"/superadmin/plans/{spare['id']}", headers=admin).status_code == 204
+    assert [p["name"] for p in client.get("/superadmin/plans", headers=admin).json()] == ["Pro"]
+
+
+def test_a_renewal_starts_a_fresh_month_today() -> None:
+    business = SimpleNamespace(plan_id=None, plan_started_at=dt.datetime(2026, 9, 1, tzinfo=UTC))
+    now = dt.datetime(2026, 9, 20, 14, 30, tzinfo=UTC)
+    billing.start_plan(business, None, months=3, now=now)
+    assert billing.billing_period(business.plan_started_at, now)[0] == now  # the count starts over
+    assert business.subscription_expires_at == dt.datetime(2026, 12, 20, 14, 30, tzinfo=UTC)
 
 
 def test_owners_cannot_touch_plans(client) -> None:
