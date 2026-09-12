@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { toast } from "vue-sonner";
+import { ApiError } from "~/composables/useApi";
+import { safeHttpsUrl } from "~/lib/utils";
 import type { ConversationDetail, ConversationSummary, Message } from "~/types/api";
 import {
-  MessageSquare,
   Bot,
   ArrowLeft,
   User,
@@ -20,7 +22,7 @@ import {
   ExternalLink,
   ChevronUp,
   ArrowDown,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 
 definePageMeta({ layout: "dashboard" });
 
@@ -28,11 +30,36 @@ const api = useMivoApi();
 const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
+const { onConversationUpdated } = useNotifications();
+
+const CONVERSATION_PAGE = 50;
+const MAX_CONVERSATION_PAGE = 200;
+const MESSAGE_PAGE = 100;
+const MAX_MESSAGE_LIMIT = 500;
+const REPLY_MAX_LENGTH = 1000;
 
 const conversations = ref<ConversationSummary[]>([]);
+const hasMoreConversations = ref(false);
+const loadingMoreConversations = ref(false);
+// Server state of the open thread: its messages are exactly what the server
+// returned (oldest first). Optimistic replies live in `localMessages`.
 const selected = ref<ConversationDetail | null>(null);
 const loading = ref(true);
+const listError = ref<string | null>(null);
+// A background refresh failed; cleared by the next successful one.
+const syncError = ref(false);
+const threadLoading = ref(false);
 const messagesContainerRef = ref<HTMLElement | null>(null);
+
+// Replies the server hasn't acknowledged, per conversation — pending, or
+// failed before reaching it. Kept apart from server messages so no merge or
+// reload can ever wipe one (and its text) out, and they survive switching.
+const localMessages = reactive<Record<string, Message[]>>({});
+
+const threadMessages = computed<Message[]>(() => {
+  if (!selected.value) return [];
+  return [...selected.value.messages, ...(localMessages[selected.value.id] ?? [])];
+});
 
 // Mobile specific active view state
 const isMobileThreadActive = useState<boolean>("isMobileThreadActive", () => false);
@@ -43,7 +70,6 @@ const feedbackTargetMessage = ref<Message | null>(null);
 const feedbackCustomerQuery = ref("");
 const feedbackCorrectionText = ref("");
 const feedbackSubmitting = ref(false);
-const toastMessage = ref<string | null>(null);
 
 // Conversation Delete Confirm Modal
 const isDeleteConfirmModalOpen = ref(false);
@@ -62,6 +88,18 @@ function closeMediaPreview() {
   previewMediaUrl.value = null;
 }
 
+function errorText(err: unknown): string {
+  return err instanceof Error && err.message ? err.message : t("conversations.genericError");
+}
+
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: string } | null)?.name === "AbortError";
+}
+
+function isAiStatus(status: string | undefined) {
+  return status === "ai_active" || status === "active";
+}
+
 // Infinite Scroll / Message Windowing State
 const PAGE_SIZE = 35;
 const displayedCount = ref(PAGE_SIZE);
@@ -72,33 +110,43 @@ let messagesResizeObserver: ResizeObserver | null = null;
 let messagesMutationObserver: MutationObserver | null = null;
 
 const visibleMessages = computed(() => {
-  if (!selected.value) return [];
-  const msgs = selected.value.messages;
+  const msgs = threadMessages.value;
   if (msgs.length <= displayedCount.value) return msgs;
   return msgs.slice(-displayedCount.value);
 });
 
+const hiddenLoadedCount = computed(() => Math.max(0, threadMessages.value.length - displayedCount.value));
+
+// Older messages exist either in the local window or on the server (the
+// detail endpoint returns only the most recent ones).
 const hasOlderMessages = computed(() => {
   if (!selected.value) return false;
-  return selected.value.messages.length > displayedCount.value;
+  if (hiddenLoadedCount.value > 0) return true;
+  return selected.value.has_more_messages && selected.value.messages.length < MAX_MESSAGE_LIMIT;
 });
 
-const olderMessagesCount = computed(() => {
-  if (!selected.value) return 0;
-  return Math.max(0, selected.value.messages.length - displayedCount.value);
-});
-
-function loadOlderMessages() {
-  if (!messagesContainerRef.value || !hasOlderMessages.value || isLoadingOlder.value) return;
+async function loadOlderMessages() {
+  if (!messagesContainerRef.value || !hasOlderMessages.value || isLoadingOlder.value || !selected.value) return;
   isLoadingOlder.value = true;
   const container = messagesContainerRef.value;
   const prevScrollHeight = container.scrollHeight;
   const prevScrollTop = container.scrollTop;
 
-  displayedCount.value = Math.min(
-    displayedCount.value + PAGE_SIZE,
-    selected.value?.messages.length || 0
-  );
+  if (hiddenLoadedCount.value === 0) {
+    // Everything loaded is already shown — fetch a longer tail from the server.
+    const convId = selected.value.id;
+    const limit = Math.min(selected.value.messages.length + MESSAGE_PAGE, MAX_MESSAGE_LIMIT);
+    try {
+      const detail = await api.getConversation(convId, { limit });
+      replaceThread(convId, detail);
+    } catch (err) {
+      toast.error(errorText(err));
+      isLoadingOlder.value = false;
+      return;
+    }
+  }
+
+  displayedCount.value = Math.min(displayedCount.value + PAGE_SIZE, threadMessages.value.length);
 
   nextTick(() => {
     const newScrollHeight = container.scrollHeight;
@@ -129,144 +177,233 @@ function handleMessagesScroll() {
   }
 }
 
-// Media Parser
-interface ParsedMessagePart {
-  type: "text" | "image" | "video" | "reel" | "audio" | "placeholder";
-  url?: string;
-  text?: string;
-  badge?: string;
+// Media comes only from attachment_url/attachment_type, and only https URLs
+// are rendered or linked — message text is never parsed for links.
+interface MessageMedia {
+  kind: "image" | "video" | "audio" | "link";
+  url: string;
 }
 
-function parseMessage(content: string): ParsedMessagePart[] {
-  if (!content) return [];
-  const trimmed = content.trim();
+function mediaOf(m: Message): MessageMedia | null {
+  const url = safeHttpsUrl(m.attachment_url);
+  if (!url) return null;
+  const type = (m.attachment_type || "").toLowerCase();
+  if (type === "image") return { kind: "image", url };
+  if (type === "video") return { kind: "video", url };
+  if (type === "audio") return { kind: "audio", url };
+  return { kind: "link", url };
+}
 
-  // Known Instagram placeholders
-  if (trimmed === "[Rasm yuborildi]") {
-    return [{ type: "placeholder", badge: "📷 Rasm", text: "Instagram rasmi yuborildi" }];
-  }
-  if (trimmed === "[Video yuborildi]") {
-    return [{ type: "placeholder", badge: "🎥 Video", text: "Instagram videosi yuborildi" }];
-  }
-  if (trimmed === "[Ig_reel yuborildi]" || trimmed === "[Reels / Story ulashildi]") {
-    return [{ type: "placeholder", badge: "🎬 Reels / Story", text: "Instagram Reels ulashildi" }];
-  }
-
-  const parts: ParsedMessagePart[] = [];
-  const tagRegex = /\[(image|video|reel|audio):\s*([^\s\]]+)\]/gi;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = tagRegex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      const chunk = content.slice(lastIndex, match.index).trim();
-      if (chunk) parts.push({ type: "text", text: chunk });
-    }
-    const mediaType = match[1].toLowerCase() as "image" | "video" | "reel" | "audio";
-    const mediaUrl = match[2].trim();
-    parts.push({ type: mediaType, url: mediaUrl });
-    lastIndex = match.index + match[0].length;
-  }
-
-  if (lastIndex < content.length) {
-    const remaining = content.slice(lastIndex).trim();
-    if (remaining) {
-      if (remaining === "[Rasm yuborildi]") {
-        parts.push({ type: "placeholder", badge: "📷 Rasm", text: "Instagram rasmi yuborildi" });
-      } else if (remaining === "[Video yuborildi]") {
-        parts.push({ type: "placeholder", badge: "🎥 Video", text: "Instagram videosi yuborildi" });
-      } else if (remaining === "[Ig_reel yuborildi]" || remaining === "[Reels / Story ulashildi]") {
-        parts.push({ type: "placeholder", badge: "🎬 Reels / Story", text: "Instagram Reels ulashildi" });
-      } else {
-        parts.push({ type: "text", text: remaining });
-      }
-    }
-  }
-
-  if (parts.length === 0) {
-    parts.push({ type: "text", text: content });
-  }
-
-  return parts;
+function isSharedPost(m: Message) {
+  return ["share", "ig_reel", "story_mention"].includes((m.attachment_type || "").toLowerCase());
 }
 
 function formatTime(isoStr?: string) {
   if (!isoStr) return "";
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// --- Thread state helpers ----------------------------------------------------
+
+/** Merges server messages into the open thread: known ids are updated in
+ * place (delivery status changes), new ones appended. Returns the new ones. */
+function mergeIncoming(convId: string, incoming: Message[]): Message[] {
+  const conv = selected.value;
+  if (!conv || conv.id !== convId || incoming.length === 0) return [];
+  const byId = new Map(incoming.map((m) => [m.id, m]));
+  const updated = conv.messages.map((m) => byId.get(m.id) ?? m);
+  const known = new Set(updated.map((m) => m.id));
+  const added = incoming.filter((m) => !known.has(m.id));
+  conv.messages = [...updated, ...added];
+  return added;
+}
+
+/** Replaces the open thread with a fresh detail response. */
+function replaceThread(convId: string, detail: ConversationDetail): Message[] {
+  const conv = selected.value;
+  if (!conv || conv.id !== convId) return [];
+  const known = new Set(conv.messages.map((m) => m.id));
+  const added = detail.messages.filter((m) => !known.has(m.id));
+  selected.value = detail;
+  return added;
+}
+
+/** Id to poll `?after=` from: the last message, or — while an outbound
+ * message is still pending — the one before it, so its final delivery
+ * status comes back too. null means "reload the thread". */
+function pollAnchorId(msgs: Message[]): string | null {
+  if (msgs.length === 0) return null;
+  const firstPending = msgs.findIndex((m) => m.delivery_status === "pending");
+  if (firstPending === -1) return msgs[msgs.length - 1]!.id;
+  return firstPending === 0 ? null : msgs[firstPending - 1]!.id;
+}
+
+async function syncThread(convId: string, signal: AbortSignal): Promise<Message[]> {
+  const conv = selected.value;
+  if (!conv || conv.id !== convId) return [];
+  const anchor = pollAnchorId(conv.messages);
+  if (anchor) {
+    try {
+      const incoming: Message[] = [];
+      let after = anchor;
+      // Pages of MESSAGE_PAGE until the server has nothing newer.
+      for (;;) {
+        const page = await api.listMessagesAfter(convId, after, { limit: MESSAGE_PAGE, signal });
+        incoming.push(...page);
+        if (page.length < MESSAGE_PAGE) break;
+        after = page[page.length - 1]!.id;
+      }
+      return mergeIncoming(convId, incoming);
+    } catch (err) {
+      // 404 = the anchor message is gone (the thread itself is checked by
+      // the reload below, which 404s too if the conversation was deleted).
+      if (!(err instanceof ApiError && err.status === 404)) throw err;
+    }
+  }
+  const limit = Math.min(Math.max(MESSAGE_PAGE, conv.messages.length), MAX_MESSAGE_LIMIT);
+  const detail = await api.getConversation(convId, { limit, signal });
+  return replaceThread(convId, detail);
+}
+
+function handleConversationGone(id: string) {
+  conversations.value = conversations.value.filter((c) => c.id !== id);
+  delete localMessages[id];
+  if (selected.value?.id === id) selected.value = null;
+  if (requestedId === id) requestedId = null;
+  if (route.query.id === id) {
+    isMobileThreadActive.value = false;
+    const nextQuery = { ...route.query };
+    delete nextQuery.id;
+    router.replace({ query: nextQuery });
+  }
+  toast.error(t("conversations.notFound"));
+}
+
+// --- Operator replies --------------------------------------------------------
+
+const replyText = ref("");
+// Per-conversation drafts, so switching chats never sends a half-typed
+// reply to the wrong customer.
+const drafts: Record<string, string> = {};
+
+function setLocal(convId: string, localId: string, patch: Partial<Message>) {
+  const msg = localMessages[convId]?.find((m) => m.id === localId);
+  if (msg) Object.assign(msg, patch);
+}
+
+function removeLocal(convId: string, localId: string) {
+  const list = localMessages[convId];
+  if (!list) return;
+  localMessages[convId] = list.filter((m) => m.id !== localId);
+}
+
+function addLocal(convId: string, content: string): Message {
+  const msg: Message = {
+    id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    sender_type: "human",
+    content,
+    message_type: "text",
+    attachment_url: null,
+    attachment_type: null,
+    delivery_status: "pending",
+    delivery_error: null,
+    created_at: new Date().toISOString(),
+    local: true,
+  };
+  localMessages[convId] = [...(localMessages[convId] ?? []), msg];
+  return msg;
+}
+
+// The server hands a conversation to the human when the operator replies
+// (ai_active / human_needed -> human_active) — mirror it in the UI.
+function applyOperatorTakeover(convId: string) {
+  const apply = (c: ConversationSummary) => {
+    if (c.status === "ai_active" || c.status === "human_needed") c.status = "human_active";
+  };
+  if (selected.value?.id === convId) apply(selected.value);
+  const item = conversations.value.find((c) => c.id === convId);
+  if (item) apply(item);
+}
+
+function bumpConversation(convId: string, at: string) {
+  const idx = conversations.value.findIndex((c) => c.id === convId);
+  if (idx === -1) return;
+  const [item] = conversations.value.splice(idx, 1);
+  item!.last_message_at = at;
+  conversations.value.unshift(item!);
+}
+
+async function deliver(convId: string, localId: string, content: string) {
+  setLocal(convId, localId, { delivery_status: "pending", delivery_error: null });
+  // Server messages this thread already had — to recognise the one a failed
+  // delivery leaves behind.
+  const knownIds = new Set(selected.value?.id === convId ? selected.value.messages.map((m) => m.id) : []);
   try {
-    const d = new Date(isoStr);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return "";
+    const msg = await api.sendConversationReply(convId, content);
+    removeLocal(convId, localId);
+    mergeIncoming(convId, [msg]);
+    applyOperatorTakeover(convId);
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 400)) {
+      setLocal(convId, localId, { delivery_status: "failed", delivery_error: errorText(err) });
+      toast.error(errorText(err));
+      return;
+    }
+    // 400 = Instagram refused the delivery. The server kept the message,
+    // marked failed — unless it was rejected before being stored (no
+    // Instagram account connected). Check which, so the text is never lost
+    // and never shown twice.
+    toast.error(err.message);
+    let stored = false;
+    try {
+      const recent = await api.getConversation(convId, { limit: 20 });
+      stored = recent.messages.some(
+        (m) => !knownIds.has(m.id) && m.sender_type === "human" && m.content === content && m.delivery_status === "failed"
+      );
+    } catch (checkErr) {
+      console.error("Failed to re-check the thread after a failed reply", checkErr);
+    }
+    if (stored) {
+      removeLocal(convId, localId);
+      applyOperatorTakeover(convId);
+      if (selected.value?.id === convId) await syncNow({ force: true });
+    } else {
+      setLocal(convId, localId, { delivery_status: "failed", delivery_error: err.message });
+    }
   }
 }
 
-// Operator Reply state
-const replyText = ref("");
-const sendingReply = ref(false);
-
 async function handleSendReply() {
-  if (!selected.value || !replyText.value.trim()) return;
+  const conv = selected.value;
   const content = replyText.value.trim();
-  const convId = selected.value.id;
+  if (!conv || !content) return;
+  if (content.length > REPLY_MAX_LENGTH) {
+    toast.error(t("conversations.replyTooLong", { max: REPLY_MAX_LENGTH }));
+    return;
+  }
 
   // Clear input immediately so operator can type next message without waiting
   replyText.value = "";
+  drafts[conv.id] = "";
 
-  // Create optimistic message
-  const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const optimisticMsg: Message = {
-    id: tempId,
-    sender_type: "human",
-    content: content,
-    message_type: "text",
-    created_at: new Date().toISOString(),
-    status: "pending",
-  };
-
-  selected.value.messages.push(optimisticMsg);
+  const local = addLocal(conv.id, content);
   scrollToBottom(true);
-
-  // Update conversation last_message_at in sidebar
-  const idx = conversations.value.findIndex((c) => c.id === convId);
-  if (idx !== -1) {
-    conversations.value[idx].last_message_at = optimisticMsg.created_at;
-  }
-
-  // Send reply in background
-  try {
-    const newMsg = await api.sendConversationReply(convId, content);
-    if (selected.value && selected.value.id === convId) {
-      const msgIdx = selected.value.messages.findIndex((m) => m.id === tempId);
-      if (msgIdx !== -1) {
-        selected.value.messages[msgIdx] = { ...newMsg, status: "sent" };
-      }
-    }
-  } catch (err: any) {
-    console.error("Failed to send reply", err);
-    if (selected.value && selected.value.id === convId) {
-      const msg = selected.value.messages.find((m) => m.id === tempId);
-      if (msg) {
-        msg.status = "failed";
-      }
-    }
-    showToast(err?.message || t("conversations.sendError"));
-  }
+  bumpConversation(conv.id, local.created_at);
+  await deliver(conv.id, local.id, content);
 }
 
-async function retrySendMessage(msg: Message) {
-  if (!selected.value || msg.status !== "failed") return;
-  msg.status = "pending";
-  try {
-    const newMsg = await api.sendConversationReply(selected.value.id, msg.content);
-    if (selected.value) {
-      const idx = selected.value.messages.findIndex((m) => m.id === msg.id);
-      if (idx !== -1) {
-        selected.value.messages[idx] = { ...newMsg, status: "sent" };
-      }
-    }
-  } catch (err: any) {
-    msg.status = "failed";
-    showToast(t("conversations.retryError"));
+function retrySendMessage(msg: Message) {
+  const conv = selected.value;
+  if (!conv || msg.sender_type !== "human" || msg.delivery_status !== "failed") return;
+  if (msg.local) {
+    deliver(conv.id, msg.id, msg.content);
+  } else {
+    // Stored server-side as failed: send its text again as a new reply.
+    const local = addLocal(conv.id, msg.content);
+    scrollToBottom(true);
+    deliver(conv.id, local.id, msg.content);
   }
 }
 
@@ -277,12 +414,7 @@ function handleReplyKeydown(e: KeyboardEvent) {
   }
 }
 
-function showToast(msg: string) {
-  toastMessage.value = msg;
-  setTimeout(() => {
-    toastMessage.value = null;
-  }, 3500);
-}
+// --- Scrolling ---------------------------------------------------------------
 
 function scrollToBottomDirect() {
   const el = messagesContainerRef.value;
@@ -334,22 +466,59 @@ function attachObservers() {
   messagesMutationObserver.observe(el, { childList: true, subtree: true });
 }
 
+// --- Opening a conversation --------------------------------------------------
+
+// Every open gets a sequence number and its own AbortController: a slow
+// response for a chat the user already left is cancelled, and if it still
+// lands it is dropped instead of overwriting the chat now on screen.
+let openSeq = 0;
+let openAbort: AbortController | null = null;
+let requestedId: string | null = null;
+
 async function openConversation(id: string, updateQuery = true) {
+  if (updateQuery && route.query.id !== id) {
+    router.replace({ query: { ...route.query, id } });
+  }
+  isMobileThreadActive.value = true;
+  if (requestedId === id && (threadLoading.value || selected.value?.id === id)) return;
+
+  if (selected.value) drafts[selected.value.id] = replyText.value;
+  replyText.value = drafts[id] ?? "";
+
+  const seq = ++openSeq;
+  requestedId = id;
+  openAbort?.abort();
+  pollAbort?.abort();
+  const ctrl = new AbortController();
+  openAbort = ctrl;
+  selected.value = null;
+  threadLoading.value = true;
+
   try {
-    selected.value = await api.getConversation(id);
+    const detail = await api.getConversation(id, { limit: MESSAGE_PAGE, signal: ctrl.signal });
+    if (seq !== openSeq) return;
+    selected.value = detail;
     displayedCount.value = PAGE_SIZE;
-    isMobileThreadActive.value = true;
     shouldStickToBottom.value = true;
     showScrollDownBtn.value = false;
     scrollToBottom(false);
     nextTick(() => {
       attachObservers();
     });
-    if (updateQuery && route.query.id !== id) {
-      router.replace({ query: { ...route.query, id } });
-    }
   } catch (err) {
-    console.error("Failed to load conversation", err);
+    if (seq !== openSeq || isAbortError(err)) return;
+    requestedId = null;
+    if (err instanceof ApiError && err.status === 404) {
+      handleConversationGone(id);
+    } else {
+      console.error("Failed to load conversation", err);
+      toast.error(errorText(err));
+    }
+  } finally {
+    if (seq === openSeq) {
+      threadLoading.value = false;
+      openAbort = null;
+    }
   }
 }
 
@@ -363,48 +532,109 @@ function closeMobileThread() {
 }
 
 async function toggleConversationStatus() {
-  if (!selected.value) return;
-  const newStatus = selected.value.status === "ai_active" || selected.value.status === "active" ? "human_needed" : "ai_active";
+  const conv = selected.value;
+  if (!conv) return;
+  const newStatus = isAiStatus(conv.status) ? "human_needed" : "ai_active";
   try {
-    const updated = await api.updateConversationStatus(selected.value.id, newStatus);
-    selected.value.status = updated.status;
-    const idx = conversations.value.findIndex((c) => c.id === selected.value?.id);
-    if (idx !== -1) conversations.value[idx].status = updated.status;
-    showToast(newStatus === "ai_active" ? "Suhbat AI rejimiga o'tkazildi" : "AI bu suhbatda endi javob yozmaydi");
+    const updated = await api.updateConversationStatus(conv.id, newStatus);
+    if (selected.value?.id === conv.id) selected.value.status = updated.status;
+    const item = conversations.value.find((c) => c.id === conv.id);
+    if (item) item.status = updated.status;
+    toast.success(newStatus === "ai_active" ? t("conversations.switchedToAi") : t("conversations.switchedToOperator"));
   } catch (err) {
     console.error("Failed to update status", err);
+    toast.error(errorText(err));
   }
 }
 
-// Polling: DMs arrive from real customers at any moment, not just while this
-// tab is focused — a manual refresh button plus a quiet background poll
-// means the owner doesn't have to reload the page to see a new message land.
+// --- Background sync ---------------------------------------------------------
+
+// DMs arrive from real customers at any moment: a manual refresh button, the
+// SSE "conversation_updated" event, and a quiet 12s poll. At most one sync
+// runs at a time (a trigger during one queues exactly one follow-up), and the
+// poll skips hidden tabs.
 const refreshing = ref(false);
 const POLL_INTERVAL_MS = 12000;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let syncInFlight = false;
+let syncQueued = false;
+let pollAbort: AbortController | null = null;
 
-async function refreshData(showSpinner = false) {
-  if (showSpinner) refreshing.value = true;
+async function refreshList() {
+  const limit = Math.min(Math.max(CONVERSATION_PAGE, conversations.value.length), MAX_CONVERSATION_PAGE);
+  const fresh = await api.listConversations(limit, 0);
+  const freshIds = new Set(fresh.map((c) => c.id));
+  const tail = conversations.value.slice(limit).filter((c) => !freshIds.has(c.id));
+  conversations.value = [...fresh, ...tail];
+  if (tail.length === 0) hasMoreConversations.value = fresh.length === limit;
+  // Keep the open thread's header in step (e.g. the AI handed over).
+  const conv = selected.value;
+  const summary = conv ? fresh.find((c) => c.id === conv.id) : undefined;
+  if (conv && summary) conv.status = summary.status;
+}
+
+async function syncNow(opts: { force?: boolean; userInitiated?: boolean } = {}) {
+  if (syncInFlight) {
+    syncQueued = true;
+    return;
+  }
+  if (!opts.force && document.hidden) return;
+  syncInFlight = true;
+  const ctrl = new AbortController();
+  pollAbort = ctrl;
+  const convId = selected.value?.id ?? null;
   try {
-    const updatedList = await api.listConversations();
-    conversations.value = updatedList;
-
-    if (selected.value) {
-      const stillExists = updatedList.some((c) => c.id === selected.value!.id);
-      if (stillExists) {
-        const previousCount = selected.value.messages.length;
-        const updatedDetail = await api.getConversation(selected.value.id);
-        selected.value = updatedDetail;
-        // Only jump the scroll position on an actual new message — a quiet
-        // background refresh shouldn't yank the view while someone's
-        // reading back through older messages.
-        if (updatedDetail.messages.length > previousCount) scrollToBottom();
+    await refreshList();
+    if (convId && selected.value?.id === convId) {
+      const added = await syncThread(convId, ctrl.signal);
+      if (added.length > 0) {
+        // Only move the view on an actual new message, and not while the
+        // owner is reading back through older ones.
+        if (shouldStickToBottom.value) scrollToBottom();
+        else showScrollDownBtn.value = true;
       }
     }
+    syncError.value = false;
   } catch (err) {
+    if (isAbortError(err)) return;
+    if (convId && err instanceof ApiError && err.status === 404) {
+      handleConversationGone(convId);
+      return;
+    }
     console.error("Failed to refresh conversations", err);
+    syncError.value = true;
+    if (opts.userInitiated) toast.error(errorText(err));
   } finally {
-    if (showSpinner) refreshing.value = false;
+    syncInFlight = false;
+    if (pollAbort === ctrl) pollAbort = null;
+    if (syncQueued) {
+      syncQueued = false;
+      syncNow();
+    }
+  }
+}
+
+async function manualRefresh() {
+  refreshing.value = true;
+  try {
+    await syncNow({ force: true, userInitiated: true });
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+async function loadMoreConversations() {
+  if (loadingMoreConversations.value || !hasMoreConversations.value) return;
+  loadingMoreConversations.value = true;
+  try {
+    const page = await api.listConversations(CONVERSATION_PAGE, conversations.value.length);
+    const known = new Set(conversations.value.map((c) => c.id));
+    conversations.value = [...conversations.value, ...page.filter((c) => !known.has(c.id))];
+    hasMoreConversations.value = page.length === CONVERSATION_PAGE;
+  } catch (err) {
+    toast.error(errorText(err));
+  } finally {
+    loadingMoreConversations.value = false;
   }
 }
 
@@ -413,17 +643,24 @@ function openDeleteConfirmModal() {
 }
 
 async function confirmDeleteConversation() {
-  if (!selected.value) return;
+  const conv = selected.value;
+  if (!conv) return;
   deletingConversation.value = true;
   try {
-    await api.deleteConversation(selected.value.id);
-    conversations.value = conversations.value.filter((c) => c.id !== selected.value?.id);
-    selected.value = null;
+    await api.deleteConversation(conv.id);
+    conversations.value = conversations.value.filter((c) => c.id !== conv.id);
+    delete localMessages[conv.id];
+    delete drafts[conv.id];
+    if (selected.value?.id === conv.id) selected.value = null;
+    requestedId = null;
+    replyText.value = "";
     isDeleteConfirmModalOpen.value = false;
-    showToast("Suhbat o'chirildi");
+    isMobileThreadActive.value = false;
+    toast.success(t("conversations.deleted"));
     router.replace({ query: {} });
   } catch (err) {
     console.error("Failed to delete conversation", err);
+    toast.error(errorText(err));
   } finally {
     deletingConversation.value = false;
   }
@@ -437,22 +674,19 @@ async function handlePositiveFeedback(msg: Message) {
       rating: "thumb_up",
       ai_response: msg.content,
     });
-    showToast("Rahmat! Mivo AI ushbu javobni ijobiy baholadi 👍");
+    toast.success(t("conversations.feedbackThanks"));
   } catch (err) {
     console.error("Failed to submit feedback", err);
+    toast.error(errorText(err));
   }
 }
 
 function openCorrectionModal(msg: Message) {
   feedbackTargetMessage.value = msg;
-  if (selected.value) {
-    const msgIndex = selected.value.messages.findIndex((m) => m.id === msg.id);
-    if (msgIndex > 0 && selected.value.messages[msgIndex - 1].sender_type === "customer") {
-      feedbackCustomerQuery.value = selected.value.messages[msgIndex - 1].content;
-    } else {
-      feedbackCustomerQuery.value = "";
-    }
-  }
+  const msgs = threadMessages.value;
+  const msgIndex = msgs.findIndex((m) => m.id === msg.id);
+  const previous = msgIndex > 0 ? msgs[msgIndex - 1] : undefined;
+  feedbackCustomerQuery.value = previous && previous.sender_type === "customer" ? previous.content : "";
   feedbackCorrectionText.value = "";
   isFeedbackModalOpen.value = true;
 }
@@ -475,32 +709,60 @@ async function submitCorrection() {
       correction: feedbackCorrectionText.value.trim(),
     });
     closeCorrectionModal();
-    showToast("Mivo AI ushbu tuzatishni o'rgandi ✨");
+    toast.success(t("conversations.correctionLearned"));
   } catch (err) {
     console.error("Failed to submit correction", err);
+    toast.error(errorText(err));
   } finally {
     feedbackSubmitting.value = false;
   }
 }
 
-onMounted(async () => {
+async function loadInitial() {
+  loading.value = true;
+  listError.value = null;
   try {
-    conversations.value = await api.listConversations();
-    const queryId = route.query.id as string | undefined;
-    if (queryId && conversations.value.some((c) => c.id === queryId)) {
-      await openConversation(queryId, false);
-    } else if (conversations.value.length > 0 && window.innerWidth > 768) {
-      await openConversation(conversations.value[0].id, false);
-    }
+    const page = await api.listConversations(CONVERSATION_PAGE, 0);
+    conversations.value = page;
+    hasMoreConversations.value = page.length === CONVERSATION_PAGE;
+  } catch (err) {
+    console.error("Failed to load conversations", err);
+    listError.value = errorText(err);
+    return;
   } finally {
     loading.value = false;
   }
-  pollTimer = setInterval(() => refreshData(false), POLL_INTERVAL_MS);
+  const queryId = route.query.id as string | undefined;
+  if (queryId) {
+    // Links from notifications may point past the first page — open it anyway.
+    await openConversation(queryId, false);
+  } else if (conversations.value.length > 0 && window.innerWidth > 768) {
+    await openConversation(conversations.value[0]!.id, false);
+  }
+}
+
+function onVisibilityChange() {
+  if (!document.hidden) syncNow();
+}
+
+let stopConversationEvents: (() => void) | null = null;
+
+onMounted(async () => {
+  stopConversationEvents = onConversationUpdated(() => {
+    syncNow();
+  });
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  pollTimer = setInterval(() => syncNow(), POLL_INTERVAL_MS);
+  await loadInitial();
 });
 
 onUnmounted(() => {
   isMobileThreadActive.value = false;
   if (pollTimer) clearInterval(pollTimer);
+  openAbort?.abort();
+  pollAbort?.abort();
+  stopConversationEvents?.();
+  document.removeEventListener("visibilitychange", onVisibilityChange);
   if (messagesResizeObserver) messagesResizeObserver.disconnect();
   if (messagesMutationObserver) messagesMutationObserver.disconnect();
 });
@@ -508,7 +770,7 @@ onUnmounted(() => {
 watch(
   () => route.query.id,
   async (newId) => {
-    if (newId && typeof newId === "string" && selected.value?.id !== newId) {
+    if (newId && typeof newId === "string" && requestedId !== newId) {
       await openConversation(newId, false);
     } else if (!newId) {
       isMobileThreadActive.value = false;
@@ -530,22 +792,10 @@ function getAvatarLetter(username?: string | null) {
   const clean = cleanCustomerName(username).replace("@", "").trim();
   return clean.charAt(0).toUpperCase();
 }
-
-function getStatusBadgeClass(status: string) {
-  if (status === "ai_active" || status === "active") return "lead-badge-warm";
-  if (status === "human_needed") return "lead-badge-cold";
-  return "lead-badge-cold";
-}
 </script>
 
 <template>
   <div class="conversations-page" :class="{ 'mobile-thread-active': isMobileThreadActive }">
-    <!-- Toast Notification -->
-    <div v-if="toastMessage" class="feedback-toast">
-      <Sparkles :size="16" class="text-primary" />
-      <span>{{ toastMessage }}</span>
-    </div>
-
     <!-- Loading State with Smooth Animated Messenger Skeleton -->
     <div v-if="loading" class="split-view">
       <div class="conversation-sidebar p-4 space-y-3">
@@ -574,12 +824,28 @@ function getStatusBadgeClass(status: string) {
       </div>
     </div>
 
+    <!-- Initial load failed -->
+    <div v-else-if="listError" class="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+      <AlertCircle :size="28" class="text-destructive" />
+      <p class="text-sm text-foreground">{{ t("conversations.loadError") }}</p>
+      <p class="text-xs text-muted-foreground">{{ listError }}</p>
+      <Button variant="outline" size="sm" class="gap-2" @click="loadInitial">
+        <RefreshCw :size="14" />
+        <span>{{ t("common.retry") }}</span>
+      </Button>
+    </div>
+
     <!-- Split View Messenger Container -->
     <div v-else class="split-view" :class="{ 'mobile-thread-open': isMobileThreadActive }">
       <!-- Conversation List Sidebar -->
       <div class="conversation-sidebar" :class="{ 'mobile-hidden': isMobileThreadActive }">
         <div class="px-4 py-3.5 border-b border-border text-xs font-bold text-muted-foreground uppercase tracking-wide shrink-0">
-          {{ t("conversations.activeChats") }} ({{ conversations.length }})
+          {{ t("conversations.activeChats") }} ({{ conversations.length }}{{ hasMoreConversations ? "+" : "" }})
+        </div>
+
+        <div v-if="syncError" class="px-4 py-2 text-[11px] text-destructive bg-destructive/5 border-b border-destructive/20 flex items-center gap-1.5 shrink-0">
+          <AlertCircle :size="12" class="shrink-0" />
+          <span>{{ t("conversations.syncError") }}</span>
         </div>
 
         <ul v-if="conversations.length > 0" class="flex-1 min-h-0 overflow-y-auto overscroll-contain m-0 p-0 list-none custom-scrollbar">
@@ -587,7 +853,7 @@ function getStatusBadgeClass(status: string) {
             v-for="c in conversations"
             :key="c.id"
             class="conversation-item"
-            :class="{ active: selected?.id === c.id }"
+            :class="{ active: (selected?.id ?? requestedId) === c.id }"
             @click="openConversation(c.id)"
           >
             <div class="avatar">
@@ -602,15 +868,27 @@ function getStatusBadgeClass(status: string) {
               <div class="flex items-center justify-between mt-1">
                 <span
                   class="inline-flex items-center justify-center h-5 w-5 rounded-md"
-                  :class="c.status === 'ai_active' || c.status === 'active' ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'"
-                  :title="c.status === 'ai_active' || c.status === 'active' ? 'AI' : 'Operator'"
+                  :class="isAiStatus(c.status) ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'"
+                  :title="isAiStatus(c.status) ? t('conversations.modeAi') : t('conversations.modeOperator')"
                 >
-                  <Bot v-if="c.status === 'ai_active' || c.status === 'active'" :size="12" />
+                  <Bot v-if="isAiStatus(c.status)" :size="12" />
                   <User v-else :size="12" />
                 </span>
                 <span class="text-xs text-muted-foreground">Instagram</span>
               </div>
             </div>
+          </li>
+          <li v-if="hasMoreConversations" class="p-3 flex justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              class="h-8 text-xs gap-1.5"
+              :disabled="loadingMoreConversations"
+              @click="loadMoreConversations"
+            >
+              <Loader2 v-if="loadingMoreConversations" :size="12" class="animate-spin" />
+              <span>{{ t("common.loadMore") }}</span>
+            </Button>
           </li>
         </ul>
         <div v-else class="muted p-8 text-center text-sm">
@@ -648,15 +926,15 @@ function getStatusBadgeClass(status: string) {
               <button
                 type="button"
                 class="inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border transition-all shadow-2xs active:scale-95 cursor-pointer"
-                :class="selected.status === 'ai_active' || selected.status === 'active'
+                :class="isAiStatus(selected.status)
                   ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
                   : 'border-border/80 bg-card text-muted-foreground hover:bg-muted hover:text-foreground'"
-                :title="selected.status === 'ai_active' || selected.status === 'active'
+                :title="isAiStatus(selected.status)
                   ? t('conversations.aiModeActiveTooltip')
                   : t('conversations.operatorModeActiveTooltip')"
                 @click="toggleConversationStatus"
               >
-                <Bot v-if="selected.status === 'ai_active' || selected.status === 'active'" :size="16" class="shrink-0" />
+                <Bot v-if="isAiStatus(selected.status)" :size="16" class="shrink-0" />
                 <User v-else :size="16" class="shrink-0" />
               </button>
 
@@ -666,7 +944,7 @@ function getStatusBadgeClass(status: string) {
                 class="inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border border-border/80 bg-card hover:bg-muted text-foreground transition-all shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
                 :title="t('common.refresh')"
                 :disabled="refreshing"
-                @click="refreshData(true)"
+                @click="manualRefresh"
               >
                 <RefreshCw :size="14" :class="{ 'animate-spin': refreshing }" />
               </button>
@@ -699,7 +977,7 @@ function getStatusBadgeClass(status: string) {
               >
                 <Loader2 v-if="isLoadingOlder" :size="12" class="animate-spin" />
                 <ChevronUp v-else :size="12" />
-                <span>{{ t("conversations.loadOlder", { count: olderMessagesCount }) }}</span>
+                <span>{{ hiddenLoadedCount > 0 ? t("conversations.loadOlder", { count: hiddenLoadedCount }) : t("conversations.loadOlderServer") }}</span>
               </button>
             </div>
 
@@ -710,8 +988,8 @@ function getStatusBadgeClass(status: string) {
               class="bubble max-w-[85%] sm:max-w-[80%] break-words relative transition-all duration-150"
               :class="[
                 m.sender_type === 'customer' ? 'bubble-customer' : m.sender_type === 'human' ? 'bubble-human' : 'bubble-ai',
-                m.status === 'pending' ? 'opacity-70' : '',
-                m.status === 'failed' ? 'border-destructive/60 bg-destructive/5' : ''
+                m.delivery_status === 'pending' ? 'opacity-70' : '',
+                m.delivery_status === 'failed' ? 'border-destructive/60 bg-destructive/5' : ''
               ]"
             >
               <!-- Bubble Header -->
@@ -721,24 +999,29 @@ function getStatusBadgeClass(status: string) {
                   <UserCheck v-else-if="m.sender_type === 'human'" :size="12" class="text-blue-500" />
                   <Bot v-else :size="12" class="text-primary" />
                   <span class="font-semibold text-xs text-foreground/90">
-                    {{ m.sender_type === 'customer' ? cleanCustomerName(selected.customer_username) : m.sender_type === 'human' ? t('conversations.youOperator') : 'Mivo AI' }}
+                    {{ m.sender_type === 'customer' ? cleanCustomerName(selected.customer_username) : m.sender_type === 'human' ? t('conversations.youOperator') : t('conversations.aiAssistant') }}
                   </span>
                 </div>
 
                 <!-- Status & Time Badge -->
                 <div class="flex items-center gap-1 text-[11px]">
-                  <span v-if="m.status === 'pending'" class="text-muted-foreground flex items-center gap-1">
+                  <span v-if="m.delivery_status === 'pending'" class="text-muted-foreground flex items-center gap-1">
                     <Clock :size="11" class="animate-pulse" />
                     <span class="hidden sm:inline">{{ t("conversations.sending") }}</span>
                   </span>
-                  <span
-                    v-else-if="m.status === 'failed'"
+                  <button
+                    v-else-if="m.delivery_status === 'failed' && m.sender_type === 'human'"
+                    type="button"
                     class="text-destructive flex items-center gap-1 cursor-pointer font-medium hover:underline"
                     :title="t('conversations.retryTitle')"
                     @click="retrySendMessage(m)"
                   >
                     <AlertCircle :size="11" />
                     <span>{{ t("conversations.retry") }}</span>
+                  </button>
+                  <span v-else-if="m.delivery_status === 'failed'" class="text-destructive flex items-center gap-1 font-medium">
+                    <AlertCircle :size="11" />
+                    <span>{{ t("conversations.notDelivered") }}</span>
                   </span>
                   <span v-else class="opacity-70">{{ formatTime(m.created_at) }}</span>
                 </div>
@@ -746,46 +1029,59 @@ function getStatusBadgeClass(status: string) {
 
               <!-- Message Content & Media Rendering -->
               <div class="text-sm leading-relaxed">
-                <div v-for="(part, pIdx) in parseMessage(m.content)" :key="pIdx" class="my-0.5">
-                  <!-- Text Block -->
-                  <div v-if="part.type === 'text'" class="whitespace-pre-wrap">
-                    {{ part.text }}
-                  </div>
-
+                <template v-if="mediaOf(m)">
                   <!-- Image Attachment -->
                   <div
-                    v-else-if="part.type === 'image' && part.url"
-                    class="mt-1.5 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black/5 dark:bg-white/5 cursor-pointer hover:opacity-95 transition-opacity shadow-2xs group relative"
-                    @click="openMediaPreview(part.url, 'image')"
+                    v-if="mediaOf(m)!.kind === 'image'"
+                    class="mt-1.5 mb-1 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black/5 dark:bg-white/5 cursor-pointer hover:opacity-95 transition-opacity shadow-2xs group relative"
+                    @click="openMediaPreview(mediaOf(m)!.url, 'image')"
                   >
                     <img
-                      :src="part.url"
-                      alt="Rasm"
+                      :src="mediaOf(m)!.url"
+                      :alt="t('conversations.imageAlt')"
                       class="w-full h-auto max-h-[340px] object-cover rounded-xl group-hover:scale-[1.01] transition-transform duration-200"
                       loading="lazy"
+                      referrerpolicy="no-referrer"
                     />
                     <div class="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-xs font-medium">
                       {{ t("common.zoom") }}
                     </div>
                   </div>
 
-                  <!-- Reel / Share Card -->
+                  <!-- Video Attachment -->
                   <div
-                    v-else-if="part.type === 'reel'"
-                    class="mt-1.5 p-3 rounded-xl border border-pink-500/20 bg-gradient-to-r from-pink-500/10 via-purple-500/10 to-indigo-500/10 flex items-center justify-between gap-3 shadow-2xs"
+                    v-else-if="mediaOf(m)!.kind === 'video'"
+                    class="mt-1.5 mb-1 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black shadow-2xs"
+                  >
+                    <video :src="mediaOf(m)!.url" controls preload="metadata" class="w-full max-h-[280px] rounded-xl"></video>
+                  </div>
+
+                  <!-- Voice note -->
+                  <audio
+                    v-else-if="mediaOf(m)!.kind === 'audio'"
+                    :src="mediaOf(m)!.url"
+                    controls
+                    preload="none"
+                    class="mt-1.5 mb-1 w-full max-w-[280px]"
+                  ></audio>
+
+                  <!-- Shared post / other attachment: an explicit, https-only link -->
+                  <div
+                    v-else
+                    class="mt-1.5 mb-1 p-3 rounded-xl border border-pink-500/20 bg-gradient-to-r from-pink-500/10 via-purple-500/10 to-indigo-500/10 flex items-center justify-between gap-3 shadow-2xs"
                   >
                     <div class="flex items-center gap-2.5 min-w-0">
                       <div class="h-9 w-9 rounded-lg bg-pink-500/20 text-pink-500 flex items-center justify-center shrink-0">
                         <Film :size="18" />
                       </div>
                       <div class="min-w-0">
-                        <div class="text-xs font-semibold text-foreground truncate">Instagram Reel</div>
-                        <div class="text-[11px] text-muted-foreground truncate">{{ t("conversations.reelShared") }}</div>
+                        <div class="text-xs font-semibold text-foreground truncate">
+                          {{ isSharedPost(m) ? t("conversations.reelShared") : t("conversations.attachment") }}
+                        </div>
                       </div>
                     </div>
                     <a
-                      v-if="part.url"
-                      :href="part.url"
+                      :href="mediaOf(m)!.url"
                       target="_blank"
                       rel="noopener noreferrer"
                       class="text-xs text-primary hover:underline flex items-center gap-1 shrink-0 px-2.5 py-1 rounded-lg bg-card border border-border"
@@ -794,24 +1090,14 @@ function getStatusBadgeClass(status: string) {
                       <ExternalLink :size="11" />
                     </a>
                   </div>
+                </template>
 
-                  <!-- Video Attachment -->
-                  <div
-                    v-else-if="part.type === 'video' && part.url"
-                    class="mt-1.5 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black shadow-2xs"
-                  >
-                    <video :src="part.url" controls class="w-full max-h-[280px] rounded-xl"></video>
-                  </div>
+                <!-- Text is always plain text, exactly as sent -->
+                <div v-if="m.content" class="whitespace-pre-wrap">{{ m.content }}</div>
 
-                  <!-- Instagram Placeholder Badge (for legacy messages) -->
-                  <div
-                    v-else-if="part.type === 'placeholder'"
-                    class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-border/70 bg-muted/50 text-xs font-medium my-0.5"
-                  >
-                    <span class="font-semibold text-foreground">{{ part.badge }}</span>
-                    <span class="text-muted-foreground">{{ part.text }}</span>
-                  </div>
-                </div>
+                <p v-if="m.delivery_status === 'failed'" class="mt-1.5 text-[11px] text-destructive">
+                  {{ m.delivery_error || t("conversations.notDelivered") }}
+                </p>
               </div>
 
               <!-- AI Feedback & Learning Action Bar -->
@@ -866,6 +1152,7 @@ function getStatusBadgeClass(status: string) {
               <Input
                 v-model="replyText"
                 type="text"
+                maxlength="1000"
                 :placeholder="t('conversations.typeMessage')"
                 class="flex-1 h-10 px-4 rounded-xl border border-border bg-background text-sm text-foreground focus-visible:ring-2 focus-visible:ring-primary/30 transition-all placeholder:text-muted-foreground/60"
                 @keydown="handleReplyKeydown"
@@ -881,6 +1168,10 @@ function getStatusBadgeClass(status: string) {
             </form>
           </div>
         </template>
+
+        <div v-else-if="threadLoading" class="flex h-full items-center justify-center p-8 text-muted-foreground">
+          <Loader2 :size="22" class="animate-spin" />
+        </div>
 
         <div v-else class="flex h-full items-center justify-center text-muted-foreground p-8 text-center">
           {{ t("conversations.selectChat") }}
@@ -918,6 +1209,7 @@ function getStatusBadgeClass(status: string) {
               id="feedback-correction"
               v-model="feedbackCorrectionText"
               rows="3"
+              maxlength="1000"
               :placeholder="t('conversations.aiCorrectPlaceholder')"
             />
           </div>
@@ -939,9 +1231,10 @@ function getStatusBadgeClass(status: string) {
         <DialogHeader>
           <DialogTitle class="text-destructive">{{ t("conversations.deleteModalTitle") }}</DialogTitle>
         </DialogHeader>
-        <p class="text-sm text-foreground mb-5">
+        <p class="text-sm text-foreground">
           {{ t("conversations.deleteModalConfirm", { name: selected?.customer_username || t("conversations.customer") }) }}
         </p>
+        <p class="text-xs text-muted-foreground mb-5">{{ t("conversations.deleteKeepsLead") }}</p>
         <div class="flex items-center justify-end gap-3">
           <Button variant="outline" @click="isDeleteConfirmModalOpen = false">{{ t("common.cancel") }}</Button>
           <Button variant="destructive" class="gap-2" :disabled="deletingConversation" @click="confirmDeleteConversation">
@@ -959,7 +1252,8 @@ function getStatusBadgeClass(status: string) {
           <img
             v-if="previewMediaType === 'image' && previewMediaUrl"
             :src="previewMediaUrl"
-            alt="Media Preview"
+            :alt="t('conversations.imageAlt')"
+            referrerpolicy="no-referrer"
             class="max-h-[82vh] w-auto max-w-full rounded-lg object-contain shadow-md"
           />
           <video

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { toast } from "vue-sonner";
 import type { Lead } from "~/types/api";
 import {
   Flame,
@@ -17,8 +18,9 @@ import {
   X,
   PhoneCall,
   SlidersHorizontal,
-  ArrowUpDown
-} from "lucide-vue-next";
+  AlertCircle,
+  RefreshCw
+} from "@lucide/vue";
 import {
   Select,
   SelectContent,
@@ -36,6 +38,7 @@ const router = useRouter();
 
 const leads = ref<Lead[]>([]);
 const loading = ref(true);
+const loadError = ref<string | null>(null);
 
 // Filters & Controls
 const searchQuery = ref("");
@@ -66,20 +69,26 @@ const copiedAllPhones = ref(false);
 
 const route = useRoute();
 
-onMounted(async () => {
+async function loadLeads() {
+  loading.value = true;
+  loadError.value = null;
   try {
-    loading.value = true;
-    leads.value = await api.listLeads();
+    leads.value = await api.listLeads(500, 0);
     if (route.query.id) {
       const match = leads.value.find((l) => l.id === route.query.id);
       if (match) {
         selectedLead.value = match;
       }
     }
+  } catch (err) {
+    console.error("Failed to load leads", err);
+    loadError.value = err instanceof Error && err.message ? err.message : t("leads.loadError");
   } finally {
     loading.value = false;
   }
-});
+}
+
+onMounted(loadLeads);
 
 watch(
   () => route.query.id,
@@ -119,7 +128,7 @@ const filteredLeads = computed(() => {
       const phone = (l.phone || "").toLowerCase();
       const reason = (l.qualification_reason || "").toLowerCase();
       const summary = (l.summary || "").toLowerCase();
-      const products = (l.interested_products || []).map((p) => p.name.toLowerCase()).join(" ");
+      const products = (l.interested_products || []).map((p) => (p.name || "").toLowerCase()).join(" ");
       return (
         username.includes(q) ||
         phone.includes(q) ||
@@ -147,28 +156,17 @@ const filteredLeads = computed(() => {
 
 const { locale } = useI18n();
 
+// The AI writes `summaries` only in the locales it managed to (uz always):
+// the viewer's language, else Uzbek, else the plain summary.
 function formatAiReason(lead: Lead | null | undefined): string {
   if (!lead) return "";
-  const currentLang = locale.value || "uz";
-  if (lead.summaries && lead.summaries[currentLang]) {
-    return lead.summaries[currentLang];
-  }
-  const reason = lead.summary || lead.qualification_reason;
-  if (!reason) {
-    if (currentLang === "ru") return "Информация о клиенте анализируется.";
-    if (currentLang === "en") return "Customer interaction is being analyzed.";
-    return "Mijoz ma'lumotlari tahlil qilinmoqda.";
-  }
-  if (reason.includes("initiated conversation with a general greeting")) {
-    if (currentLang === "ru") return "Клиент начал диалог с приветствия. Интерес к товарам уточняется.";
-    if (currentLang === "en") return "Customer started conversation with a greeting. Interest is being determined.";
-    return "Mijoz suhbatni salomlashish bilan boshladi. Mahsulotlarga qiziqishi aniqlashtirilmoqda.";
-  }
-  if (reason.includes("AI provider failed") || reason.includes("escalated to human")) {
-    if (currentLang === "ru") return "Запрошено подключение оператора.";
-    if (currentLang === "en") return "Human operator assistance requested.";
-    return "Mijoz bilan inson operatori bog'lanishi so'ralgan.";
-  }
+  // `||`, not `??`: an empty string is "not written" too.
+  const reason =
+    lead.summaries?.[locale.value] || lead.summaries?.uz || lead.summary || lead.qualification_reason;
+  if (!reason) return t("leads.reasonAnalyzing");
+  // Fixed English reasons the backend writes for two special cases.
+  if (reason.includes("initiated conversation with a general greeting")) return t("leads.reasonGreeting");
+  if (reason.includes("AI provider failed") || reason.includes("escalated to human")) return t("leads.reasonEscalated");
   return reason;
 }
 
@@ -187,12 +185,11 @@ function formatDate(iso: string | null): string {
   }
 }
 
+// Only offered when the lead still has a conversation (deleting a
+// conversation keeps the lead and clears the link).
 function openLeadChat(lead: Lead) {
-  if (lead.conversation_id) {
-    router.push({ path: "/", query: { id: lead.conversation_id } });
-  } else {
-    router.push("/");
-  }
+  if (!lead.conversation_id) return;
+  router.push({ path: "/", query: { id: lead.conversation_id } });
 }
 
 async function copyPhone(phone: string) {
@@ -202,7 +199,10 @@ async function copyPhone(phone: string) {
     setTimeout(() => {
       copiedPhone.value = null;
     }, 2000);
-  } catch {}
+  } catch (err) {
+    console.error("Clipboard write failed", err);
+    toast.error(t("common.copyFailed"));
+  }
 }
 
 async function copyAllPhoneNumbers() {
@@ -218,29 +218,53 @@ async function copyAllPhoneNumbers() {
     setTimeout(() => {
       copiedAllPhones.value = false;
     }, 2500);
-  } catch {}
+  } catch (err) {
+    console.error("Clipboard write failed", err);
+    toast.error(t("common.copyFailed"));
+  }
+}
+
+// Every field quoted with inner quotes doubled. Customer-written text that
+// starts like a formula (= + - @) gets a leading apostrophe so a spreadsheet
+// shows it instead of evaluating it.
+function csvField(value: string | number, guardFormula = true): string {
+  let v = String(value ?? "");
+  if (guardFormula && /^[=+\-@\t\r]/.test(v)) v = `'${v}`;
+  return `"${v.replace(/"/g, '""')}"`;
 }
 
 function exportCsv() {
-  const headers = ["Mijoz", "Holat", "Niyat bali", "Telefon", "Qiziqqan mahsulotlari", "AI Xulosasi", "Sana"];
+  const headers = [
+    t("leads.csvCustomer"),
+    t("leads.csvStatus"),
+    t("leads.csvScore"),
+    t("leads.csvPhone"),
+    t("leads.csvProducts"),
+    t("leads.csvSummary"),
+    t("leads.csvDate"),
+  ];
   const rows = filteredLeads.value.map((l) => [
-    `"${l.customer_username || 'Mijoz'}"`,
-    `"${l.status}"`,
-    l.score,
-    `"${l.phone || ''}"`,
-    `"${(l.interested_products || []).map((p) => p.name).join(', ')}"`,
-    `"${(l.qualification_reason || '').replace(/"/g, '""')}"`,
-    `"${l.updated_at || l.created_at}"`
+    csvField(l.customer_username || t("leads.customer")),
+    csvField(l.status),
+    csvField(l.score, false),
+    csvField(l.phone || "", false),
+    csvField((l.interested_products || []).map((p) => p.name).join(", ")),
+    csvField(formatAiReason(l)),
+    csvField(l.updated_at || l.created_at, false),
   ]);
 
-  const csvContent = "data:text/csv;charset=utf-8," + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
-  const encodedUri = encodeURI(csvContent);
+  // BOM so Excel opens the UTF-8 (Cyrillic/Uzbek) text correctly; a Blob URL
+  // rather than a data: URI, which breaks on '#' and on large exports.
+  const csv = [headers.map((h) => csvField(h, false)).join(","), ...rows.map((r) => r.join(","))].join("\r\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.setAttribute("href", encodedUri);
-  link.setAttribute("download", `mivo_leads_${new Date().toISOString().slice(0, 10)}.csv`);
+  link.href = url;
+  link.download = `mivo_leads_${new Date().toISOString().slice(0, 10)}.csv`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }
 </script>
 
@@ -522,6 +546,17 @@ function exportCsv() {
       <Skeleton v-for="i in 5" :key="i" class="h-12 rounded-lg w-full" />
     </div>
 
+    <!-- Load Error -->
+    <Card v-else-if="loadError" class="text-center py-10 px-4 border-destructive/30 shadow-xs space-y-3">
+      <AlertCircle :size="28" class="mx-auto text-destructive" />
+      <p class="text-sm font-semibold text-foreground">{{ t("leads.loadError") }}</p>
+      <p class="text-xs text-muted-foreground">{{ loadError }}</p>
+      <Button variant="outline" size="sm" class="h-8 text-xs gap-1.5 cursor-pointer" @click="loadLeads">
+        <RefreshCw :size="13" />
+        <span>{{ t("common.retry") }}</span>
+      </Button>
+    </Card>
+
     <!-- Empty State -->
     <Card
       v-else-if="filteredLeads.length === 0"
@@ -648,6 +683,7 @@ function exportCsv() {
           <!-- Card Footer Actions -->
           <div class="flex items-center justify-end gap-2 pt-1 border-t border-border/40" @click.stop>
             <Button
+              v-if="lead.conversation_id"
               variant="outline"
               size="sm"
               class="h-8 text-xs gap-1.5 font-medium flex-1 cursor-pointer shadow-none"
@@ -787,6 +823,7 @@ function exportCsv() {
               <TableCell class="py-3 px-4 text-right whitespace-nowrap" @click.stop>
                 <div class="inline-flex items-center gap-1.5">
                   <Button
+                    v-if="lead.conversation_id"
                     variant="outline"
                     size="sm"
                     class="h-7 text-xs gap-1 px-2.5 font-medium cursor-pointer shadow-none"
@@ -924,6 +961,7 @@ function exportCsv() {
             {{ t("common.close") }}
           </Button>
           <Button
+            v-if="selectedLead.conversation_id"
             variant="default"
             size="sm"
             class="h-9 px-4 gap-1.5 cursor-pointer shadow-xs"

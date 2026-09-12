@@ -1,28 +1,69 @@
 <script setup lang="ts">
-import { ApiError } from "~/composables/useApi";
-import type { AiFeedback, Business } from "~/types/api";
+import { toast } from "vue-sonner";
+import type { AiFeedback, Business, BusinessUpdate } from "~/types/api";
 import {
   Building2,
   Sparkles,
   ShieldCheck,
+  ShieldAlert,
   UserCheck,
   Save,
   ChevronDown,
   ChevronUp,
   Bot,
   BrainCircuit,
-  Trash2
-} from "lucide-vue-next";
+  Trash2,
+  RefreshCw
+} from "@lucide/vue";
 
 definePageMeta({ layout: "dashboard" });
 
 const api = useMivoApi();
 const { t } = useI18n();
+
+// The fields this page edits — the only ones it ever sends. PATCH /business
+// rejects unknown fields and read-only ones (id, ai_suspended, ...).
+const TEXT_FIELDS = [
+  "description",
+  "target_customers",
+  "tone",
+  "language",
+  "selling_approach",
+  "rules_text",
+  "discount_policy",
+  "delivery_info",
+  "payment_info",
+  "handoff_instructions",
+] as const;
+type TextField = (typeof TEXT_FIELDS)[number];
+type SettingsForm = Record<TextField, string> & { ai_enabled: boolean };
+
+// Server values (read-only parts shown as-is) and the editable copy.
 const business = ref<Business | null>(null);
+const form = ref<SettingsForm | null>(null);
+const loadError = ref<string | null>(null);
 const learnedRules = ref<AiFeedback[]>([]);
 const saving = ref(false);
 const saved = ref(false);
 const error = ref<string | null>(null);
+
+function toForm(b: Business): SettingsForm {
+  const f = { ai_enabled: b.ai_enabled } as SettingsForm;
+  for (const key of TEXT_FIELDS) f[key] = b[key] ?? "";
+  return f;
+}
+
+// Only what changed since the last load/save; a cleared field is sent as null.
+function changedFields(): BusinessUpdate {
+  const patch: BusinessUpdate = {};
+  if (!business.value || !form.value) return patch;
+  for (const key of TEXT_FIELDS) {
+    const next = form.value[key].trim();
+    if (next !== (business.value[key] ?? "").trim()) patch[key] = next === "" ? null : next;
+  }
+  if (form.value.ai_enabled !== business.value.ai_enabled) patch.ai_enabled = form.value.ai_enabled;
+  return patch;
+}
 
 const openSections = ref<Record<string, boolean>>({
   business: true,
@@ -36,14 +77,33 @@ function toggleSection(sec: string) {
   openSections.value[sec] = !openSections.value[sec];
 }
 
-onMounted(async () => {
-  business.value = await api.getBusiness();
+function errorText(err: unknown, fallbackKey: string): string {
+  return err instanceof Error && err.message ? err.message : t(fallbackKey);
+}
+
+const learnedRulesError = ref<string | null>(null);
+
+async function loadSettings() {
+  loadError.value = null;
+  try {
+    const b = await api.getBusiness();
+    business.value = b;
+    form.value = toForm(b);
+  } catch (err) {
+    console.error("Failed to load business settings", err);
+    loadError.value = errorText(err, "aiSettings.loadError");
+    return;
+  }
+  learnedRulesError.value = null;
   try {
     learnedRules.value = await api.getLearnedRules();
   } catch (err) {
     console.error("Failed to load learned rules", err);
+    learnedRulesError.value = errorText(err, "aiSettings.learnedRulesLoadError");
   }
-});
+}
+
+onMounted(loadSettings);
 
 async function onDeleteRule(id: string) {
   try {
@@ -51,20 +111,29 @@ async function onDeleteRule(id: string) {
     learnedRules.value = learnedRules.value.filter((r) => r.id !== id);
   } catch (err) {
     console.error("Failed to delete learned rule", err);
+    toast.error(errorText(err, "aiSettings.deleteRuleError"));
   }
 }
 
 async function onSave() {
-  if (!business.value) return;
-  saving.value = true;
+  if (!business.value || !form.value || saving.value) return;
   error.value = null;
   saved.value = false;
+  const patch = changedFields();
+  if (Object.keys(patch).length === 0) {
+    saved.value = true;
+    setTimeout(() => { saved.value = false; }, 3000);
+    return;
+  }
+  saving.value = true;
   try {
-    business.value = await api.updateBusiness(business.value);
+    const updated = await api.updateBusiness(patch);
+    business.value = updated;
+    form.value = toForm(updated);
     saved.value = true;
     setTimeout(() => { saved.value = false; }, 3000);
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : t("aiSettings.saveError");
+    error.value = errorText(err, "aiSettings.saveError");
   } finally {
     saving.value = false;
   }
@@ -76,8 +145,18 @@ async function onSave() {
     <div v-if="error" class="error mb-5">{{ error }}</div>
     <div v-if="saved" class="success mb-5">{{ t("aiSettings.savedSuccess") }}</div>
 
+    <!-- Load Error -->
+    <Card v-if="loadError" class="p-6 text-center space-y-3 border-destructive/30">
+      <p class="text-sm font-semibold text-foreground">{{ t("aiSettings.loadError") }}</p>
+      <p class="text-xs text-muted-foreground">{{ loadError }}</p>
+      <Button variant="outline" size="sm" class="gap-1.5" @click="loadSettings">
+        <RefreshCw :size="14" />
+        <span>{{ t("common.retry") }}</span>
+      </Button>
+    </Card>
+
     <!-- Loading Skeleton State -->
-    <div v-if="!business" class="space-y-3 w-full">
+    <div v-else-if="!business || !form" class="space-y-3 w-full">
       <Skeleton class="h-20 w-full rounded-xl" />
       <Skeleton class="h-32 w-full rounded-xl" />
       <Skeleton class="h-32 w-full rounded-xl" />
@@ -86,6 +165,18 @@ async function onSave() {
 
     <!-- 1-Column Sequential Vertical Layout -->
     <div v-else class="flex flex-col gap-3">
+
+      <!-- Platform suspension: the owner's own switch can't override it -->
+      <div
+        v-if="business.ai_suspended"
+        class="p-4 rounded-xl border border-destructive/30 bg-destructive/10 text-destructive flex items-start gap-3"
+      >
+        <ShieldAlert :size="20" class="shrink-0 mt-0.5" />
+        <div class="space-y-0.5">
+          <div class="text-sm font-bold">{{ t("aiSettings.suspendedTitle") }}</div>
+          <p class="text-xs sm:text-sm text-destructive/90">{{ t("aiSettings.suspendedBody") }}</p>
+        </div>
+      </div>
 
       <!-- Master Switch Card -->
       <Card class="p-4 sm:p-5 border-border shadow-xs">
@@ -98,12 +189,12 @@ async function onSave() {
               <div class="text-base font-bold text-foreground truncate">
                 {{ t("aiSettings.enableAi") }}
               </div>
-              <div v-if="t('aiSettings.enableAiDesc')" class="text-muted-foreground text-xs sm:text-sm mt-0.5 line-clamp-2">
+              <div class="text-muted-foreground text-xs sm:text-sm mt-0.5 line-clamp-2">
                 {{ t("aiSettings.enableAiDesc") }}
               </div>
             </div>
           </div>
-          <Switch :checked="business.ai_enabled" @update:checked="business.ai_enabled = $event" class="shrink-0" />
+          <Switch v-model="form.ai_enabled" class="shrink-0" />
         </label>
       </Card>
 
@@ -119,11 +210,11 @@ async function onSave() {
         <div v-if="openSections['business']" class="p-5 pt-2 border-t border-border/60 space-y-4">
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.descLabel") }}</Label>
-            <Textarea v-model="business.description" :rows="3" :placeholder="t('aiSettings.descPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.description" maxlength="4000" :rows="3" :placeholder="t('aiSettings.descPlaceholder')" class="bg-background" />
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.targetLabel") }}</Label>
-            <Textarea v-model="business.target_customers" :rows="3" :placeholder="t('aiSettings.targetPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.target_customers" maxlength="4000" :rows="3" :placeholder="t('aiSettings.targetPlaceholder')" class="bg-background" />
           </div>
         </div>
       </div>
@@ -141,16 +232,16 @@ async function onSave() {
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div class="space-y-1.5">
               <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.toneLabel") }}</Label>
-              <Input v-model="business.tone" :placeholder="t('aiSettings.tonePlaceholder')" class="bg-background h-10" />
+              <Input v-model="form.tone" maxlength="4000" :placeholder="t('aiSettings.tonePlaceholder')" class="bg-background h-10" />
             </div>
             <div class="space-y-1.5">
               <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.langLabel") }}</Label>
-              <Input v-model="business.language" :placeholder="t('aiSettings.langPlaceholder')" class="bg-background h-10" />
+              <Input v-model="form.language" maxlength="50" :placeholder="t('aiSettings.langPlaceholder')" class="bg-background h-10" />
             </div>
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.sellingApproachLabel") }}</Label>
-            <Textarea v-model="business.selling_approach" :rows="3" :placeholder="t('aiSettings.sellingApproachPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.selling_approach" maxlength="4000" :rows="3" :placeholder="t('aiSettings.sellingApproachPlaceholder')" class="bg-background" />
           </div>
         </div>
       </div>
@@ -167,20 +258,20 @@ async function onSave() {
         <div v-if="openSections['policies']" class="p-5 pt-2 border-t border-border/60 space-y-4">
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.rulesLabel") }}</Label>
-            <Textarea v-model="business.rules_text" :rows="3" :placeholder="t('aiSettings.rulesPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.rules_text" maxlength="4000" :rows="3" :placeholder="t('aiSettings.rulesPlaceholder')" class="bg-background" />
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.discountLabel") }}</Label>
-            <Textarea v-model="business.discount_policy" :rows="2" :placeholder="t('aiSettings.discountPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.discount_policy" maxlength="4000" :rows="2" :placeholder="t('aiSettings.discountPlaceholder')" class="bg-background" />
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div class="space-y-1.5">
               <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.deliveryLabel") }}</Label>
-              <Textarea v-model="business.delivery_info" :rows="3" :placeholder="t('aiSettings.deliveryPlaceholder')" class="bg-background" />
+              <Textarea v-model="form.delivery_info" maxlength="4000" :rows="3" :placeholder="t('aiSettings.deliveryPlaceholder')" class="bg-background" />
             </div>
             <div class="space-y-1.5">
               <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.paymentLabel") }}</Label>
-              <Textarea v-model="business.payment_info" :rows="3" :placeholder="t('aiSettings.paymentPlaceholder')" class="bg-background" />
+              <Textarea v-model="form.payment_info" maxlength="4000" :rows="3" :placeholder="t('aiSettings.paymentPlaceholder')" class="bg-background" />
             </div>
           </div>
         </div>
@@ -198,7 +289,7 @@ async function onSave() {
         <div v-if="openSections['handoff']" class="p-5 pt-2 border-t border-border/60 space-y-4">
           <div class="space-y-1.5">
             <Label class="text-xs font-semibold text-foreground/90">{{ t("aiSettings.handoffLabel") }}</Label>
-            <Textarea v-model="business.handoff_instructions" :rows="4" :placeholder="t('aiSettings.handoffPlaceholder')" class="bg-background" />
+            <Textarea v-model="form.handoff_instructions" maxlength="4000" :rows="4" :placeholder="t('aiSettings.handoffPlaceholder')" class="bg-background" />
           </div>
         </div>
       </div>
@@ -217,7 +308,11 @@ async function onSave() {
             {{ t("aiSettings.learnedRulesDesc") }}
           </p>
 
-          <div v-if="learnedRules.length === 0" class="text-muted-foreground text-sm text-center py-6 bg-muted/40 rounded-lg border border-dashed border-border">
+          <div v-if="learnedRulesError" class="text-destructive text-sm text-center py-4 bg-destructive/5 rounded-lg border border-destructive/20">
+            {{ t("aiSettings.learnedRulesLoadError") }}: {{ learnedRulesError }}
+          </div>
+
+          <div v-else-if="learnedRules.length === 0" class="text-muted-foreground text-sm text-center py-6 bg-muted/40 rounded-lg border border-dashed border-border">
             {{ t("aiSettings.noLearnedRules") }}
           </div>
 

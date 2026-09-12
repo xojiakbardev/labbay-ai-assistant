@@ -20,10 +20,12 @@ export function useSuperadminApi() {
         method: "PATCH",
         body,
       }),
-    setAiEnabled: (businessId: string, ai_enabled: boolean) =>
+    // The platform kill switch — separate from the owner's own ai_enabled,
+    // which the superadmin can only see.
+    setAiSuspended: (businessId: string, ai_suspended: boolean) =>
       apiRequest<SuperadminBusiness>(`/superadmin/businesses/${businessId}/ai`, {
         method: "PATCH",
-        body: { ai_enabled },
+        body: { ai_suspended },
       }),
     deleteBusiness: (businessId: string) =>
       apiRequest<void>(`/superadmin/businesses/${businessId}`, { method: "DELETE" }),

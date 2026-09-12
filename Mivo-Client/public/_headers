@@ -5,6 +5,9 @@
 # or embedding, so the policy below is deliberately strict: no framing, no
 # unused browser APIs, a locked-down CSP.
 #
+# img-src allows blob: for the local preview of a photo picked for upload;
+# media-src https: lets customers' Instagram videos/voice notes play.
+#
 # connect-src/img-src use `https:` (any HTTPS host) rather than a fixed
 # domain because the backend API and R2 media host are only known via
 # NUXT_PUBLIC_API_BASE / R2_PUBLIC_BASE_URL at deploy time, not at build time
@@ -28,4 +31,4 @@
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()
   Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' https:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests

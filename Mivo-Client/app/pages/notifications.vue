@@ -1,9 +1,5 @@
 <script setup lang="ts">
 import {
-  Bell,
-  Flame,
-  Sparkles,
-  Info,
   Check,
   CheckCheck,
   Trash2,
@@ -12,9 +8,12 @@ import {
   User,
   CheckCircle2,
   Inbox,
-  Filter,
-} from "lucide-vue-next";
+  Loader2,
+  AlertCircle,
+  RefreshCw,
+} from "@lucide/vue";
 import type { NotificationItem } from "~/types/api";
+import { KNOWN_NOTIFICATION_TYPES, notificationTarget } from "~/composables/useNotifications";
 
 definePageMeta({
   layout: "dashboard",
@@ -27,12 +26,24 @@ const {
   notifications,
   unreadCount,
   isLoading,
+  isLoadingMore,
+  hasMore,
+  loadError,
+  loadMore,
   markAsRead,
   markAllAsRead,
   deleteNotification,
   deleteReadNotifications,
   fetchNotifications,
 } = useNotifications();
+
+function typeLabel(type: string): string | null {
+  return KNOWN_NOTIFICATION_TYPES.includes(type) ? t(`notifications.types.${type}`) : null;
+}
+
+function actionLabel(item: NotificationItem): string {
+  return item.extra_metadata?.conversation_id ? t("notifications.openChat") : t("notifications.viewAllLeads");
+}
 
 type FilterTab = "all" | "unread" | "hot";
 const currentTab = ref<FilterTab>("all");
@@ -75,13 +86,10 @@ async function handleClearRead() {
 }
 
 async function handleItemClick(item: NotificationItem) {
+  const target = notificationTarget(item);
+  if (target) router.push(target);
   if (!item.is_read) {
     await markAsRead(item.id);
-  }
-  if (item.lead_id) {
-    router.push({ path: "/leads", query: { id: item.lead_id } });
-  } else if (item.type.startsWith("lead")) {
-    router.push("/leads");
   }
 }
 
@@ -228,28 +236,19 @@ function formatTime(isoStr: string): string {
         <!-- Main Info Left -->
         <div class="flex items-start gap-3.5 min-w-0 flex-1">
           <!-- Icon -->
-          <div
-            :class="[
-              'w-9 h-9 rounded-xl flex items-center justify-center shrink-0 mt-0.5',
-              item.type === 'lead_hot'
-                ? 'bg-amber-500/15 text-amber-500 dark:bg-amber-500/25'
-                : item.type === 'lead_warm'
-                ? 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400'
-                : item.type === 'lead_updated'
-                ? 'bg-blue-500/15 text-blue-500'
-                : 'bg-primary/15 text-primary'
-            ]"
-          >
-            <Flame v-if="item.type === 'lead_hot' || item.type === 'lead_warm'" :size="18" />
-            <Sparkles v-else-if="item.type === 'lead_updated'" :size="18" />
-            <Info v-else :size="18" />
-          </div>
+          <NotificationTypeIcon :type="item.type" :size="18" class="w-9 h-9 rounded-xl mt-0.5" />
 
           <!-- Content -->
           <div class="min-w-0 flex-1 space-y-1">
             <div class="flex flex-wrap items-center gap-2">
               <span class="font-bold text-sm text-foreground">
                 {{ item.title }}
+              </span>
+              <span
+                v-if="typeLabel(item.type)"
+                class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-muted text-muted-foreground"
+              >
+                {{ typeLabel(item.type) }}
               </span>
               <span
                 v-if="!item.is_read"
@@ -298,13 +297,13 @@ function formatTime(isoStr: string): string {
         <!-- Action Buttons Right -->
         <div class="flex items-center gap-1.5 self-end sm:self-center shrink-0 pt-2 sm:pt-0">
           <Button
-            v-if="item.lead_id || item.type.startsWith('lead')"
+            v-if="notificationTarget(item)"
             variant="outline"
             size="sm"
             class="h-8 gap-1 text-xs cursor-pointer"
             @click="handleItemClick(item)"
           >
-            <span>{{ t("notifications.viewAllLeads") }}</span>
+            <span>{{ actionLabel(item) }}</span>
             <ExternalLink :size="12" />
           </Button>
 
@@ -332,6 +331,20 @@ function formatTime(isoStr: string): string {
       </div>
     </div>
 
+    <!-- Load Error -->
+    <div
+      v-else-if="loadError"
+      class="py-12 text-center border border-destructive/30 rounded-2xl bg-destructive/5 flex flex-col items-center justify-center gap-3"
+    >
+      <AlertCircle :size="24" class="text-destructive" />
+      <p class="text-sm font-semibold text-foreground">{{ t("notifications.loadError") }}</p>
+      <p class="text-xs text-muted-foreground">{{ loadError }}</p>
+      <Button variant="outline" size="sm" class="h-8 gap-1.5 text-xs cursor-pointer" @click="fetchNotifications">
+        <RefreshCw :size="13" />
+        <span>{{ t("common.retry") }}</span>
+      </Button>
+    </div>
+
     <!-- Empty State -->
     <div
       v-else-if="!isLoading"
@@ -354,6 +367,20 @@ function formatTime(isoStr: string): string {
     <!-- Loading State -->
     <div v-if="isLoading && notifications.length === 0" class="py-16 text-center text-xs text-muted-foreground">
       {{ t("common.loading") }}
+    </div>
+
+    <!-- Pagination: older notifications, a page at a time -->
+    <div v-if="hasMore && !loadError" class="flex justify-center pt-1">
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-8 gap-1.5 text-xs cursor-pointer"
+        :disabled="isLoadingMore"
+        @click="loadMore"
+      >
+        <Loader2 v-if="isLoadingMore" :size="13" class="animate-spin" />
+        <span>{{ t("common.loadMore") }}</span>
+      </Button>
     </div>
   </div>
 </template>

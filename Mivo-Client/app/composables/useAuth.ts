@@ -1,4 +1,7 @@
-import { getAccessToken, setTokens, clearTokens } from "./useApi";
+import { getAccessToken, getRefreshToken, setTokens, clearTokens, withTokenLock } from "./useApi";
+import { resetNotificationsState } from "./useNotifications";
+import { unsubscribeDevicePush } from "./usePushNotifications";
+import { resetUserPreferencesState } from "./useUserPreferences";
 
 // useState gives an SSR-safe, app-wide singleton ref — but since this app runs
 // with ssr:false, it's effectively just a shared client-side ref (plan: no SSR
@@ -18,6 +21,7 @@ export function useAuth() {
   const isAuthenticated = authState();
   const isSuperadmin = superadminState();
   const { apiRequest } = useApi();
+  const api = useMivoApi();
 
   // There's no self-serve signup — every account (business owner or
   // superadmin) is created by a superadmin. The dashboard only needs to know
@@ -35,21 +39,54 @@ export function useAuth() {
     }
   }
 
+  // Throws ApiError: 401 for bad credentials, 429 (with retryAfter) when
+  // throttled.
   async function signIn(loginKey: string, password: string) {
     const data = await apiRequest<{ access_token: string; refresh_token: string }>("/auth/login", {
       method: "POST",
-      body: { login: loginKey, login_key: loginKey, email: loginKey, password },
+      body: { email: loginKey, password },
     });
     setTokens(data.access_token, data.refresh_token);
     isAuthenticated.value = true;
     await fetchMe();
   }
 
-  function signOut() {
-    clearTokens();
+  /**
+   * Fixed order: this device's push subscription (needs the still-valid
+   * session), then the refresh token is revoked server-side, then local state
+   * is dropped and the page hard-reloads on /login. A failing server step is
+   * logged and sign-out still completes — the user asked to leave, and the
+   * local tokens are gone either way.
+   *
+   * Revoke-and-clear runs under the token lock: a refresh in flight (in any
+   * tab) finishes first, so the token revoked is the current one, and nothing
+   * can write a live session back after it's cleared.
+   */
+  async function signOut() {
+    try {
+      // No-op when this browser holds no push subscription.
+      await unsubscribeDevicePush(api);
+    } catch (err) {
+      console.error("[useAuth] push unsubscribe on sign-out failed", err);
+    }
+
+    await withTokenLock(async () => {
+      const refreshToken = getRefreshToken();
+      if (refreshToken) {
+        try {
+          await apiRequest<void>("/auth/logout", { method: "POST", body: { refresh_token: refreshToken } });
+        } catch (err) {
+          console.error("[useAuth] server-side logout failed", err);
+        }
+      }
+      clearTokens();
+    });
+
+    resetNotificationsState();
+    resetUserPreferencesState();
     isAuthenticated.value = false;
     isSuperadmin.value = null;
-    navigateTo("/login");
+    if (import.meta.client) window.location.href = "/login";
   }
 
   return { isAuthenticated, isSuperadmin, signIn, signOut, fetchMe };

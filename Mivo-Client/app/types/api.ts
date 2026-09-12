@@ -13,7 +13,28 @@ export interface Business {
   payment_info: string | null;
   handoff_instructions: string | null;
   ai_enabled: boolean;
+  // The platform's kill switch (set by the superadmin) — read-only here; the
+  // owner's own ai_enabled switch can't override it.
+  ai_suspended: boolean;
   ui_preferences?: Record<string, any> | null;
+}
+
+// PATCH /business rejects unknown fields (extra=forbid) and an explicit null
+// for name/ai_enabled — send only what was actually edited.
+export interface BusinessUpdate {
+  name?: string;
+  description?: string | null;
+  target_customers?: string | null;
+  tone?: string | null;
+  language?: string | null;
+  selling_approach?: string | null;
+  rules_text?: string | null;
+  discount_policy?: string | null;
+  delivery_info?: string | null;
+  payment_info?: string | null;
+  handoff_instructions?: string | null;
+  ai_enabled?: boolean;
+  ui_preferences?: Record<string, any>;
 }
 
 export interface Variant {
@@ -49,45 +70,129 @@ export interface Product {
   images: ProductImage[];
 }
 
+// Write shapes (ProductCreate / ProductUpdate on the server). Image URLs must
+// be http(s) — `data:` URLs are rejected with a 422; upload files first.
+export interface ImageInput {
+  url: string;
+  is_primary: boolean;
+}
+
+export interface VariantInput {
+  variant_type: string;
+  value: string;
+  attributes: Record<string, any>;
+  sku: string | null;
+  barcode: string | null;
+  price_override: number | null;
+  stock_quantity: number | null;
+  image_url: string | null;
+  images: string[];
+  availability: boolean;
+}
+
+export interface ProductInput {
+  name: string;
+  description?: string | null;
+  price?: number | null;
+  currency?: string;
+  availability?: boolean;
+  attributes?: Record<string, any>;
+  variants?: VariantInput[];
+  images?: ImageInput[];
+}
+
+// PATCH never sends null for name/currency/availability/attributes (NOT NULL
+// columns) — omit a field to leave it unchanged.
+export interface ProductPatch {
+  name?: string;
+  description?: string | null;
+  price?: number | null;
+  currency?: string;
+  availability?: boolean;
+  attributes?: Record<string, any>;
+  variants?: VariantInput[];
+  images?: ImageInput[];
+}
+
+export interface MediaUpload {
+  url: string;
+}
+
 export interface Lead {
   id: string;
   customer_id: string;
   customer_username?: string | null;
-  conversation_id: string;
+  // null once the conversation was deleted — the lead outlives it.
+  conversation_id: string | null;
   status: "cold" | "warm" | "hot";
   score: number;
   phone: string | null;
   interested_products: { id: string; name: string }[];
   summary: string | null;
   qualification_reason: string | null;
+  // Only the locales the AI actually wrote (uz always, ru/en maybe).
   summaries?: Record<string, string> | null;
   hot_notified_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
+export type ConversationStatus = "ai_active" | "active" | "human_needed" | "human_active" | "closed";
+
 export interface ConversationSummary {
   id: string;
   customer_id: string;
   customer_username?: string | null;
+  customer_name?: string | null;
   customer_phone?: string | null;
   channel: string;
-  status: string;
+  status: ConversationStatus | string;
   last_message_at: string | null;
   created_at: string;
 }
+
+export type DeliveryStatus = "pending" | "sent" | "failed" | "unknown";
 
 export interface Message {
   id: string;
   sender_type: "customer" | "ai" | "human" | "system";
   content: string;
   message_type: string;
+  // Media lives only here — never parse it out of `content`, which is
+  // whatever the customer typed.
+  attachment_url: string | null;
+  attachment_type: string | null;
+  // Outbound messages only.
+  delivery_status: DeliveryStatus | null;
+  delivery_error: string | null;
   created_at: string;
-  status?: "pending" | "sent" | "failed";
+  // Client-only: an optimistic operator reply that the server hasn't
+  // acknowledged (pending) or that never reached it (failed).
+  local?: boolean;
 }
 
 export interface ConversationDetail extends ConversationSummary {
+  // Oldest first — the most recent `limit` messages.
   messages: Message[];
+  has_more_messages: boolean;
+}
+
+// Non-notification payload on the SSE `notification` event.
+export interface ConversationUpdatedEvent {
+  type: "conversation_updated";
+  conversation_id: string;
+  customer_id: string;
+  last_message: string;
+  sender_type: string;
+}
+
+export interface Customer {
+  id: string;
+  business_id: string;
+  ig_scoped_id: string;
+  username: string | null;
+  name: string | null;
+  phone: string | null;
 }
 
 export interface AiFeedback {
@@ -112,11 +217,26 @@ export interface FeedbackCreateInput {
   correction?: string | null;
 }
 
+export interface InstagramStatus {
+  connected: boolean;
+  username?: string | null;
+  expires_at?: string | null;
+}
+
+export interface TelegramStatus {
+  connected: boolean;
+  username?: string | null;
+  chat_id?: string | null;
+}
+
 export interface SuperadminBusiness {
   id: string;
   name: string;
   owner_email: string;
+  // The owner's own switch — read-only for the superadmin.
   ai_enabled: boolean;
+  // The platform kill switch the superadmin controls.
+  ai_suspended: boolean;
   subscription_expires_at: string | null;
   subscription_active: boolean;
   created_at: string;
@@ -147,15 +267,25 @@ export interface RevenuePoint {
   expense_usd: number;
 }
 
+export type NotificationType =
+  | "lead_hot"
+  | "lead_warm"
+  | "lead_updated"
+  | "handoff"
+  | "ai_limit"
+  | "delivery_failed"
+  | "system";
+
 export interface NotificationItem {
   id: string;
-  business_id: string;
-  type: "lead_hot" | "lead_warm" | "lead_updated" | "system" | string;
+  business_id?: string;
+  type: NotificationType | string;
   title: string;
   message: string;
   lead_id?: string | null;
   customer_id?: string | null;
-  extra_metadata?: Record<string, any>;
+  // handoff / ai_limit / delivery_failed carry { conversation_id }.
+  extra_metadata?: Record<string, any> | null;
   is_read: boolean;
   created_at: string;
   read_at?: string | null;
@@ -202,4 +332,3 @@ export interface SandboxState {
   known_facts: { text: string; noted_at: string }[];
   interested_products: SandboxProduct[];
 }
-

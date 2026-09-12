@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Plus, Building2, CalendarClock, Check, Trash2 } from "lucide-vue-next";
+import { Plus, Building2, CalendarClock, Check, Trash2 } from "@lucide/vue";
 import type { SuperadminBusiness } from "~/types/api";
 import { formatFullDate } from "~/composables/useDateFormat";
 
@@ -12,10 +12,16 @@ const businesses = ref<SuperadminBusiness[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 
+function errorText(err: unknown, fallbackKey: string): string {
+  return err instanceof Error && err.message ? err.message : t(fallbackKey);
+}
+
 async function load() {
   loading.value = true;
   try {
     businesses.value = await api.listBusinesses();
+  } catch (err) {
+    error.value = errorText(err, "superadmin.businesses.loadError");
   } finally {
     loading.value = false;
   }
@@ -43,7 +49,7 @@ async function submitCreate() {
     createForm.value = { business_name: "", email: "", password: "", trial_days: 14 };
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "Failed to create business.";
+    error.value = errorText(err, "superadmin.businesses.createError");
   } finally {
     creating.value = false;
   }
@@ -82,16 +88,29 @@ async function submitExtend() {
     extendTarget.value = null;
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "Failed to extend subscription.";
+    error.value = errorText(err, "superadmin.businesses.extendError");
   } finally {
     extending.value = false;
   }
 }
 
-async function toggleAi(business: SuperadminBusiness) {
-  const updated = await api.setAiEnabled(business.id, !business.ai_enabled);
-  const idx = businesses.value.findIndex((b) => b.id === business.id);
-  if (idx !== -1) businesses.value[idx] = updated;
+// The switch is the platform kill switch (ai_suspended): on = AI allowed.
+// The owner's own ai_enabled is shown next to it, read-only.
+const togglingAiId = ref<string | null>(null);
+
+async function toggleSuspension(business: SuperadminBusiness) {
+  if (togglingAiId.value) return;
+  togglingAiId.value = business.id;
+  error.value = null;
+  try {
+    const updated = await api.setAiSuspended(business.id, !business.ai_suspended);
+    const idx = businesses.value.findIndex((b) => b.id === business.id);
+    if (idx !== -1) businesses.value[idx] = updated;
+  } catch (err) {
+    error.value = errorText(err, "superadmin.businesses.toggleAiError");
+  } finally {
+    togglingAiId.value = null;
+  }
 }
 
 // --- Delete (soft) ---
@@ -107,7 +126,7 @@ async function confirmDelete() {
     deleteTarget.value = null;
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : "Failed to delete business.";
+    error.value = errorText(err, "superadmin.businesses.deleteError");
   } finally {
     deleting.value = false;
   }
@@ -173,12 +192,21 @@ async function confirmDelete() {
             </TableCell>
             <TableCell class="text-sm text-muted-foreground">{{ fmtDate(b.subscription_expires_at) }}</TableCell>
             <TableCell>
-              <label class="inline-flex items-center gap-2 cursor-pointer" :title="t('superadmin.businesses.aiStatus')">
-                <Switch :model-value="b.ai_enabled" @update:model-value="toggleAi(b)" />
-                <span class="text-xs font-medium text-muted-foreground">
-                  {{ b.ai_enabled ? t("superadmin.businesses.aiOn") : t("superadmin.businesses.aiOff") }}
+              <div class="flex flex-col gap-1">
+                <label class="inline-flex items-center gap-2 cursor-pointer" :title="t('superadmin.businesses.platformSwitchTitle')">
+                  <Switch
+                    :model-value="!b.ai_suspended"
+                    :disabled="togglingAiId === b.id"
+                    @update:model-value="toggleSuspension(b)"
+                  />
+                  <span class="text-xs font-medium" :class="b.ai_suspended ? 'text-destructive' : 'text-muted-foreground'">
+                    {{ b.ai_suspended ? t("superadmin.businesses.aiSuspended") : t("superadmin.businesses.aiAllowed") }}
+                  </span>
+                </label>
+                <span class="text-[11px] text-muted-foreground">
+                  {{ b.ai_enabled ? t("superadmin.businesses.ownerAiOn") : t("superadmin.businesses.ownerAiOff") }}
                 </span>
-              </label>
+              </div>
             </TableCell>
             <TableCell class="font-mono text-sm">{{ fmtUsd(b.cost_last_30d_usd) }}</TableCell>
             <TableCell class="text-right">

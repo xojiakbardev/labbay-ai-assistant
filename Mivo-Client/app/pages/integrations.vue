@@ -11,7 +11,8 @@ import {
   BellRing,
   Loader2,
   RefreshCw,
-} from "lucide-vue-next";
+} from "@lucide/vue";
+import type { InstagramStatus } from "~/types/api";
 
 definePageMeta({ layout: "dashboard" });
 
@@ -25,35 +26,96 @@ const loadingStatus = ref(true);
 const isInstagramConnected = ref(false);
 const instagramUsername = ref<string | null>(null);
 const instagramExpiresAt = ref<string | null>(null);
+// A status that couldn't be loaded is shown as an error on its card — never
+// silently as "not connected".
+const instagramStatusError = ref<string | null>(null);
 
 const isTelegramConnected = ref(false);
 const telegramUsername = ref<string | null>(null);
+const telegramStatusError = ref<string | null>(null);
 
 const route = useRoute();
-const justConnected = ref(route.query.instagram_connected === "1");
-const instagramErrorReason = ref(route.query.instagram_error as string | undefined);
+const router = useRouter();
+const justConnected = ref(false);
+const completingInstagram = ref(false);
+const instagramConnectError = ref<string | null>(null);
 
-onMounted(async () => {
-  if (justConnected.value || instagramErrorReason.value) {
-    navigateTo("/integrations", { replace: true });
+function errorText(err: unknown, fallbackKey: string): string {
+  return err instanceof Error && err.message ? err.message : t(fallbackKey);
+}
+
+function applyInstagramStatus(status: InstagramStatus) {
+  isInstagramConnected.value = status.connected;
+  instagramUsername.value = status.username ?? null;
+  instagramExpiresAt.value = status.expires_at ?? null;
+}
+
+async function loadInstagramStatus() {
+  instagramStatusError.value = null;
+  try {
+    applyInstagramStatus(await api.getInstagramStatus());
+  } catch (err) {
+    console.error("Failed to fetch Instagram status", err);
+    instagramStatusError.value = errorText(err, "integrations.statusLoadError");
+  }
+}
+
+async function loadTelegramStatus() {
+  telegramStatusError.value = null;
+  try {
+    const status = await api.getTelegramStatus();
+    isTelegramConnected.value = status.connected;
+    telegramUsername.value = status.username ?? null;
+  } catch (err) {
+    console.error("Failed to fetch Telegram status", err);
+    telegramStatusError.value = errorText(err, "integrations.statusLoadError");
+  }
+}
+
+// Instagram's OAuth callback lands the browser here with a one-time
+// completion id (or an error reason); the logged-in dashboard finishes the
+// connection. The query is consumed once and removed from the URL.
+async function handleOAuthReturn(): Promise<boolean> {
+  const pending = typeof route.query.instagram_pending === "string" ? route.query.instagram_pending : null;
+  const oauthError = typeof route.query.instagram_error === "string" ? route.query.instagram_error : null;
+  if (!pending && !oauthError) return false;
+
+  const nextQuery = { ...route.query };
+  delete nextQuery.instagram_pending;
+  delete nextQuery.instagram_error;
+  router.replace({ query: nextQuery });
+
+  if (oauthError) {
+    instagramConnectError.value =
+      oauthError === "denied"
+        ? t("integrations.oauthDenied")
+        : oauthError === "invalid_state"
+          ? t("integrations.oauthInvalidState")
+          : t("integrations.connectionFailed", { reason: oauthError });
+    return false;
   }
 
-  push.checkStatus();
-
+  completingInstagram.value = true;
   try {
-    const [igStatus, tgStatus] = await Promise.all([
-      api.getInstagramStatus().catch(() => ({ connected: false })),
-      api.getTelegramStatus().catch(() => ({ connected: false })),
-    ]);
-
-    isInstagramConnected.value = igStatus.connected;
-    if (igStatus.username) instagramUsername.value = igStatus.username;
-    if ("expires_at" in igStatus && igStatus.expires_at) instagramExpiresAt.value = igStatus.expires_at;
-
-    isTelegramConnected.value = tgStatus.connected;
-    if (tgStatus.username) telegramUsername.value = tgStatus.username;
+    applyInstagramStatus(await api.completeInstagramConnect(pending!));
+    justConnected.value = true;
+    return true;
   } catch (err) {
-    console.error("Failed to fetch integration statuses", err);
+    console.error("Failed to complete Instagram connect", err);
+    instagramConnectError.value = t("integrations.connectionFailed", {
+      reason: errorText(err, "integrations.instagramConnectError"),
+    });
+    return false;
+  } finally {
+    completingInstagram.value = false;
+  }
+}
+
+onMounted(async () => {
+  push.checkStatus();
+  try {
+    const completed = await handleOAuthReturn();
+    await Promise.all([completed ? Promise.resolve() : loadInstagramStatus(), loadTelegramStatus()]);
   } finally {
     loadingStatus.value = false;
   }
@@ -101,7 +163,7 @@ async function startInstagramConnect() {
     const { oauth_url } = await api.connectInstagram();
     window.location.href = oauth_url;
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : "Could not start Instagram connect.";
+    error.value = errorText(err, "integrations.instagramConnectError");
   }
 }
 
@@ -131,7 +193,7 @@ async function onDisconnectInstagram() {
     instagramExpiresAt.value = null;
     showDisconnectInstagramConfirm.value = false;
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : "Could not disconnect Instagram.";
+    error.value = errorText(err, "integrations.instagramDisconnectError");
   } finally {
     disconnectingInstagram.value = false;
   }
@@ -179,13 +241,22 @@ async function onConnectTelegram() {
     telegramLink.value = deep_link;
     startTelegramCountdown(expires_at);
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : "Could not start Telegram connect.";
+    error.value =
+      err instanceof ApiError && err.status === 503
+        ? t("integrations.telegramNotConfigured")
+        : errorText(err, "integrations.telegramConnectError");
   }
 }
 
 async function copyTelegramLink() {
   if (!telegramLink.value) return;
-  await navigator.clipboard.writeText(telegramLink.value);
+  try {
+    await navigator.clipboard.writeText(telegramLink.value);
+  } catch (err) {
+    console.error("Clipboard write failed", err);
+    error.value = t("common.copyFailed");
+    return;
+  }
   telegramCopied.value = true;
   setTimeout(() => (telegramCopied.value = false), 2000);
 }
@@ -197,7 +268,7 @@ async function onDisconnectTelegram() {
     isTelegramConnected.value = false;
     telegramUsername.value = null;
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : "Could not disconnect Telegram.";
+    error.value = errorText(err, "integrations.telegramDisconnectError");
   }
 }
 </script>
@@ -209,13 +280,19 @@ async function onDisconnectTelegram() {
       {{ error }}
     </div>
 
+    <div v-if="completingInstagram" class="success mb-5">
+      <Loader2 :size="18" class="animate-spin" />
+      {{ t("integrations.completingInsta") }}
+    </div>
+
     <div v-if="justConnected" class="success mb-5">
       <CheckCircle2 :size="18" />
       {{ t("integrations.successInsta") }}
     </div>
 
-    <div v-if="instagramErrorReason" class="error mb-5">
-      {{ t("integrations.connectionFailed", { reason: instagramErrorReason }) }}
+    <div v-if="instagramConnectError" class="error mb-5">
+      <AlertCircle :size="18" />
+      {{ instagramConnectError }}
     </div>
 
     <!-- Loading Skeleton State -->
@@ -253,16 +330,31 @@ async function onDisconnectTelegram() {
             {{ t("integrations.instagramDesc") }}
           </p>
 
-          <div v-if="isInstagramConnected" class="bg-muted/50 border border-border p-3.5 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
+          <div v-if="instagramStatusError" class="bg-destructive/10 border border-destructive/20 text-destructive p-3 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center gap-1.5 text-xs">
+            <div class="flex items-center gap-1.5 font-semibold">
+              <AlertCircle :size="14" class="shrink-0" />
+              <span>{{ t("integrations.statusLoadError") }}</span>
+            </div>
+            <span class="text-destructive/80">{{ instagramStatusError }}</span>
+          </div>
+
+          <div v-else-if="isInstagramConnected" class="bg-muted/50 border border-border p-3.5 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
             <div class="text-[11px] text-muted-foreground uppercase tracking-wider font-semibold mb-0.5">{{ t("integrations.account") }}</div>
             <div class="font-bold text-sm text-foreground flex items-center gap-1 truncate">
-              <span class="text-primary font-bold">@</span>{{ instagramUsername || "Connected Account" }}
+              <span class="text-primary font-bold">@</span>{{ instagramUsername || t("integrations.connectedAccount") }}
+            </div>
+            <div v-if="expiryLabel" class="mt-1 text-[11px] font-medium" :class="expiryTone === 'ok' ? 'text-muted-foreground' : expiryTone === 'warm' ? 'text-amber-600 dark:text-amber-400' : 'text-destructive'">
+              {{ t("integrations.tokenExpires") }}: {{ expiryLabel }}
             </div>
           </div>
         </div>
 
         <div class="mt-auto pt-2">
-          <Button v-if="!isInstagramConnected" class="w-full h-9 gap-2 text-xs sm:text-sm font-medium" @click="onInstagramButtonClick">
+          <Button v-if="instagramStatusError" variant="outline" class="w-full h-9 gap-2 text-xs sm:text-sm font-medium" @click="loadInstagramStatus">
+            <RefreshCw :size="14" />
+            <span>{{ t("common.retry") }}</span>
+          </Button>
+          <Button v-else-if="!isInstagramConnected" class="w-full h-9 gap-2 text-xs sm:text-sm font-medium" :disabled="completingInstagram" @click="onInstagramButtonClick">
             <InstagramIcon :size="16" />
             <span>{{ t("integrations.instagramConnectBtn") }}</span>
           </Button>
@@ -277,7 +369,7 @@ async function onDisconnectTelegram() {
               @click="showDisconnectInstagramConfirm = true"
             >
               <LogOut :size="14" />
-              <span>{{ t("integrations.telegramDisconnectBtn") || "Uzish" }}</span>
+              <span>{{ t("integrations.telegramDisconnectBtn") }}</span>
             </Button>
           </div>
         </div>
@@ -303,10 +395,18 @@ async function onDisconnectTelegram() {
             {{ t("integrations.telegramDesc") }}
           </p>
 
-          <div v-if="isTelegramConnected" class="bg-muted/50 border border-border p-3.5 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
+          <div v-if="telegramStatusError" class="bg-destructive/10 border border-destructive/20 text-destructive p-3 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center gap-1.5 text-xs">
+            <div class="flex items-center gap-1.5 font-semibold">
+              <AlertCircle :size="14" class="shrink-0" />
+              <span>{{ t("integrations.statusLoadError") }}</span>
+            </div>
+            <span class="text-destructive/80">{{ telegramStatusError }}</span>
+          </div>
+
+          <div v-else-if="isTelegramConnected" class="bg-muted/50 border border-border p-3.5 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
             <div class="text-[11px] text-muted-foreground uppercase tracking-wider font-semibold mb-0.5">{{ t("integrations.chat") }}</div>
             <div class="font-bold text-sm text-foreground flex items-center gap-1 truncate">
-              <span class="text-sky-500 font-bold">@</span>{{ telegramUsername || "Notifications Connected" }}
+              <span class="text-sky-500 font-bold">@</span>{{ telegramUsername || t("integrations.telegramConnectedChat") }}
             </div>
           </div>
 
@@ -330,8 +430,12 @@ async function onDisconnectTelegram() {
         </div>
 
         <div class="mt-auto pt-2">
+          <Button v-if="telegramStatusError" variant="outline" class="w-full h-9 gap-2 text-xs sm:text-sm font-medium" @click="loadTelegramStatus">
+            <RefreshCw :size="14" />
+            <span>{{ t("common.retry") }}</span>
+          </Button>
           <Button
-            v-if="isTelegramConnected"
+            v-else-if="isTelegramConnected"
             variant="outline"
             class="w-full h-9 gap-1.5 text-xs sm:text-sm font-medium border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
             @click="onDisconnectTelegram"
@@ -362,7 +466,7 @@ async function onDisconnectTelegram() {
               <CheckIcon :size="13" /> {{ t("integrations.connected") }}
             </span>
             <span v-else-if="push.permission.value === 'denied'" class="connected-pill border-red-500/30 bg-red-500/10 text-red-500">
-              {{ t("integrations.expired") }}
+              {{ t("integrations.pushBlocked") }}
             </span>
           </div>
 
@@ -370,6 +474,20 @@ async function onDisconnectTelegram() {
           <p class="text-xs text-muted-foreground leading-relaxed mt-1 mb-3.5 min-h-[36px] line-clamp-2">
             {{ t("integrations.pushDesc") }}
           </p>
+
+          <!-- The server has no VAPID keys: push can't work, so it isn't offered. -->
+          <div v-if="push.isConfigured.value === false" class="bg-muted/50 border border-border text-muted-foreground p-3 rounded-xl text-xs mb-4 min-h-[66px] flex items-center">
+            {{ t("push.notConfigured") }}
+          </div>
+
+          <div v-else-if="!push.isSupported.value" class="bg-muted/50 border border-border text-muted-foreground p-3 rounded-xl text-xs mb-4 min-h-[66px] flex items-center">
+            {{ t("push.unsupported") }}
+          </div>
+
+          <div v-if="push.error.value" class="bg-destructive/10 border border-destructive/20 text-destructive p-3 rounded-xl text-xs mb-4 flex items-start gap-1.5">
+            <AlertCircle :size="14" class="shrink-0 mt-0.5" />
+            <span>{{ push.error.value }}</span>
+          </div>
 
           <div v-if="push.isSubscribed.value" class="bg-muted/50 border border-border p-3.5 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
             <div class="text-[11px] text-muted-foreground uppercase tracking-wider font-semibold mb-0.5">
@@ -400,7 +518,7 @@ async function onDisconnectTelegram() {
           <Button
             v-else
             class="w-full h-9 gap-2 text-xs sm:text-sm font-medium"
-            :disabled="push.loading.value || !push.isSupported.value"
+            :disabled="push.loading.value || !push.isSupported.value || push.isConfigured.value === false"
             @click="handleEnablePush"
           >
             <Loader2 v-if="push.loading.value" :size="16" class="animate-spin" />

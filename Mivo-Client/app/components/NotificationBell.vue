@@ -1,15 +1,13 @@
 <script setup lang="ts">
 import {
   Bell,
-  Flame,
-  Sparkles,
-  Info,
   Check,
   CheckCheck,
   CheckCircle2,
   ExternalLink,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import type { NotificationItem } from "~/types/api";
+import { notificationTarget } from "~/composables/useNotifications";
 
 const router = useRouter();
 const { t } = useI18n();
@@ -19,6 +17,7 @@ const {
   unreadNotifications,
   unreadCount,
   isLoading,
+  loadError,
   markAsRead,
   markAllAsRead,
   fetchNotifications,
@@ -57,15 +56,11 @@ function handleClickOutside(event: MouseEvent) {
 }
 
 async function handleNotificationClick(item: NotificationItem) {
+  isOpen.value = false;
+  const target = notificationTarget(item);
+  if (target) router.push(target);
   if (!item.is_read) {
     await markAsRead(item.id);
-  }
-  isOpen.value = false;
-
-  if (item.lead_id) {
-    router.push({ path: "/leads", query: { id: item.lead_id } });
-  } else if (item.type.startsWith("lead")) {
-    router.push("/leads");
   }
 }
 
@@ -100,7 +95,7 @@ function formatTime(isoStr: string): string {
       variant="outline"
       size="icon"
       class="relative h-9 w-9 rounded-xl border-border bg-card hover:bg-muted text-foreground transition-all cursor-pointer shadow-2xs"
-      :title="`Bildirishnomalar (${unreadCount} o'qilmagan)`"
+      :title="t('notifications.bellTitle', { count: unreadCount })"
       @click="toggleDropdown"
     >
       <Bell :size="16" class="text-foreground" />
@@ -159,22 +154,7 @@ function formatTime(isoStr: string): string {
             @click="handleNotificationClick(item)"
           >
             <!-- Type Icon -->
-            <div
-              :class="[
-                'w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5',
-                item.type === 'lead_hot'
-                  ? 'bg-amber-500/15 text-amber-500 dark:bg-amber-500/25'
-                  : item.type === 'lead_warm'
-                  ? 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400'
-                  : item.type === 'lead_updated'
-                  ? 'bg-blue-500/15 text-blue-500'
-                  : 'bg-primary/15 text-primary'
-              ]"
-            >
-              <Flame v-if="item.type === 'lead_hot' || item.type === 'lead_warm'" :size="16" />
-              <Sparkles v-else-if="item.type === 'lead_updated'" :size="16" />
-              <Info v-else :size="16" />
-            </div>
+            <NotificationTypeIcon :type="item.type" :size="16" class="w-8 h-8 rounded-lg mt-0.5" />
 
             <!-- Content -->
             <div class="flex-1 min-w-0">
@@ -215,9 +195,14 @@ function formatTime(isoStr: string): string {
             </div>
           </div>
 
+          <!-- Load Error -->
+          <div v-if="loadError && unreadNotifications.length === 0" class="py-8 px-4 text-center text-xs text-destructive">
+            {{ t("notifications.loadError") }}: {{ loadError }}
+          </div>
+
           <!-- Empty State -->
           <div
-            v-if="unreadNotifications.length === 0 && !isLoading"
+            v-else-if="unreadNotifications.length === 0 && !isLoading"
             class="py-10 px-4 text-center text-muted-foreground flex flex-col items-center justify-center gap-2"
           >
             <CheckCircle2 :size="28" class="text-emerald-500/70" />

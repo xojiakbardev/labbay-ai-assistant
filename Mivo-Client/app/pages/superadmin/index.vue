@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Building2, CheckCircle2, AlertCircle, Zap, Coins, Wallet } from "lucide-vue-next";
+import { Building2, CheckCircle2, AlertCircle, Zap, Coins, Wallet } from "@lucide/vue";
 import type { SuperadminStats, UsagePoint, RevenuePoint } from "~/types/api";
 import { formatShortDay, formatShortMonth } from "~/composables/useDateFormat";
 
