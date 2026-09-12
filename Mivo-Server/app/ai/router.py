@@ -41,7 +41,7 @@ from app.telegram.models import TelegramConnection
 logger = logging.getLogger("app.ai.router")
 
 # Sandbox sessions older than this will be auto-reset on next access
-SANDBOX_TTL_HOURS: int = 24
+SANDBOX_TTL_HOURS: int = get_settings().sandbox_ttl_hours
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 

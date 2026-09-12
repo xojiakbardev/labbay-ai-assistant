@@ -34,6 +34,9 @@ from app.businesses.models import Business
 from app.conversations.models import DELIVERY_PENDING, Conversation, Message, is_untranscribed_voice_note
 from app.conversations.service import add_message, get_recent_messages
 from app.leads.models import Lead
+from app.leads.scoring import COLD_MAX_SCORE, WARM_MAX_SCORE
+from app.core.config import get_settings
+from app import prompts
 
 
 def detect_preferred_language(
@@ -108,7 +111,8 @@ class TurnAnalysis(BaseModel):
     lead_score: int = Field(
         ge=0, le=100,
         description=(
-            "0-100, matching lead_status's band (0-34 cold, 35-69 warm, 70-100 hot). Your "
+            f"0-100, matching lead_status's band (0-{COLD_MAX_SCORE} cold, {COLD_MAX_SCORE + 1}-{WARM_MAX_SCORE} "
+            f"warm, {WARM_MAX_SCORE + 1}-100 hot). Your "
             "honest read of how close this customer is to buying right now — based only on "
             "this exact message and the conversation so far, not on how many messages "
             "you've exchanged or how promising it looked a few turns ago."
@@ -600,15 +604,9 @@ def _apply_reply_guards(
     return reply, flagged
 
 
-_DISCOUNT_TERMS = [
-    "chegirma", "aksiya", "arzon qilib", "skidka", "скидк", "акци",
-    "discount", "% off", "foiz chegirma", "promo", "promokod", "kupon", "купон"
-]
+_DISCOUNT_TERMS = prompts.lexicon()["discount_terms"]
 # Ways to lower a price without saying "discount" — "10% arzonroq", "уступлю".
-_PRICE_LOWERING_TERMS = [
-    "arzonroq", "arzonlashtir", "tushirib", "tushiraman", "kamaytirib", "kamaytiraman",
-    "cheaper", "less than", "дешевле", "уступ", "сбавл",
-]
+_PRICE_LOWERING_TERMS = prompts.lexicon()["price_lowering_terms"]
 # "chegirma yo'q", "скидок нет", "no discount right now" — honest denials.
 # Stripped before looking for claims, so a denial can't hide a claim elsewhere
 # in the same reply, and "100% paxta, chegirma yo'q" isn't read as a 100% one.
@@ -799,11 +797,8 @@ def _catalog_prices(escalation_state: dict, working_state: dict | None) -> set[f
 # Words that make a customer's number their budget ("500 minggacha",
 # "около 300 000", "budget 50$"). Only those numbers are theirs to repeat —
 # anything else they typed (a phone, an order code, a size) is not a price.
-_BUDGET_TERMS = (
-    "gacha", "atrofida", "atrof", "byudjet", "budjet", "budget", "oraliq", "dan oshmasin",
-    "до ", "около", "бюджет", "в пределах", "up to", "around", "under ",
-)
-_BUDGET_WINDOW = 25
+_BUDGET_TERMS = tuple(prompts.lexicon()["budget_terms"])
+_BUDGET_WINDOW = get_settings().guard_budget_window_chars
 
 
 def _customer_budget_numbers(text: str) -> set[float]:
@@ -869,7 +864,7 @@ def _allowed_prices(
     return allowed
 
 
-_PRICE_TOLERANCE = 0.01
+_PRICE_TOLERANCE = get_settings().guard_price_tolerance
 
 
 def _contains_unverified_price(reply: str, allowed: set[float]) -> bool:

@@ -16,7 +16,7 @@ from app.core.config import get_settings
 
 logger = logging.getLogger("app.storage.r2")
 
-MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
+MAX_FILE_SIZE_BYTES = get_settings().upload_max_bytes  # 5MB
 _CHUNK = 64 * 1024
 
 # Images referenced by URL only (not stored by us) carry this key prefix, so

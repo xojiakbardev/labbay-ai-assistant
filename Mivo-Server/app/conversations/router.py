@@ -24,10 +24,11 @@ from app.customers.models import Customer
 from app.instagram.client import MetaClient
 from app.instagram.models import InstagramAccount
 from app.notifications.broadcaster import broadcaster
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
-DETAIL_MESSAGE_LIMIT = 100
+DETAIL_MESSAGE_LIMIT = get_settings().conversation_detail_messages
 
 
 def get_meta_client() -> MetaClient:
@@ -46,7 +47,7 @@ def _display_name(cust: Customer) -> str:
     return "Instagram foydalanuvchisi"
 
 
-_PREVIEW_CHARS = 120
+_PREVIEW_CHARS = get_settings().conversation_preview_chars
 
 
 def _out(conv: Conversation, cust: Customer, last: LastMessageOut | None = None) -> ConversationOut:

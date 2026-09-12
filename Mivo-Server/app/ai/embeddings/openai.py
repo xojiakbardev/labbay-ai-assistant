@@ -27,19 +27,16 @@ from app.core.config import get_settings
 
 # OpenAI list prices, for the superadmin cost figures (the embeddings API
 # returns token counts, not cost). Unknown models are logged at $0.
-_USD_PER_MILLION_TOKENS = {
-    "text-embedding-3-large": 0.13,
-    "text-embedding-3-small": 0.02,
-}
+_USD_PER_MILLION_TOKENS = get_settings().embedding_usd_per_million_tokens
 
 logger = logging.getLogger("app.ai.embeddings.openai")
 
-_OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
+_OPENAI_EMBEDDINGS_URL = get_settings().embedding_api_url
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # The API accepts far more, but a batch that fails costs a retry of everything
 # in it, and catalogs here are small enough that this is never the bottleneck.
-MAX_BATCH = 64
+MAX_BATCH = get_settings().embedding_max_batch
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):

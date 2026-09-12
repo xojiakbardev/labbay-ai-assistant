@@ -1,0 +1,1 @@
+The assistant message directly above is the reply that was just sent to this customer. Read the whole conversation as it now stands and return your analysis as JSON matching the required schema.

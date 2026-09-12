@@ -30,7 +30,7 @@ from app.core.security import (
 # was lost) — refused, but without revoking the user's other sessions.
 REUSE_GRACE = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
 
-DEFAULT_TRIAL_DAYS = 14
+DEFAULT_TRIAL_DAYS = get_settings().trial_days
 
 _settings = get_settings()
 login_throttle = LoginThrottle(

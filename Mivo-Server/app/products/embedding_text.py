@@ -11,13 +11,12 @@ than by any write: editing a product's stock count shouldn't cost an API call,
 and a model change should re-embed everything.
 """
 import hashlib
+from app import prompts
 
 # Attributes worth embedding. Deliberately a list rather than "everything in
 # attributes" — internal keys like ai_instructions and image_url would add
 # noise to the vector without helping any customer's query.
-_EMBEDDED_ATTRIBUTES = (
-    "category", "brand", "material", "fit", "gender", "season", "style", "origin",
-)
+_EMBEDDED_ATTRIBUTES = tuple(prompts.lexicon()["embedded_attributes"])
 
 
 def build_embedding_text(product) -> str:

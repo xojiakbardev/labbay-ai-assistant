@@ -13,13 +13,14 @@ from app.ai.orchestrator import ConversationTurnResult, merge_known_facts
 from app.leads.models import Lead
 from app.leads.scoring import extract_valid_phone, status_from_score
 from app.products.models import Product
+from app.core.config import get_settings
 
 logger = logging.getLogger("app.leads.service")
 
 # How many products a lead remembers interest in (newest first).
-MAX_INTERESTED_PRODUCTS = 10
+MAX_INTERESTED_PRODUCTS = get_settings().lead_max_interested_products
 # How far back to look for a phone number the customer typed.
-PHONE_LOOKBACK_MESSAGES = 6
+PHONE_LOOKBACK_MESSAGES = get_settings().lead_phone_lookback_messages
 
 
 async def _validate_interested_products(

@@ -5,7 +5,7 @@ import httpx
 
 from app.core.config import get_settings
 
-_API_BASE = "https://api.telegram.org"
+_API_BASE = get_settings().telegram_api_base
 logger = logging.getLogger("app.telegram")
 
 

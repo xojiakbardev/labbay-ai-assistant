@@ -16,12 +16,13 @@ outstanding, what the customer pushed back on — come from the analyst pass.
 import datetime as dt
 import uuid
 from typing import Any
+from app.core.config import get_settings
 
 # Enough to keep the current thread of the sale coherent without turning the
 # system prompt into a second catalog.
-MAX_TRACKED_PRODUCTS = 6
-MAX_TRACKED_OBJECTIONS = 4
-MAX_VARIANTS_PER_PRODUCT = 8
+MAX_TRACKED_PRODUCTS = get_settings().state_max_tracked_products
+MAX_TRACKED_OBJECTIONS = get_settings().state_max_tracked_objections
+MAX_VARIANTS_PER_PRODUCT = get_settings().state_max_variants_per_product
 
 STAGES = ("greeting", "discovery", "recommendation", "objection", "closing", "handoff")
 
@@ -33,7 +34,7 @@ DISCOVERY_SLOTS = ("use_case", "size", "color", "budget", "recipient")
 
 # The subset actually worth chasing. Colour and who it's for are useful when
 # offered but not worth interrogating anyone about.
-ESSENTIAL_SLOTS = ("use_case", "size", "budget")
+ESSENTIAL_SLOTS = tuple(s for s in get_settings().essential_slots if s in DISCOVERY_SLOTS)
 
 
 def fact_snapshot(product_summary: dict[str, Any]) -> dict[str, Any]:

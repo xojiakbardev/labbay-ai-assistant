@@ -16,11 +16,12 @@ from app.core.security import SSE_TICKET_TTL, TOKEN_SSE, create_sse_ticket
 from app.notifications import service
 from app.notifications.broadcaster import broadcaster
 from app.notifications.schemas import MarkReadAllOut, NotificationOut, UnreadCountOut
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
-_HEARTBEAT_SECONDS = 15.0
-_REAUTH_EVERY_PINGS = 20  # ~5 minutes
+_HEARTBEAT_SECONDS = get_settings().sse_heartbeat_seconds
+_REAUTH_EVERY_PINGS = get_settings().sse_reauth_every_pings  # ~5 minutes
 
 
 async def _still_active(business_id: uuid.UUID) -> bool:

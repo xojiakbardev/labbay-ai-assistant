@@ -17,7 +17,7 @@ _AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
 _TOKEN_URL = "https://api.instagram.com/oauth/access_token"
 _LONG_LIVED_TOKEN_URL = "https://graph.instagram.com/access_token"
 _REFRESH_TOKEN_URL = "https://graph.instagram.com/refresh_access_token"
-_GRAPH_BASE = "https://graph.instagram.com/v21.0"
+_GRAPH_BASE = f"https://graph.instagram.com/{get_settings().instagram_graph_version}"
 _SCOPES = "instagram_business_basic,instagram_business_manage_messages"
 
 

@@ -13,22 +13,11 @@ from app.customers.models import Customer
 from app.leads.models import Lead
 from app.telegram.client import TelegramAPIError, TelegramClient
 from app.telegram.models import TelegramConnection
+from app import prompts
 
 logger = logging.getLogger("app.leads.notifications")
 
-_TEMPLATE = """🔥 <b>YANGI ISSIQ LID (HOT LEAD)!</b>
-
-👤 <b>Instagram:</b> @{username}
-📞 <b>Telefon:</b> <code>{phone}</code>
-📊 <b>Niyat darajasi:</b> <code>{score}/100</code>
-
-📦 <b>Qiziqqan mahsulotlari:</b>
-{products}
-
-💡 <b>AI Xulosasi:</b>
-<i>{summary}</i>
-
-👉 <a href="{frontend}/leads?id={lead_id}">Mivo Dashboard-da ochish</a>"""
+_TEMPLATE = prompts.load("telegram_hot_lead.html")
 
 
 def get_telegram_client() -> TelegramClient:

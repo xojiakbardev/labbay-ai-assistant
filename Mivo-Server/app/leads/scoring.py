@@ -1,14 +1,14 @@
 """Deterministic scoring bands + phone extraction (plan §10). A single source of
 truth for the cold/warm/hot thresholds, so nothing else hardcodes them."""
 import re
+from app.core.config import get_settings
+from app import prompts
 
-COLD_MAX_SCORE = 34
-WARM_MAX_SCORE = 69
+COLD_MAX_SCORE = get_settings().lead_cold_max_score
+WARM_MAX_SCORE = get_settings().lead_warm_max_score
 
 # Valid 2-digit Uzbek mobile and regional operator prefixes
-UZ_PREFIXES = frozenset({
-    "20", "33", "50", "55", "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "88", "90", "91", "92", "93", "94", "95", "97", "98", "99"
-})
+UZ_PREFIXES = frozenset(prompts.lexicon()["uz_phone_prefixes"])
 
 # Matches phone-number-shaped substrings with various separators
 _PHONE_CANDIDATE_PATTERN = re.compile(r"(?:\+\s*)?[\d][\d\s\-()./]{5,25}\d|\b\d{9}\b|\b\d{12}\b")

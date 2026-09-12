@@ -40,28 +40,28 @@ from app.products.models import EMBEDDING_DIMENSIONS, Product, ProductVariant
 
 logger = logging.getLogger("app.products.search")
 
-DEFAULT_LIMIT = 5
+DEFAULT_LIMIT = get_settings().search_default_limit
 
 # Reciprocal Rank Fusion's damping constant. 60 is the value from the original
 # paper and the usual default: high enough that rank 1 doesn't dominate, low
 # enough that deep results stop mattering.
-_RRF_K = 60
+_RRF_K = get_settings().search_rrf_k
 
 # How many candidates each retriever contributes to the fusion. Wider than
 # `limit` so a product ranked 6th lexically and 1st semantically can still win.
-_CANDIDATE_POOL = 20
+_CANDIDATE_POOL = get_settings().search_candidate_pool
 
 # Cosine distance above which a "nearest" product isn't actually related.
 # Vector search always returns its N closest rows, however far away they are —
 # without this, a query matching nothing would still come back full of
 # confident-looking rubbish, which is worse than an honest empty result.
 # Tune against the eval suite (`python -m evals.run`), not by intuition.
-_SEMANTIC_MAX_DISTANCE = 0.62
+_SEMANTIC_MAX_DISTANCE = get_settings().semantic_max_distance
 
 # Query embeddings are hit repeatedly — the same customer phrasing recurs across
 # retries and tool calls within one turn. Small, process-local, best-effort.
 _QUERY_VECTOR_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
-_QUERY_VECTOR_CACHE_MAX = 256
+_QUERY_VECTOR_CACHE_MAX = get_settings().semantic_query_cache_size
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -160,7 +160,7 @@ def _variant_filter(variant_type: str, value: str):
     )
 
 
-_TRIGRAM_THRESHOLD = 0.25
+_TRIGRAM_THRESHOLD = get_settings().search_trigram_threshold
 
 
 async def _trigram_fallback(db, business_id, *, query, price_max, only_available, limit, color, size):
@@ -216,7 +216,7 @@ async def _run(db, business_id, *, ts_query, price_max, only_available, limit, c
 
 # After an embedding call fails, the semantic tier sits out this long rather
 # than making every search in every turn wait for the same dead API again.
-_EMBEDDING_COOLDOWN_SECONDS = 60.0
+_EMBEDDING_COOLDOWN_SECONDS = get_settings().embedding_cooldown_seconds
 _embedding_down_until = 0.0
 
 

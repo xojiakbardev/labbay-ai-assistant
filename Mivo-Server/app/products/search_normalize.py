@@ -4,49 +4,9 @@ Translates Cyrillic to Latin, unifies Uzbek apostrophe variants (oʻ/o'/gʻ/g'),
 strips punctuation, and returns a clean lowercased string for trigram matching.
 """
 import re
+from app import prompts
 
-_CYRILLIC_TO_LATIN = {
-    # Multi-character transliterations
-    "ё": "yo",
-    "ю": "yu",
-    "я": "ya",
-    "ч": "ch",
-    "ш": "sh",
-    "щ": "sh",
-    "ц": "ts",
-    # Single-character transliterations
-    "а": "a",
-    "б": "b",
-    "в": "v",
-    "г": "g",
-    "д": "d",
-    "е": "e",
-    "ж": "j",
-    "з": "z",
-    "и": "i",
-    "й": "y",
-    "к": "k",
-    "л": "l",
-    "м": "m",
-    "н": "n",
-    "о": "o",
-    "п": "p",
-    "р": "r",
-    "с": "s",
-    "т": "t",
-    "у": "u",
-    "ф": "f",
-    "х": "x",
-    "ъ": "",
-    "ы": "i",
-    "ь": "",
-    "э": "e",
-    # Uzbek Cyrillic specific letters
-    "қ": "q",
-    "ғ": "g",
-    "ў": "o",
-    "ҳ": "h",
-}
+_CYRILLIC_TO_LATIN = prompts.lexicon()["cyrillic_to_latin"]
 
 _APOSTROPHES = r"['ʻ’‘ʼ`´\"״]"
 
@@ -83,33 +43,7 @@ def normalize_for_search(text: str | None) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-_SYNONYM_MAP: dict[str, list[str]] = {
-    "krasovka": ["krossovka", "keta", "sneakers"],
-    "krasofka": ["krossovka", "krasovka"],
-    "krossi": ["krossovka", "krasovka"],
-    "krossovki": ["krossovka", "krasovka"],
-    "keta": ["krossovka", "kedy"],
-    "poyabzal": ["tufli", "krossovka", "oyoqkiyim"],
-    "oyoqkiyim": ["poyabzal", "krossovka", "tufli"],
-    "futbolka": ["mayka", "tshirt"],
-    "mayka": ["futbolka"],
-    "shim": ["bryuk", "bryuki", "djinsi", "jinsi"],
-    "bryuk": ["shim", "bryuki"],
-    "bryuki": ["shim"],
-    "djinsi": ["shim", "jinsi"],
-    "jinsi": ["shim", "djinsi"],
-    "kofta": ["sviter", "hudi", "hoodie", "tolstovka"],
-    "hudi": ["hoodie", "sviter", "tolstovka"],
-    "hoodie": ["hudi", "sviter", "tolstovka"],
-    "sviter": ["kofta"],
-    "kurtka": ["jaket", "vetrovka"],
-    "koylak": ["platye", "rubashka"],
-    "rubashka": ["koylak"],
-    "sumka": ["ryukzak", "sumkalar"],
-    "ryukzak": ["sumka"],
-    "soat": ["smartwatch"],
-    "tufli": ["lofer", "loafer", "poyabzal"],
-}
+_SYNONYM_MAP: dict[str, list[str]] = prompts.lexicon()["synonyms"]
 
 
 def get_synonyms_for_word(word: str) -> list[str]:

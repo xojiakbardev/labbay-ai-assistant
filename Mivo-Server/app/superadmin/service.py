@@ -14,7 +14,7 @@ from app.auth.models import User
 from app.businesses.models import Business
 from app.core.config import get_settings
 
-_OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+_OPENROUTER_CREDITS_URL = get_settings().llm_credits_url
 
 
 def _month_start(now: dt.datetime) -> dt.datetime:

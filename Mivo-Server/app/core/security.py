@@ -22,7 +22,7 @@ TOKEN_SSE = "sse"
 # password" and response timing can't be used to enumerate accounts.
 _DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"timing-equaliser", bcrypt.gensalt()).decode()
 
-SSE_TICKET_TTL = dt.timedelta(seconds=60)
+SSE_TICKET_TTL = dt.timedelta(seconds=get_settings().sse_ticket_ttl_seconds)
 
 
 # bcrypt only uses the first 72 bytes and bcrypt>=5 raises on longer input.
@@ -31,7 +31,7 @@ MAX_PASSWORD_BYTES = 72
 # bcrypt is ~250ms of CPU per call. Run on the event loop it stalls every
 # other request (webhooks, SSE) for that long, so it runs in worker threads —
 # at most this many at once, so a login flood queues instead of eating the CPU.
-_BCRYPT_SLOTS = asyncio.Semaphore(4)
+_BCRYPT_SLOTS = asyncio.Semaphore(get_settings().bcrypt_concurrency)
 
 
 def password_too_long(password: str) -> bool:

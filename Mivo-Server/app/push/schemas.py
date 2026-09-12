@@ -1,17 +1,12 @@
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator
+from app.core.config import get_settings
 
 # The server POSTs to whatever endpoint a subscription names, so it must be a
 # real browser push service — anything else turns /push/test into a way to
 # make the server call internal addresses (SSRF).
-_PUSH_SERVICE_HOSTS = (
-    "fcm.googleapis.com",
-    "updates.push.services.mozilla.com",
-    "web.push.apple.com",
-    ".push.apple.com",
-    ".notify.windows.com",
-)
+_PUSH_SERVICE_HOSTS = tuple(get_settings().push_service_hosts)
 
 
 def _is_push_service(url: str) -> bool:

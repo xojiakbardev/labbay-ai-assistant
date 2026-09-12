@@ -79,7 +79,7 @@ _AUDIO_UNREADABLE = "[Ovozli xabar — matnga o'girib bo'lmadi]"
 # Reels carry their caption as the payload's "title" — the only part of them
 # anyone can read without opening them — and that's kept as the text.
 _CAPTIONED = ("share", "ig_post", "ig_reel", "reel")
-_MAX_CAPTION = 500
+_MAX_CAPTION = _settings.caption_max_chars
 
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,12 @@ from app.products.ingestion import service as ingestion_service
 from app.products.ingestion.service import IngestionError
 from app.products.schemas import ImageOut, MediaUploadOut, ProductCreate, ProductOut, ProductUpdate
 from app.storage.r2 import R2Storage, get_r2_storage, validate_and_read_upload
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 # A pasted catalogue, not a novel — and every character is sent to the LLM.
-MAX_IMPORT_TEXT_CHARS = 50_000
+MAX_IMPORT_TEXT_CHARS = get_settings().product_import_max_chars
 
 
 class ImportPreviewRequest(BaseModel):

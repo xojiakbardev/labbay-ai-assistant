@@ -5,23 +5,9 @@ from typing import Any
 
 from app.products.ingestion.schemas import RawExtractedProduct, RawExtractedProductList
 from app.products.schemas import ImageIn, ProductCreate, VariantIn
+from app import prompts
 
-_CURRENCY_ALIASES = {
-    "so'm": "UZS",
-    "som": "UZS",
-    "sum": "UZS",
-    "сум": "UZS",
-    "uzs": "UZS",
-    "$": "USD",
-    "usd": "USD",
-    "dollar": "USD",
-    "доллар": "USD",
-    "rub": "RUB",
-    "руб": "RUB",
-    "rubl": "RUB",
-    "eur": "EUR",
-    "euro": "EUR",
-}
+_CURRENCY_ALIASES = prompts.lexicon()["currency_aliases"]
 
 
 def _normalize_currency(raw: str | None) -> str:

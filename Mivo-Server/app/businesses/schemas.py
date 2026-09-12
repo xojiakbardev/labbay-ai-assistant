@@ -4,6 +4,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.ai.replies import DEFAULT_REPLIES, LANGUAGES, MAX_REPLY_CHARS
+from app.core.config import get_settings
 
 
 class BusinessOut(BaseModel):
@@ -29,7 +30,7 @@ class BusinessOut(BaseModel):
     reply_texts: dict[str, dict[str, str]] = {}
 
 
-_TEXT = 4000  # generous for a settings paragraph, bounded for the prompt
+_TEXT = get_settings().business_text_max_chars  # generous for a settings paragraph, bounded for the prompt
 
 
 class BusinessUpdate(BaseModel):

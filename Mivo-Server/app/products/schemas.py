@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
+from app.core.config import get_settings
 
 # Numeric(14, 2) holds up to 999 999 999 999.99.
 _MAX_PRICE = Decimal("999999999999.99")
@@ -14,7 +15,7 @@ Money = Annotated[
     Field(ge=0, le=_MAX_PRICE, decimal_places=2),
     PlainSerializer(float, return_type=float, when_used="json"),
 ]
-_MAX_IMAGES = 20
+_MAX_IMAGES = get_settings().product_max_images
 
 
 def _check_image_url(url: str) -> str:

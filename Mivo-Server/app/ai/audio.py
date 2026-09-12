@@ -12,17 +12,17 @@ import uuid
 import httpx
 
 from app.core.config import get_settings
+from app import prompts
 
 logger = logging.getLogger("app.ai.audio")
 
 # Instagram voice notes are well under this; anything bigger isn't one.
-MAX_AUDIO_BYTES = 25 * 1024 * 1024
-_DOWNLOAD_TIMEOUT = 20.0
-_STT_TIMEOUT = 45.0
+MAX_AUDIO_BYTES = get_settings().stt_max_audio_bytes
+_DOWNLOAD_TIMEOUT = get_settings().stt_download_timeout_seconds
+_STT_TIMEOUT = get_settings().stt_timeout_seconds
 
 _PROMPT = (
-    "Ushbu audio xabarni so'zma-so'z matnga aylantiring (o'zbek, rus yoki ingliz tilida, qaysi tilda "
-    "gapirilgan bo'lsa). Faqat eshitilgan so'zlarni qaytaring, hech qanday izoh qo'shmang."
+    prompts.load("transcription.md")
 )
 
 

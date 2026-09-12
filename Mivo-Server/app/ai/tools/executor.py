@@ -19,12 +19,14 @@ from app.products.discovery import (
 from app.products.media import get_display_image_url
 from app.products.models import Product
 from app.products.search import check_availability, get_product_by_id, search_products, variant_matches
+from app.core.config import get_settings
+from app import prompts
 
 # Tool results are re-sent on every later round, to the writer and to the
 # analyst, so each product costs its size several times over. The model needs
 # the facts, not the full marketing copy or the photo URLs (the backend sends
 # photos itself — the model only ever names product ids).
-_MAX_DESCRIPTION_CHARS = 600
+_MAX_DESCRIPTION_CHARS = get_settings().tool_description_max_chars
 
 
 def _variant_available(v) -> bool:
@@ -71,11 +73,7 @@ def _product_summary(product: Product) -> dict:
 # admitting it doesn't have one. A bare "invalid product_id" doesn't tell it what
 # to do next, so it has reported that literal error to the customer before —
 # spell out the fix so it self-corrects within the same turn instead.
-_INVALID_PRODUCT_ID = {
-    "error": "invalid product_id — this must be a real UUID from a search_products "
-    "result, not a name or invented ID. Call search_products first to get it, then "
-    "retry with the returned id."
-}
+_INVALID_PRODUCT_ID = {"error": prompts.load("tool_invalid_product_id.md")}
 
 
 def _price_or_none(value: Any) -> float | None:

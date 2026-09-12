@@ -1,0 +1,1 @@
+Ushbu audio xabarni so'zma-so'z matnga aylantiring (o'zbek, rus yoki ingliz tilida, qaysi tilda gapirilgan bo'lsa). Faqat eshitilgan so'zlarni qaytaring, hech qanday izoh qo'shmang.

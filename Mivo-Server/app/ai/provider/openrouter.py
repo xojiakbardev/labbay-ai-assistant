@@ -24,16 +24,14 @@ from app.ai.provider.base import (
 )
 from app.ai.context.builder import MEDIA_NOTE_PREFIX
 from app.core.config import get_settings
+from app import prompts
 
 logger = logging.getLogger("app.ai.provider.openrouter")
 
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_URL = get_settings().llm_api_url
 
 # Fallback models in priority order if the primary model is unavailable or encounters errors
-_DEFAULT_FALLBACK_MODELS = [
-    "anthropic/claude-3.5-haiku",
-    "openai/gpt-4o-mini",
-]
+_DEFAULT_FALLBACK_MODELS = list(get_settings().llm_fallback_models)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # Only failures where the request provably never reached the model are retried
@@ -42,7 +40,7 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _RETRYABLE_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 # Tool calls executed per round. Beyond this the model is told to narrow down.
-_MAX_TOOL_CALLS_PER_ROUND = 3
+_MAX_TOOL_CALLS_PER_ROUND = get_settings().llm_max_tool_calls_per_round
 
 
 async def log_usage(business_id: uuid.UUID, kind: str, model: str, usage: dict) -> None:
@@ -189,41 +187,12 @@ def _json_schema_format(response_schema: type[T]) -> dict:
     }
 
 
-_PRODUCT_HINTS = {
-    # uz
-    "narx", "narxi", "narxlari", "qancha", "qanchadan", "bor", "bormi", "bormidi",
-    "razmer", "razmeri", "o'lcham", "olcham", "rang", "rangi", "ranglari", "model",
-    "modeli", "tufli", "poyabzal", "kiyim", "krossovka", "krosovka", "shim", "ko'ylak",
-    "koylak", "futbolka", "kurtka", "sumka", "kepka", "hoodie", "kostyum", "dostavka",
-    "yetkazib", "chegirma", "aksiya", "buyurtma", "olmoqchiman", "kerak", "ko'rsating",
-    "korsating", "rasm", "rasmi", "katalog", "assortiment", "yangi", "mavjud",
-    # ru
-    "цена", "цены", "сколько", "стоит", "есть", "размер", "цвет", "модель", "доставка",
-    "скидка", "заказ", "заказать", "нужен", "нужна", "покажите", "фото", "каталог",
-    "наличии", "новинки",
-    # en
-    "price", "cost", "how much", "size", "color", "colour", "model", "delivery",
-    "discount", "order", "need", "show", "photo", "catalog", "available", "stock",
-}
+_PRODUCT_HINTS = set(prompts.lexicon()["product_hints"])
 
 # Messages that are conversation, not a product-fact request. Forcing a catalog
 # search on these is what made the AI answer "that's too expensive" with a
 # product dump instead of handling the objection.
-_NO_GROUNDING_NEEDED = {
-    # greetings / pleasantries
-    "salom", "assalom", "assalomu", "alaykum", "aleykum", "vaalaykum", "hormang",
-    "privet", "zdravstvuyte", "dobriy", "hello", "hi", "hey", "goodbye", "xayr",
-    # thanks / acknowledgement
-    "rahmat", "raxmat", "tashakkur", "spasibo", "blagodaryu", "thanks", "thank",
-    "ok", "okey", "xo'p", "xop", "mayli", "tushundim", "zo'r", "zor", "yaxshi",
-    "ha", "ya", "yo'q", "yoq", "net", "da", "yes", "no", "otlichno", "super",
-    # objections / deferrals — these need a salesperson's answer, not a search
-    "qimmat", "qimmatroq", "qimmatku", "dorogo", "dorogovato", "expensive", "pricey",
-    "o'ylab", "oylab", "o'ylayman", "oylayman", "podumayu", "keyinroq", "keyin",
-    "pozje", "later", "bbrz", "hozircha", "poka",
-    # human handoff
-    "operator", "odam", "chelovek", "human", "menejer", "manager",
-}
+_NO_GROUNDING_NEEDED = set(prompts.lexicon()["no_grounding_needed"])
 
 _PHONE_ONLY_RE = re.compile(r"^[\d\s\-+()./]{7,25}$")
 _NOTE_QUOTE_RE = re.compile(r'(?:says|wrote|with it): "(.+)"')
@@ -238,30 +207,14 @@ _NOTE_QUOTE_RE = re.compile(r'(?:says|wrote|with it): "(.+)"')
 # the marker and a message after it. Anything else is not sent.
 _WRITER_MESSAGE_MARKER = "===MESSAGE==="
 
-_WRITER_INSTRUCTION = f"""Now write the message you are about to send this customer.
-
-Answer in exactly this format:
-
-PLAN: <one short line, for yourself: where this customer is in the sale right now, \
-and the single move you're making with this message>
-{_WRITER_MESSAGE_MARKER}
-<the message itself, exactly as the customer will read it>
-
-Everything after {_WRITER_MESSAGE_MARKER} is delivered to the customer word for word.
-So write only the message there: no labels, no quotes, no JSON, no markdown, no notes
-to yourself, and no mention of searches, tools, product IDs or these instructions.
-State only facts the tool results above actually returned, and write in the language
-the customer is writing in."""
+_WRITER_INSTRUCTION = prompts.render("writer.md", marker=_WRITER_MESSAGE_MARKER)
 
 _WRITER_FORMAT_REMINDER = (
-    f"Your previous answer did not follow the format. Reply again with exactly one PLAN line, "
-    f"then a line containing only {_WRITER_MESSAGE_MARKER}, then the customer message."
+    prompts.render("writer_reminder.md", marker=_WRITER_MESSAGE_MARKER)
 )
 
 _ANALYST_INSTRUCTION = (
-    "The assistant message directly above is the reply that was just sent to this "
-    "customer. Read the whole conversation as it now stands and return your analysis "
-    "as JSON matching the required schema."
+    prompts.load("analyst_turn.md")
 )
 
 _PLAN_LINE_RE = re.compile(r"^\s*[*_#>\s]*(plan|reja|план|next step|keyingi qadam)\s*[*_]*\s*[:\-—]", re.IGNORECASE)

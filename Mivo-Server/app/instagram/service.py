@@ -16,10 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decrypt_secret, encrypt_secret
 from app.instagram.client import ConnectedAccount, MetaAPIError, MetaClient
 from app.instagram.models import InstagramAccount, OAuthState
+from app.core.config import get_settings
 
 logger = logging.getLogger("app.instagram.service")
 
-OAUTH_STATE_TTL = dt.timedelta(minutes=15)
+OAUTH_STATE_TTL = dt.timedelta(minutes=get_settings().instagram_oauth_state_ttl_minutes)
 
 
 class OAuthFlowError(Exception):
@@ -211,8 +212,8 @@ async def backfill_customer_profiles(db: AsyncSession, meta_client: MetaClient, 
     return len(rows)
 
 
-REFRESH_WINDOW = dt.timedelta(days=10)
-MIN_TOKEN_AGE = dt.timedelta(hours=24)
+REFRESH_WINDOW = dt.timedelta(days=get_settings().instagram_token_refresh_window_days)
+MIN_TOKEN_AGE = dt.timedelta(hours=get_settings().instagram_token_min_age_hours)
 
 
 async def refresh_expiring_tokens(db: AsyncSession, meta_client: MetaClient) -> int:

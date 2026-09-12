@@ -13,16 +13,17 @@ away. The worst outcome here is a customer receiving mangled text, which is far
 worse than an unsplit reply.
 """
 import re
+from app.core.config import get_settings
 
 # Below this, it's already one natural message.
-MIN_TOTAL_CHARS = 150
+MIN_TOTAL_CHARS = get_settings().reply_split_min_total_chars
 
 # A fragment shorter than this is a sentence stub, not a message — merge it.
-MIN_PART_CHARS = 30
+MIN_PART_CHARS = get_settings().reply_split_min_part_chars
 
 # Instagram tolerates more, but three is where it still reads as a person
 # talking rather than a notification burst.
-MAX_PARTS = 3
+MAX_PARTS = get_settings().reply_split_max_parts
 
 # Sentence end followed by whitespace. Uzbek, Russian and English all break the
 # same way here; the lookbehind keeps the punctuation with the sentence it ends.

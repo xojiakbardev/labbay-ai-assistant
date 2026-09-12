@@ -167,6 +167,88 @@ class Settings(BaseSettings):
     conversation_lock_wait_seconds: int = 120
     refresh_reuse_grace_seconds: int = 30
 
+    # LLM calls.
+    llm_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    llm_credits_url: str = "https://openrouter.ai/api/v1/credits"
+    llm_fallback_models: list[str] = ["anthropic/claude-3.5-haiku", "openai/gpt-4o-mini"]
+    llm_max_tool_calls_per_round: int = 3
+    tool_description_max_chars: int = 600
+    closing_transcript_messages: int = 6
+    stt_max_audio_bytes: int = 25 * 1024 * 1024
+    stt_download_timeout_seconds: float = 20.0
+    stt_timeout_seconds: float = 45.0
+    embedding_api_url: str = "https://api.openai.com/v1/embeddings"
+    embedding_max_batch: int = 64
+    embedding_usd_per_million_tokens: dict[str, float] = {
+        "text-embedding-3-large": 0.13,
+        "text-embedding-3-small": 0.02,
+    }
+
+    # Replies and conversation state.
+    reply_split_min_total_chars: int = 150
+    reply_split_min_part_chars: int = 30
+    reply_split_max_parts: int = 3
+    reply_text_max_chars: int = 500
+    guard_price_tolerance: float = 0.01
+    guard_budget_window_chars: int = 25
+    state_max_tracked_products: int = 6
+    state_max_tracked_objections: int = 4
+    state_max_variants_per_product: int = 8
+    # Discovery answers the AI chases before recommending (a subset of
+    # use_case, size, color, budget, recipient).
+    essential_slots: list[str] = ["use_case", "size", "budget"]
+    caption_max_chars: int = 500
+    sandbox_ttl_hours: int = 24
+
+    # Leads.
+    lead_cold_max_score: int = 34
+    lead_warm_max_score: int = 69
+    lead_max_interested_products: int = 10
+    lead_phone_lookback_messages: int = 6
+
+    # Products and search.
+    search_default_limit: int = 5
+    search_candidate_pool: int = 20
+    search_rrf_k: int = 60
+    search_trigram_threshold: float = 0.25
+    semantic_max_distance: float = 0.62
+    semantic_query_cache_size: int = 256
+    embedding_cooldown_seconds: float = 60.0
+    browse_limit: int = 6
+    similar_limit: int = 4
+    max_categories: int = 12
+    similar_price_spread: float = 0.4
+    product_import_max_chars: int = 50_000
+    product_max_images: int = 20
+    upload_max_bytes: int = 5 * 1024 * 1024
+
+    # Dashboard and accounts.
+    trial_days: int = 14
+    business_text_max_chars: int = 4000
+    conversation_detail_messages: int = 100
+    conversation_preview_chars: int = 120
+    sse_ticket_ttl_seconds: int = 60
+    sse_heartbeat_seconds: float = 15.0
+    sse_reauth_every_pings: int = 20
+    bcrypt_concurrency: int = 4
+
+    # Instagram, Telegram, push.
+    instagram_graph_version: str = "v21.0"
+    instagram_oauth_state_ttl_minutes: int = 15
+    instagram_token_refresh_window_days: int = 10
+    instagram_token_min_age_hours: int = 24
+    telegram_api_base: str = "https://api.telegram.org"
+    telegram_connect_token_ttl_minutes: int = 30
+    # Browser push services the server may POST to (SSRF allowlist); a leading
+    # dot allows subdomains.
+    push_service_hosts: list[str] = [
+        "fcm.googleapis.com",
+        "updates.push.services.mozilla.com",
+        "web.push.apple.com",
+        ".push.apple.com",
+        ".notify.windows.com",
+    ]
+
     # Voice messages. One provider, chosen explicitly: "openrouter" (uses
     # OPENROUTER_API_KEY and STT_MODEL), "groq" or "openai" (use STT_API_KEY),
     # or "" to not transcribe at all — a voice note then goes to the owner.

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.telegram.models import TelegramConnection
 
-CONNECT_TOKEN_TTL_MINUTES = 30
+CONNECT_TOKEN_TTL_MINUTES = get_settings().telegram_connect_token_ttl_minutes
 
 
 async def create_connect_token(db: AsyncSession, business_id: uuid.UUID) -> tuple[str, dt.datetime]:

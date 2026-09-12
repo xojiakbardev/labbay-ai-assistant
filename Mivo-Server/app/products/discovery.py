@@ -18,15 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.products.models import Product
+from app.core.config import get_settings
 
-BROWSE_LIMIT = 6
-SIMILAR_LIMIT = 4
-MAX_CATEGORIES = 12
+BROWSE_LIMIT = get_settings().browse_limit
+SIMILAR_LIMIT = get_settings().similar_limit
+MAX_CATEGORIES = get_settings().max_categories
 
 # How far either side of a product's price still counts as "something like it" —
 # wide enough to offer a cheaper alternative when someone balks at the price,
 # narrow enough not to answer "anything similar?" with the whole shop.
-SIMILAR_PRICE_SPREAD = 0.4
+SIMILAR_PRICE_SPREAD = get_settings().similar_price_spread
 
 _CATEGORY = Product.attributes["category"].astext
 

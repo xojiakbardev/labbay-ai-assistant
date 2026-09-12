@@ -1,0 +1,1 @@
+invalid product_id — this must be a real UUID from a search_products result, not a name or invented ID. Call search_products first to get it, then retry with the returned id.

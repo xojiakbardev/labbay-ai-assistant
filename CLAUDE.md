@@ -262,6 +262,12 @@ follow from that:
   JSONB in place won't mark the attribute dirty. Anything that resets a
   conversation must clear it too (see `/ai/sandbox/reset`).
 - `follow_up.py` — scheduled re-engagement of inactive warm/hot leads.
+- **Nothing tunable is hardcoded.** Numbers, limits, windows and URLs are `Settings` fields
+  (`app/core/config.py`, overridable in `.env`). Prompts, default reply texts
+  (`replies.json`) and word lists (`lexicon.json`) are files in `app/prompts/`, loaded by
+  `app.prompts.load/render/lexicon`; a business overrides reply texts from the AI settings
+  page (`businesses.reply_texts`). Constants left in code are data contracts: status/event
+  names, token types, regexes, security lists, protocol URLs.
 - `closing.py` — knowing when the conversation is over. A short, plain-text,
   question-free burst after our last message ("hop", "ok", 👍) goes to a small
   structured call (`ClosingDecision`): if the model says it's finished, nothing is
