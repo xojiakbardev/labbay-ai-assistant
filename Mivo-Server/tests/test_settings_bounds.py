@@ -43,3 +43,15 @@ def test_defaults_are_consistent() -> None:
 def test_impossible_tuning_is_refused(over) -> None:
     with pytest.raises(ValidationError):
         _settings(**over)
+
+
+def test_leaked_bot_token_runs_only_when_acknowledged(monkeypatch) -> None:
+    import hashlib
+
+    from app.core import config
+
+    fake = "999999:leaked-for-this-test"
+    monkeypatch.setattr(config, "_LEAKED_SECRET_SHA256", frozenset({hashlib.sha256(fake.encode()).hexdigest()}))
+    with pytest.raises(ValidationError):
+        _settings(telegram_bot_token=fake)
+    assert _settings(telegram_bot_token=fake, telegram_token_leak_acknowledged=True).telegram_bot_token == fake

@@ -6,6 +6,7 @@ quietly running on them — which is exactly how production ended up with a
 publicly known JWT signing key.
 """
 import hashlib
+import logging
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -325,6 +326,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_bot_username: str = ""
     telegram_webhook_secret: str = ""
+    # Temporary, owner's decision: run on the leaked bot token until it's
+    # revoked at launch. Remove together with the token.
+    telegram_token_leak_acknowledged: bool = False
 
     # Web Push / VAPID. Unset = push notifications disabled.
     #   npx web-push generate-vapid-keys
@@ -384,7 +388,13 @@ class Settings(BaseSettings):
             if value and (value in public or value.upper().startswith("CHANGE_ME")):
                 problems.append(f"{name.upper()} is a publicly known value")
         if self.telegram_bot_token and _sha256(self.telegram_bot_token.removeprefix("bot").strip()) in _LEAKED_SECRET_SHA256:
-            problems.append("TELEGRAM_BOT_TOKEN leaked in git history — revoke it in @BotFather and set the new one")
+            if self.telegram_token_leak_acknowledged:
+                logging.getLogger("app.core.config").warning(
+                    "TELEGRAM_BOT_TOKEN is the one that leaked in git history (accepted by "
+                    "TELEGRAM_TOKEN_LEAK_ACKNOWLEDGED) — revoke it in @BotFather before launch"
+                )
+            else:
+                problems.append("TELEGRAM_BOT_TOKEN leaked in git history — revoke it in @BotFather and set the new one")
 
         if self.is_production:
             if self.debug:
