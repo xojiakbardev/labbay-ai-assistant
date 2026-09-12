@@ -195,7 +195,13 @@ function mediaOf(m: Message): MessageMedia | null {
 }
 
 function isSharedPost(m: Message) {
-  return ["share", "ig_reel", "story_mention"].includes((m.attachment_type || "").toLowerCase());
+  return ["share", "ig_post", "ig_reel", "reel", "story_mention"].includes((m.attachment_type || "").toLowerCase());
+}
+
+// Media messages carry no text of their own; one Instagram gives no viewable
+// URL for (a template, say) is shown as this chip instead.
+function hasUnviewableMedia(m: Message) {
+  return !!m.attachment_type && !mediaOf(m) && !m.content;
 }
 
 function formatTime(isoStr?: string) {
@@ -1091,6 +1097,10 @@ function getAvatarLetter(username?: string | null) {
                     </a>
                   </div>
                 </template>
+
+                <div v-if="hasUnviewableMedia(m)" class="text-xs italic text-muted-foreground">
+                  {{ isSharedPost(m) ? t("conversations.reelShared") : t("conversations.unviewableMessage") }}
+                </div>
 
                 <!-- Text is always plain text, exactly as sent -->
                 <div v-if="m.content" class="whitespace-pre-wrap">{{ m.content }}</div>

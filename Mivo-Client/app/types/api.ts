@@ -320,6 +320,10 @@ export interface SandboxTurnResponse {
   executed_tools: { name: string; arguments: Record<string, any> }[];
   telegram_sent: boolean;
   messages: SandboxMessage[];
+  // The customer's message just ended the conversation: no reply was
+  // written, at most a reaction (an emoji) was left on it.
+  conversation_closed: boolean;
+  reaction: string | null;
 }
 
 export interface SandboxState {

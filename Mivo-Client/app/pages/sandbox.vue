@@ -128,6 +128,13 @@ async function onSendMessage(quickText?: string) {
     if (res.telegram_sent) {
       toast.success(t("sandbox.telegramSentToast"));
     }
+    if (res.conversation_closed) {
+      toast.info(
+        res.reaction
+          ? t("sandbox.closedWithReaction", { reaction: res.reaction })
+          : t("sandbox.closedSilently")
+      );
+    }
   } catch (err: any) {
     console.error("Failed to send message in sandbox:", err);
     toast.error(err?.message || t("sandbox.sendError"));
