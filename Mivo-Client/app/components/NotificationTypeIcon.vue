@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Flame, Sparkles, Info, UserCheck, CirclePause, TriangleAlert } from "@lucide/vue";
+import { Flame, Sparkles, Info, UserCheck, CirclePause, Gauge, TriangleAlert } from "@lucide/vue";
 
 // Icon + tint per notification type; the size of the tile comes from the
 // caller's class.
@@ -17,6 +17,8 @@ const visual = computed(() => {
       return { icon: UserCheck, tone: "bg-sky-500/15 text-sky-600 dark:text-sky-400" };
     case "ai_limit":
       return { icon: CirclePause, tone: "bg-orange-500/15 text-orange-600 dark:text-orange-400" };
+    case "plan_limit":
+      return { icon: Gauge, tone: "bg-orange-500/15 text-orange-600 dark:text-orange-400" };
     case "delivery_failed":
       return { icon: TriangleAlert, tone: "bg-red-500/15 text-red-600 dark:text-red-400" };
     default:

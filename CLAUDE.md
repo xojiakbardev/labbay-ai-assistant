@@ -397,6 +397,15 @@ the whole catalog is never handed to the model.
 - No self-serve signup. Businesses are created from `/superadmin/*`; the first
   superadmin is bootstrapped with `create_superadmin.py`, later ones by SQL.
   Payments are recorded manually (`Payment` model) — there is no payment gateway.
+- Plans (`app/billing`): the superadmin edits them (`/superadmin/plans`; never
+  deleted, switched off with `is_active`; one `is_default` plan goes to new
+  businesses) and sets a business's plan while extending its subscription
+  (`plan_id` changes only when sent; null = no plan, no limit). An Instagram AI
+  turn that recorded a reply counts once in `ai_reply_usage` (calendar month,
+  `BILLING_UTC_OFFSET_HOURS`); the sandbox, follow-ups and ready-made lines don't.
+  The owner is alerted (`plan_limit`) at `PLAN_WARN_FRACTION`, at the limit and
+  when the AI stops (`PLAN_GRACE_FRACTION` past it); `limits.limit_reason` then
+  hands conversations to a person. Owners see it on `GET /billing/usage`.
 - Root-level scripts are ops helpers, not part of the app: `reset_and_seed.py`
   (dev only — refuses unless `APP_ENV=development` and `--yes-wipe-everything`),
   `sync_script.py` (profile backfill now), `rotate_fernet_key.py`,

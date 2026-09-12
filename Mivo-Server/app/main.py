@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.ai.router import router as ai_router
 from app.auth.router import router as auth_router
+from app.billing.router import router as billing_router
 from app.businesses.router import router as businesses_router
 from app.conversations.router import router as conversations_router
 from app.core.config import get_settings
@@ -179,6 +180,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.include_router(auth_router)
 app.include_router(businesses_router)
+app.include_router(billing_router)
 app.include_router(products_router)
 app.include_router(leads_router)
 app.include_router(notifications_router)

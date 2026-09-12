@@ -53,6 +53,10 @@ class Business(Base, UUIDPk, TimestampMixin):
     subscription_expires_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The tariff (app/billing): its monthly AI-reply limit. Null = no limit.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Soft delete: superadmin "deleting" a business/owner. Row stays (leads,
     # conversations, usage history all reference it) — deleted_at set instead.

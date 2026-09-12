@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import service as auth_service
 from app.auth.models import User
 from app.auth.schemas import TokenResponse
+from app.billing.models import Plan
+from app.billing.schemas import PlanCreate, PlanOut, PlanUpdate
 from app.common.tenancy import get_current_superadmin
 from app.core.db import get_db
 from app.superadmin import service
@@ -57,6 +59,9 @@ async def extend_subscription(
     business = await service.get_business_or_404(db, business_id)
     if business is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Business not found.")
+    change_plan = "plan_id" in body.model_fields_set
+    if change_plan and body.plan_id is not None and await db.get(Plan, body.plan_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
     await service.extend_subscription(
         db,
         business,
@@ -65,8 +70,42 @@ async def extend_subscription(
         body.payment_amount,
         body.payment_currency,
         body.payment_note,
+        plan_id=body.plan_id,
+        change_plan=change_plan,
     )
     return await service.get_business_detail(db, business_id)
+
+
+@router.get("/plans", response_model=list[PlanOut])
+async def list_plans(
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_current_superadmin),
+) -> list[dict]:
+    return await service.list_plans(db)
+
+
+@router.post("/plans", response_model=PlanOut, status_code=status.HTTP_201_CREATED)
+async def create_plan(
+    body: PlanCreate,
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_current_superadmin),
+) -> dict:
+    return await service.create_plan(db, body)
+
+
+@router.patch("/plans/{plan_id}", response_model=PlanOut)
+async def update_plan(
+    plan_id: uuid.UUID,
+    body: PlanUpdate,
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_current_superadmin),
+) -> dict:
+    """A plan is never deleted (businesses and payments point at it) —
+    switch it off with is_active instead."""
+    plan = await db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan not found.")
+    return await service.update_plan(db, plan, body)
 
 
 @router.patch("/businesses/{business_id}/ai", response_model=SuperadminBusinessOut)

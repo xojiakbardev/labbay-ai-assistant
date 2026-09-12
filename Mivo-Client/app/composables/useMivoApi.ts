@@ -1,5 +1,6 @@
 import type {
   AiFeedback,
+  BillingUsage,
   Business,
   BusinessUpdate,
   ConversationDetail,
@@ -28,6 +29,7 @@ export function useMivoApi() {
 
   return {
     getBusiness: () => apiRequest<Business>("/business"),
+    getBillingUsage: () => apiRequest<BillingUsage>("/billing/usage"),
     updateBusiness: (patch: BusinessUpdate) =>
       apiRequest<Business>("/business", { method: "PATCH", body: patch }),
     // Built-in wording of the fixed replies (reply_texts overrides these).

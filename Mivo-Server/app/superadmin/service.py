@@ -11,6 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.models import AiUsageLog, Payment
 from app.auth import service as auth_service
 from app.auth.models import User
+from app.billing import service as billing
+from app.billing.models import Plan
+from app.billing.schemas import PlanCreate, PlanUpdate
 from app.businesses.models import Business
 from app.core.config import get_settings
 
@@ -28,11 +31,29 @@ def _day_start(now: dt.datetime) -> dt.datetime:
 async def create_business(
     db: AsyncSession, email: str, password: str, business_name: str, trial_days: int
 ) -> User:
-    return await auth_service.signup(db, email, password, business_name, trial_days=trial_days)
+    """A new business starts on the default plan, if one is set."""
+    user = await auth_service.signup(db, email, password, business_name, trial_days=trial_days)
+    plan = await billing.default_plan(db)
+    if plan is not None:
+        business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
+        business.plan_id = plan.id
+        await db.commit()
+    return user
 
 
-def _to_out(business: Business, owner_email: str, cost_last_30d: float, now: dt.datetime) -> dict:
+def _to_out(
+    business: Business,
+    owner_email: str,
+    cost_last_30d: float,
+    now: dt.datetime,
+    plan: Plan | None = None,
+    replies_this_month: int = 0,
+) -> dict:
     return {
+        "plan_id": business.plan_id,
+        "plan_name": plan.name if plan else None,
+        "ai_replies_this_month": replies_this_month,
+        "ai_replies_limit": plan.monthly_ai_replies if plan else None,
         "id": business.id,
         "name": business.name,
         "owner_email": owner_email,
@@ -61,8 +82,9 @@ async def _cost_since(db: AsyncSession, since: dt.datetime, business_id: uuid.UU
 async def list_businesses(db: AsyncSession) -> list[dict]:
     rows = (
         await db.execute(
-            select(Business, User.email)
+            select(Business, User.email, Plan)
             .join(User, User.id == Business.owner_user_id)
+            .outerjoin(Plan, Plan.id == Business.plan_id)
             .where(Business.deleted_at.is_(None))
             .order_by(Business.created_at.desc())
         )
@@ -70,30 +92,33 @@ async def list_businesses(db: AsyncSession) -> list[dict]:
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
     cost_by_business = await _cost_since(db, since)
+    replies = await billing.usage_by_business(db)
     now = dt.datetime.now(dt.timezone.utc)
 
     return [
-        _to_out(business, owner_email, cost_by_business.get(business.id, 0.0), now)
-        for business, owner_email in rows
+        _to_out(business, owner_email, cost_by_business.get(business.id, 0.0), now, plan, replies.get(business.id, 0))
+        for business, owner_email, plan in rows
     ]
 
 
 async def get_business_detail(db: AsyncSession, business_id: uuid.UUID) -> dict | None:
     row = (
         await db.execute(
-            select(Business, User.email)
+            select(Business, User.email, Plan)
             .join(User, User.id == Business.owner_user_id)
+            .outerjoin(Plan, Plan.id == Business.plan_id)
             .where(Business.id == business_id)
         )
     ).first()
     if row is None:
         return None
-    business, owner_email = row
+    business, owner_email, plan = row
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
     cost_by_business = await _cost_since(db, since, business_id)
+    current = await billing.usage(db, business)
     now = dt.datetime.now(dt.timezone.utc)
-    return _to_out(business, owner_email, cost_by_business.get(business.id, 0.0), now)
+    return _to_out(business, owner_email, cost_by_business.get(business.id, 0.0), now, plan, current.used)
 
 
 async def get_business_or_404(db: AsyncSession, business_id: uuid.UUID) -> Business | None:
@@ -108,8 +133,12 @@ async def extend_subscription(
     payment_amount: float | None,
     payment_currency: str,
     payment_note: str | None,
+    plan_id: uuid.UUID | None = None,
+    change_plan: bool = False,
 ) -> Business:
     business.subscription_expires_at = new_expires_at
+    if change_plan:
+        business.plan_id = plan_id
     if payment_amount:
         db.add(
             Payment(
@@ -123,6 +152,61 @@ async def extend_subscription(
     await db.commit()
     await db.refresh(business)
     return business
+
+
+async def list_plans(db: AsyncSession) -> list[dict]:
+    """Every plan, inactive ones too, with how many businesses are on each."""
+    counts = dict(
+        (
+            await db.execute(
+                select(Business.plan_id, func.count())
+                .where(Business.deleted_at.is_(None), Business.plan_id.is_not(None))
+                .group_by(Business.plan_id)
+            )
+        ).all()
+    )
+    plans = (await db.execute(select(Plan).order_by(Plan.sort_order, Plan.price, Plan.name))).scalars().all()
+    return [_plan_out(plan, counts.get(plan.id, 0)) for plan in plans]
+
+
+def _plan_out(plan: Plan, businesses_count: int) -> dict:
+    return {
+        "id": plan.id, "name": plan.name, "price": float(plan.price), "currency": plan.currency,
+        "monthly_ai_replies": plan.monthly_ai_replies, "is_active": plan.is_active,
+        "is_default": plan.is_default, "sort_order": plan.sort_order, "businesses_count": businesses_count,
+    }
+
+
+async def create_plan(db: AsyncSession, body: PlanCreate) -> dict:
+    fields = body.model_dump()
+    make_default = fields.pop("is_default")
+    plan = Plan(**fields, is_default=False)
+    db.add(plan)
+    await db.flush()
+    if make_default:
+        await billing.make_default(db, plan)
+    await db.commit()
+    await db.refresh(plan)
+    return _plan_out(plan, 0)
+
+
+async def update_plan(db: AsyncSession, plan: Plan, body: PlanUpdate) -> dict:
+    changes = body.model_dump(exclude_unset=True)
+    for field in ("name", "price", "currency", "is_active", "sort_order"):
+        if changes.get(field) is not None:
+            setattr(plan, field, changes[field])
+    if "monthly_ai_replies" in changes:
+        plan.monthly_ai_replies = changes["monthly_ai_replies"]
+    if changes.get("is_default") is True:
+        await billing.make_default(db, plan)
+    elif changes.get("is_default") is False:
+        plan.is_default = False
+    await db.commit()
+    await db.refresh(plan)
+    count = await db.scalar(
+        select(func.count()).select_from(Business).where(Business.plan_id == plan.id, Business.deleted_at.is_(None))
+    )
+    return _plan_out(plan, count or 0)
 
 
 async def set_ai_suspended(db: AsyncSession, business: Business, ai_suspended: bool) -> Business:

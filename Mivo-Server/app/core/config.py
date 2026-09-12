@@ -253,6 +253,17 @@ class Settings(BaseSettings):
     product_max_images: PositiveInt = 20
     upload_max_bytes: PositiveInt = 5 * 1024 * 1024
 
+    # Billing (app/billing). Plans and their limits are edited in the
+    # superadmin panel; these are the rules around them. The owner is warned
+    # at the warn fraction of the monthly limit; the AI keeps answering for the
+    # grace fraction past it, then hands conversations to a person. Months
+    # are counted in this UTC offset (Tashkent: +5, no DST). The contact line
+    # tells the owner how to pay (shown on their dashboard; empty = hidden).
+    plan_warn_fraction: _Fraction = 0.8
+    plan_grace_fraction: _Fraction = 0.1
+    billing_utc_offset_hours: Annotated[int, Field(ge=-12, le=14)] = 5
+    billing_contact: str = ""
+
     # Dashboard and accounts.
     trial_days: PositiveInt = 14
     business_text_max_chars: PositiveInt = 4000

@@ -118,6 +118,8 @@ const isChatThreadOpenOnMobile = computed(() => isChat.value && (isMobileThreadA
           <span>{{ item.label }}</span>
         </NuxtLink>
       </nav>
+
+      <PlanUsageCard compact class="mt-4" />
     </aside>
 
     <!-- Workspace: desktop header + page -->

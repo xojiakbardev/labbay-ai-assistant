@@ -1,5 +1,6 @@
-"""Spend guards checked before every AI turn; past a limit the conversation goes
-to a person."""
+"""Spend guards checked before every AI turn (the plan's monthly replies, the
+daily cost, the per-conversation rate); past a limit the conversation goes to
+a person."""
 import datetime as dt
 import uuid
 
@@ -7,6 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.models import AiUsageLog
+from app.billing import service as billing
+from app.businesses.models import Business
 from app.conversations.models import Message
 from app.core.config import get_settings
 
@@ -42,6 +45,11 @@ async def limit_reason(db: AsyncSession, business_id: uuid.UUID, conversation_id
     """None if the AI may take another turn here, else a human-readable
     reason (shown to the owner)."""
     settings = get_settings()
+    business = await db.get(Business, business_id)
+    if business is not None:
+        reason = billing.limit_reason(await billing.usage(db, business))
+        if reason is not None:
+            return reason
     spent = await cost_today_usd(db, business_id)
     if spent >= settings.ai_daily_cost_limit_usd:
         return (

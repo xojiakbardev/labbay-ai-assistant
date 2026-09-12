@@ -879,6 +879,31 @@ async def test_daily_budget_stops_the_ai_and_hands_off(db_session, alerts, monke
     assert [a["type"] for a in alerts["owner"]] == ["ai_limit"]
 
 
+async def test_plan_limit_counts_replies_then_hands_off(db_session, alerts, monkeypatch) -> None:
+    from app.billing import service as billing
+    from app.billing.models import Plan
+
+    monkeypatch.setattr(billing._settings, "plan_grace_fraction", 0.0)
+    business, _ = await _seed(db_session)
+    plan = Plan(name="Tiny", price=0, currency="USD", monthly_ai_replies=1)
+    db_session.add(plan)
+    await db_session.flush()
+    business.plan_id = plan.id
+    await db_session.commit()
+    meta = FakeMetaClient()
+
+    await _deliver(db_session, FakeProvider(_result("Salom!")), meta, "pl-1", "Salom", customer="c-plan")
+    assert (await billing.usage(db_session, business)).used == 1
+    assert [a["type"] for a in alerts["owner"]] == ["plan_limit"]  # "AI stopped"
+
+    second = FakeProvider(_result("should not run"))
+    await _deliver(db_session, second, meta, "pl-2", "narxi qancha?", customer="c-plan")
+    assert second.calls == 0
+    assert [a["type"] for a in alerts["owner"]] == ["plan_limit", "ai_limit"]
+    assert "tarif limiti" in alerts["owner"][-1]["message"].lower()
+    assert (await billing.usage(db_session, business)).used == 1  # the handoff line doesn't count
+
+
 async def test_voice_note_that_cannot_be_transcribed_goes_to_a_human(db_session, alerts) -> None:
     business, _ = await _seed(db_session)
     provider, meta = FakeProvider(_result("should not run")), FakeMetaClient()

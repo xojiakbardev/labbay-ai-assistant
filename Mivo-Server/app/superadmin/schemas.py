@@ -42,17 +42,24 @@ class SuperadminBusinessOut(BaseModel):
     subscription_active: bool
     created_at: dt.datetime
     cost_last_30d_usd: float
+    plan_id: uuid.UUID | None
+    plan_name: str | None
+    # This month; limit null = unlimited.
+    ai_replies_this_month: int
+    ai_replies_limit: int | None
 
 
 class ExtendSubscriptionRequest(BaseModel):
     """Extends/sets the expiry date. Optionally records the payment that
-    prompted it — both happen in one call since in practice a superadmin only
-    ever touches this screen because someone just paid."""
+    prompted it and sets the plan — all in one call since in practice a
+    superadmin only ever touches this screen because someone just paid.
+    `plan_id` changes the plan only when sent; null = no plan (unlimited)."""
 
     subscription_expires_at: dt.datetime
     payment_amount: float | None = Field(default=None, gt=0)
     payment_currency: str = Field(default="UZS", min_length=3, max_length=3)
     payment_note: str | None = Field(default=None, max_length=500)
+    plan_id: uuid.UUID | None = None
 
 
 class BusinessAiSuspendRequest(BaseModel):

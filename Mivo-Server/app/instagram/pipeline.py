@@ -17,6 +17,7 @@ from app.ai.closing import decide_closing, may_be_closing, unanswered_burst, val
 from app.ai.orchestrator import ReplySuperseded, detect_preferred_language, run_turn
 from app.ai.provider.base import LLMProvider, LLMProviderError
 from app.ai.replies import reply_text
+from app.billing import service as billing
 from app.businesses.models import Business
 from app.businesses.service import ai_may_reply
 from app.conversations.delivery import DeliveryError, reconcile_echo, send_outbound, undelivered_reply
@@ -802,6 +803,7 @@ async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider, b
         raise
     delivery_error = turn_state.get("delivery_error")
     raw_text = ctx.message.content
+    await _count_reply(db, ctx)
 
     # Bookkeeping for the turn happens whether or not the reply got out — the
     # analysis is real either way, and a retry that finds the reply recorded
@@ -848,6 +850,23 @@ async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider, b
     except Exception:  # noqa: BLE001
         logger.exception("[pipeline] product photos failed in conversation %s", ctx.conversation_id)
         await db.rollback()
+
+
+async def _count_reply(db: AsyncSession, ctx: _Context) -> None:
+    """The reply is recorded, so it counts toward the plan. Like the rest of
+    the bookkeeping, a failure here is logged and never fails the event."""
+    try:
+        current = await billing.record_ai_reply(db, ctx.business)
+    except Exception:  # noqa: BLE001
+        logger.exception("[pipeline] AI reply not counted for business %s", ctx.business_id)
+        await db.rollback()
+        await ctx.reload(db)
+        return
+    alert = billing.crossing_alert(current)
+    if alert is not None:
+        title, message = alert
+        await alert_owner(db, ctx.business, type="plan_limit", title=title, message=message)
+        await ctx.reload(db)
 
 
 async def _send_product_photos(db: AsyncSession, ctx: _Context, result) -> None:

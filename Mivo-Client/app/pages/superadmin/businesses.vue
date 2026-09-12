@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Plus, Building2, CalendarClock, Check, Trash2 } from "@lucide/vue";
-import type { SuperadminBusiness } from "~/types/api";
+import type { Plan, SuperadminBusiness } from "~/types/api";
 import { formatFullDate } from "~/composables/useDateFormat";
 
 definePageMeta({ layout: "superadmin" });
@@ -9,8 +9,12 @@ const api = useSuperadminApi();
 const { t, locale } = useI18n();
 
 const businesses = ref<SuperadminBusiness[]>([]);
+const plans = ref<Plan[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
+
+// reka-ui's Select can't hold null or "", so "no plan" is a sentinel.
+const NO_PLAN = "none";
 
 function errorText(err: unknown, fallbackKey: string): string {
   return err instanceof Error && err.message ? err.message : t(fallbackKey);
@@ -19,7 +23,7 @@ function errorText(err: unknown, fallbackKey: string): string {
 async function load() {
   loading.value = true;
   try {
-    businesses.value = await api.listBusinesses();
+    [businesses.value, plans.value] = await Promise.all([api.listBusinesses(), api.listPlans()]);
   } catch (err) {
     error.value = errorText(err, "superadmin.businesses.loadError");
   } finally {
@@ -34,6 +38,18 @@ function fmtDate(iso: string | null) {
 function fmtUsd(v: number) {
   return `$${v.toFixed(v < 10 ? 4 : 2)}`;
 }
+function fmtUsage(b: SuperadminBusiness) {
+  const used = new Intl.NumberFormat("uz-UZ").format(b.ai_replies_this_month);
+  if (b.ai_replies_limit === null) return `${used} · ${t("superadmin.businesses.unlimited")}`;
+  return `${used} / ${new Intl.NumberFormat("uz-UZ").format(b.ai_replies_limit)}`;
+}
+function overLimit(b: SuperadminBusiness) {
+  return b.ai_replies_limit !== null && b.ai_replies_this_month >= b.ai_replies_limit;
+}
+// Active plans, plus the business's own plan if it has since been switched off.
+const planChoices = computed(() =>
+  plans.value.filter((p) => p.is_active || p.id === extendTarget.value?.plan_id)
+);
 
 // --- Create business ---
 const showCreateModal = ref(false);
@@ -58,7 +74,13 @@ async function submitCreate() {
 // --- Extend subscription ---
 const extendTarget = ref<SuperadminBusiness | null>(null);
 const extending = ref(false);
-const extendForm = ref({ subscription_expires_at: "", payment_amount: null as number | null, payment_currency: "UZS", payment_note: "" });
+const extendForm = ref({
+  subscription_expires_at: "",
+  payment_amount: null as number | null,
+  payment_currency: "UZS",
+  payment_note: "",
+  plan: NO_PLAN,
+});
 
 function openExtend(business: SuperadminBusiness) {
   extendTarget.value = business;
@@ -71,8 +93,21 @@ function openExtend(business: SuperadminBusiness) {
     payment_amount: null,
     payment_currency: "UZS",
     payment_note: "",
+    plan: business.plan_id ?? NO_PLAN,
   };
 }
+
+// Picking a plan fills in its price, the usual payment.
+watch(
+  () => extendForm.value.plan,
+  (planId) => {
+    const plan = plans.value.find((p) => p.id === planId);
+    if (plan && plan.price > 0 && !extendForm.value.payment_amount) {
+      extendForm.value.payment_amount = plan.price;
+      extendForm.value.payment_currency = plan.currency;
+    }
+  }
+);
 
 async function submitExtend() {
   if (!extendTarget.value) return;
@@ -84,6 +119,7 @@ async function submitExtend() {
       payment_amount: extendForm.value.payment_amount || null,
       payment_currency: extendForm.value.payment_currency,
       payment_note: extendForm.value.payment_note || null,
+      plan_id: extendForm.value.plan === NO_PLAN ? null : extendForm.value.plan,
     });
     extendTarget.value = null;
     await load();
@@ -162,7 +198,7 @@ async function confirmDelete() {
       </Button>
     </EmptyState>
 
-    <div v-else class="rounded-xl border border-border bg-card overflow-hidden shadow-2xs">
+    <div v-else class="rounded-xl border border-border bg-card overflow-x-auto shadow-2xs">
       <Table>
         <TableHeader>
           <TableRow class="bg-muted/50">
@@ -170,6 +206,8 @@ async function confirmDelete() {
             <TableHead>{{ t("superadmin.businesses.owner") }}</TableHead>
             <TableHead>{{ t("superadmin.businesses.status") }}</TableHead>
             <TableHead>{{ t("superadmin.businesses.expires") }}</TableHead>
+            <TableHead>{{ t("superadmin.businesses.plan") }}</TableHead>
+            <TableHead>{{ t("superadmin.businesses.usageThisMonth") }}</TableHead>
             <TableHead>{{ t("superadmin.businesses.aiStatus") }}</TableHead>
             <TableHead>{{ t("superadmin.businesses.cost30d") }}</TableHead>
             <TableHead class="text-right">{{ t("superadmin.businesses.actions") }}</TableHead>
@@ -191,6 +229,10 @@ async function confirmDelete() {
               </Badge>
             </TableCell>
             <TableCell class="text-sm text-muted-foreground">{{ fmtDate(b.subscription_expires_at) }}</TableCell>
+            <TableCell class="text-sm">{{ b.plan_name ?? t("superadmin.businesses.noPlan") }}</TableCell>
+            <TableCell class="font-mono text-sm whitespace-nowrap" :class="{ 'text-destructive font-semibold': overLimit(b) }">
+              {{ fmtUsage(b) }}
+            </TableCell>
             <TableCell>
               <div class="flex flex-col gap-1">
                 <label class="inline-flex items-center gap-2 cursor-pointer" :title="t('superadmin.businesses.platformSwitchTitle')">
@@ -278,9 +320,21 @@ async function confirmDelete() {
           </DialogTitle>
         </DialogHeader>
         <form class="space-y-4 pt-2" @submit.prevent="submitExtend">
-          <div class="space-y-1.5">
-            <Label for="extend-expiry">{{ t("superadmin.businesses.newExpiryLabel") }}</Label>
-            <Input id="extend-expiry" v-model="extendForm.subscription_expires_at" type="date" required />
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <Label for="extend-expiry">{{ t("superadmin.businesses.newExpiryLabel") }}</Label>
+              <Input id="extend-expiry" v-model="extendForm.subscription_expires_at" type="date" required />
+            </div>
+            <div class="space-y-1.5">
+              <Label>{{ t("superadmin.businesses.planLabel") }}</Label>
+              <Select v-model="extendForm.plan">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="p in planChoices" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
+                  <SelectItem :value="NO_PLAN">{{ t("superadmin.businesses.noPlan") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-1.5">

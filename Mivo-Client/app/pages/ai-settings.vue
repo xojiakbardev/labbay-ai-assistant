@@ -297,6 +297,9 @@ onUnmounted(() => window.removeEventListener("beforeunload", onBeforeUnload));
     </div>
 
     <div v-else class="flex flex-col gap-3">
+      <!-- Plan and this month's AI replies (also in the desktop sidebar) -->
+      <PlanUsageCard />
+
       <!-- Platform suspension: the owner's own switch can't override it -->
       <div
         v-if="business.ai_suspended"

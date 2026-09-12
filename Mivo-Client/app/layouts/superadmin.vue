@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { LayoutDashboard, Building2, LogOut, Sun, Moon } from "@lucide/vue";
+import { LayoutDashboard, Building2, Tags, LogOut, Sun, Moon } from "@lucide/vue";
 import { useTheme } from "~/composables/useTheme";
 
 const { signOut } = useAuth();
@@ -10,6 +10,7 @@ const { theme, toggleTheme } = useTheme();
 const NAV_ITEMS = computed(() => [
   { to: "/superadmin", label: t("superadmin.nav.dashboard"), shortLabel: t("superadmin.nav.dashboard"), component: LayoutDashboard },
   { to: "/superadmin/businesses", label: t("superadmin.nav.businesses"), shortLabel: t("superadmin.nav.businesses"), component: Building2 },
+  { to: "/superadmin/plans", label: t("superadmin.nav.plans"), shortLabel: t("superadmin.nav.plans"), component: Tags },
 ]);
 
 function isActive(to: string) {

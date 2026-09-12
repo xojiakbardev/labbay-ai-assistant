@@ -1,4 +1,4 @@
-import type { RevenuePoint, SuperadminBusiness, SuperadminStats, UsagePoint } from "~/types/api";
+import type { Plan, PlanInput, RevenuePoint, SuperadminBusiness, SuperadminStats, UsagePoint } from "~/types/api";
 
 export function useSuperadminApi() {
   const { apiRequest } = useApi();
@@ -7,6 +7,7 @@ export function useSuperadminApi() {
     listBusinesses: () => apiRequest<SuperadminBusiness[]>("/superadmin/businesses"),
     createBusiness: (body: { email: string; password: string; business_name: string; trial_days?: number }) =>
       apiRequest<{ access_token: string }>("/superadmin/businesses", { method: "POST", body }),
+    // plan_id changes the plan only when present; null = no plan (unlimited).
     extendSubscription: (
       businessId: string,
       body: {
@@ -14,6 +15,7 @@ export function useSuperadminApi() {
         payment_amount?: number | null;
         payment_currency?: string;
         payment_note?: string | null;
+        plan_id?: string | null;
       }
     ) =>
       apiRequest<SuperadminBusiness>(`/superadmin/businesses/${businessId}/subscription`, {
@@ -29,6 +31,11 @@ export function useSuperadminApi() {
       }),
     deleteBusiness: (businessId: string) =>
       apiRequest<void>(`/superadmin/businesses/${businessId}`, { method: "DELETE" }),
+
+    listPlans: () => apiRequest<Plan[]>("/superadmin/plans"),
+    createPlan: (body: PlanInput) => apiRequest<Plan>("/superadmin/plans", { method: "POST", body }),
+    updatePlan: (planId: string, body: Partial<PlanInput>) =>
+      apiRequest<Plan>(`/superadmin/plans/${planId}`, { method: "PATCH", body }),
 
     getStats: () => apiRequest<SuperadminStats>("/superadmin/stats"),
     getUsageTimeseries: (days = 30) => apiRequest<UsagePoint[]>(`/superadmin/usage-timeseries?days=${days}`),

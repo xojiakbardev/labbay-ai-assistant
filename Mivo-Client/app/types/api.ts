@@ -269,6 +269,40 @@ export interface SuperadminBusiness {
   subscription_active: boolean;
   created_at: string;
   cost_last_30d_usd: number;
+  plan_id: string | null;
+  plan_name: string | null;
+  // This month; a null limit means unlimited.
+  ai_replies_this_month: number;
+  ai_replies_limit: number | null;
+}
+
+// A tariff the superadmin edits; monthly_ai_replies null = unlimited.
+export interface Plan {
+  id: string;
+  name: string;
+  price: number;
+  currency: string;
+  monthly_ai_replies: number | null;
+  is_active: boolean;
+  is_default: boolean;
+  sort_order: number;
+  businesses_count: number;
+}
+
+export type PlanInput = Omit<Plan, "id" | "businesses_count">;
+
+// GET /billing/usage — the owner's plan and this month's AI replies. The AI
+// stops at the hard limit (the limit plus a grace).
+export interface BillingUsage {
+  plan: Plan | null;
+  period_start: string;
+  period_end: string;
+  ai_replies_used: number;
+  ai_replies_limit: number | null;
+  ai_replies_hard_limit: number | null;
+  subscription_expires_at: string | null;
+  subscription_active: boolean;
+  billing_contact: string;
 }
 
 export interface SuperadminStats {
@@ -301,6 +335,7 @@ export type NotificationType =
   | "lead_updated"
   | "handoff"
   | "ai_limit"
+  | "plan_limit"
   | "delivery_failed"
   | "system";
 
