@@ -28,8 +28,11 @@ class RefreshedToken(BaseModel):
 
 class ConnectedAccount(BaseModel):
     access_token: str
+    # The professional account's Instagram id (/me `user_id`, 1784…) — the id
+    # webhooks carry as recipient/sender, so the one messages are routed by.
     ig_business_id: str
     ig_username: str | None
+    # The app-scoped id (/me `id`). Also matched when routing, never relied on.
     fb_page_id: str
     expires_at: dt.datetime
 
@@ -150,7 +153,7 @@ class MetaClient:
 
                 me = await client.get(
                     f"{_GRAPH_BASE}/me",
-                    params={"fields": "id,username,name"},
+                    params={"fields": "id,user_id,username,name"},
                     headers={"Authorization": f"Bearer {long_lived_data['access_token']}"},
                 )
                 me.raise_for_status()
@@ -160,17 +163,21 @@ class MetaClient:
             except (KeyError, ValueError) as exc:
                 raise MetaAPIError(f"Instagram connect returned an unexpected response ({exc!r})") from exc
 
-        ig_business_id = str(me_data.get("id") or "")
-        if not ig_business_id:
+        # Two different ids: `id` is scoped to this app, `user_id` is the
+        # professional account's id — and webhooks name the account by
+        # `user_id`. Routing by `id` matched no incoming message at all.
+        ig_user_id = str(me_data.get("user_id") or "")
+        app_scoped_id = str(me_data.get("id") or "")
+        if not ig_user_id or not app_scoped_id:
             raise MetaAPIError("Instagram connect: /me returned no account id")
         if not long_lived_data.get("expires_in"):
             raise MetaAPIError("Instagram connect: the long-lived token came back without an expiry")
         expires_in = int(long_lived_data["expires_in"])
         return ConnectedAccount(
             access_token=long_lived_data["access_token"],
-            ig_business_id=ig_business_id,
+            ig_business_id=ig_user_id,
             ig_username=me_data.get("username"),
-            fb_page_id=str(short_lived_data.get("user_id", "")),
+            fb_page_id=app_scoped_id,
             expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in),
         )
 
