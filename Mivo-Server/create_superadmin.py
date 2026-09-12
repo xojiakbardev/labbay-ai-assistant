@@ -18,6 +18,7 @@ import sys
 from sqlalchemy import func, select
 
 from app.auth.models import User
+import app.core.models_registry  # noqa: F401
 from app.core.db import async_session_factory
 from app.core.security import hash_password
 

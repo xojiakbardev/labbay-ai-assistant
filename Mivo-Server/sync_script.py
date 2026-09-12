@@ -6,6 +6,7 @@ business's Instagram token (app/instagram/service.py:backfill_customer_profiles)
 """
 import asyncio
 
+import app.core.models_registry  # noqa: F401
 from app.core.db import async_session_factory
 from app.instagram.client import MetaClient
 from app.instagram.service import backfill_customer_profiles

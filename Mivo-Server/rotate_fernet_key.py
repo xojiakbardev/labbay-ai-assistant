@@ -15,6 +15,7 @@ import asyncio
 from cryptography.fernet import InvalidToken
 from sqlalchemy import select
 
+import app.core.models_registry  # noqa: F401
 from app.core.db import async_session_factory
 from app.core.security import reencrypt_secret
 from app.instagram.models import InstagramAccount, OAuthState

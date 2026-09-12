@@ -22,6 +22,7 @@ from sqlalchemy import select, text
 from app.auth.models import User
 from app.businesses.models import Business
 from app.core.config import get_settings
+import app.core.models_registry  # noqa: F401
 from app.core.db import async_session_factory
 from app.core.security import hash_password
 from app.instagram.models import InstagramAccount
