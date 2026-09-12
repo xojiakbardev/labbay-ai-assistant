@@ -1,8 +1,8 @@
 """Import every model module so Base.metadata is fully populated for Alembic autogenerate."""
 from app.ai.models import AiFeedback, AiUsageLog, Payment  # noqa: F401
-from app.auth.models import User  # noqa: F401
+from app.auth.models import RefreshToken, User  # noqa: F401
 from app.businesses.models import Business  # noqa: F401
-from app.instagram.models import InstagramAccount  # noqa: F401
+from app.instagram.models import InstagramAccount, OAuthState  # noqa: F401
 from app.telegram.models import TelegramConnection  # noqa: F401
 from app.products.models import Product, ProductImage, ProductVariant  # noqa: F401
 from app.customers.models import Customer  # noqa: F401

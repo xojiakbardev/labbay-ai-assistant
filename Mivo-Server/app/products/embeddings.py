@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.embeddings.base import EmbeddingError, EmbeddingProvider
 from app.ai.embeddings.factory import get_embedding_provider
 from app.products.embedding_text import build_embedding_text, embedding_hash, needs_reembedding
-from app.products.models import Product
+from app.products.models import EMBEDDING_DIMENSIONS, Product
 
 logger = logging.getLogger("app.products.embeddings")
 
@@ -46,7 +46,11 @@ async def refresh_product_embedding(
         logger.warning("[embeddings] product %s not embedded: %s", product.id, exc)
         return False
 
-    if not vectors:
+    if len(vectors) != 1 or len(vectors[0]) != EMBEDDING_DIMENSIONS:
+        logger.error(
+            "[embeddings] product %s: provider returned a vector of the wrong shape (column is %d-d)",
+            product.id, EMBEDDING_DIMENSIONS,
+        )
         return False
 
     product.embedding = vectors[0]
@@ -85,11 +89,12 @@ async def refresh_many(
         logger.warning("[embeddings] batch of %d not embedded: %s", len(pending), exc)
         return 0
 
-    if len(vectors) != len(pending):
-        logger.warning(
-            "[embeddings] provider returned %d vectors for %d inputs — batch skipped",
+    if len(vectors) != len(pending) or any(len(v) != EMBEDDING_DIMENSIONS for v in vectors):
+        logger.error(
+            "[embeddings] provider returned %d vectors for %d inputs (column is %d-d) — batch skipped",
             len(vectors),
             len(pending),
+            EMBEDDING_DIMENSIONS,
         )
         return 0
 

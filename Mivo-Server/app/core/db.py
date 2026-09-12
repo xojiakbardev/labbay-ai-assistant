@@ -9,10 +9,15 @@ from app.core.config import get_settings
 settings = get_settings()
 
 # SQL echo is tied to DEBUG and MUST stay off in production: it logs full query
-# parameters, which include phone numbers, decrypted-in-memory secrets passed as
-# bind params, and other PII (plan §17/§26 — logging without leaking secrets).
-# Set APP_ENV=production / DEBUG=false in the deploy .env to disable it.
-engine = create_async_engine(settings.database_url, echo=settings.debug, pool_pre_ping=True)
+# parameters, which include phone numbers and other PII. Settings refuses to
+# start with DEBUG=true when APP_ENV=production.
+engine = create_async_engine(
+    settings.database_url,
+    echo=settings.debug,
+    pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+)
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 

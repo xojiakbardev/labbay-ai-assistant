@@ -28,7 +28,8 @@ class EmbeddingProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def embed_query(self, text: str) -> list[float]:
+    async def embed_query(self, text: str, timeout: float | None = None) -> list[float]:
         """Embed one customer query. Latency matters here: it sits inside a
-        tool call the customer is waiting on."""
+        tool call the customer is waiting on, so a `timeout` means one attempt
+        within that budget and no retries."""
         raise NotImplementedError

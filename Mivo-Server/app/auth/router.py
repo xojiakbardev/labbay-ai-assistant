@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import service
@@ -23,9 +23,13 @@ async def me(user: User = Depends(get_current_user)) -> User:
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     try:
         user = await service.login(db, body.email, body.password)
+    except service.LoginThrottled as exc:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, str(exc), headers={"Retry-After": str(exc.retry_after)}
+        ) from exc
     except service.AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
-    access, refresh = service.issue_tokens(user.id)
+    access, refresh = await service.issue_tokens(db, user.id)
     return TokenResponse(access_token=access, refresh_token=refresh)
 
 
@@ -36,3 +40,12 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> T
     except service.AuthError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     return TokenResponse(access_token=access, refresh_token=refresh_token)
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> Response:
+    try:
+        await service.logout(db, body.refresh_token)
+    except service.AuthError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

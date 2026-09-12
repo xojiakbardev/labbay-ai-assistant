@@ -55,7 +55,7 @@ def test_create_list_and_extend_business(client) -> None:
     assert stats["income_this_month"].get("UZS") == 500000.0
 
 
-def test_toggle_ai_enabled(client) -> None:
+def test_superadmin_suspension_cannot_be_undone_by_the_owner(client) -> None:
     admin_headers = create_superadmin_and_headers()
     create_resp = client.post(
         "/superadmin/businesses",
@@ -66,10 +66,34 @@ def test_toggle_ai_enabled(client) -> None:
     business_id = client.get("/business", headers=owner_headers).json()["id"]
 
     resp = client.patch(
-        f"/superadmin/businesses/{business_id}/ai", json={"ai_enabled": False}, headers=admin_headers
+        f"/superadmin/businesses/{business_id}/ai", json={"ai_suspended": True}, headers=admin_headers
     )
     assert resp.status_code == 200
-    assert resp.json()["ai_enabled"] is False
+    assert resp.json()["ai_suspended"] is True
+
+    # The owner's own switch is theirs — but it isn't the kill switch.
+    own = client.patch("/business", json={"ai_enabled": True}, headers=owner_headers)
+    assert own.status_code == 200
+    assert own.json()["ai_suspended"] is True
+    # ...and the kill switch itself can't be set by the owner.
+    assert client.patch("/business", json={"ai_suspended": False}, headers=owner_headers).status_code == 422
+
+
+def test_deleted_business_is_refused_immediately_with_a_live_access_token(client) -> None:
+    admin_headers = create_superadmin_and_headers()
+    create_resp = client.post(
+        "/superadmin/businesses",
+        json={"email": "livetoken@test.com", "password": "supersecret1", "business_name": "Live Token Biz"},
+        headers=admin_headers,
+    )
+    tokens = create_resp.json()
+    owner_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    business_id = client.get("/business", headers=owner_headers).json()["id"]
+    assert client.delete(f"/superadmin/businesses/{business_id}", headers=admin_headers).status_code == 204
+
+    assert client.get("/business", headers=owner_headers).status_code == 403
+    assert client.patch("/business", json={"ai_enabled": True}, headers=owner_headers).status_code == 403
+    assert client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).status_code == 401
 
 
 def test_delete_business_soft_deletes_and_blocks_login(client) -> None:

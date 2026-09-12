@@ -10,6 +10,7 @@ swapped without touching callers:
   separately-generated values. Has a default implementation on top of
   run_agentic_turn, so only the two above are abstract.
 """
+import asyncio
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -112,16 +113,24 @@ class LLMProvider(ABC):
         wait for), but `on_reply` still fires, so callers behave identically
         whichever provider they're given.
         """
-        fused = await self.run_agentic_turn(
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=tools,
-            response_schema=fused_schema,
-            tool_executor=tool_executor,
-            max_tool_calls=max_tool_calls,
-            business_id=business_id,
-        )
+        from app.core.config import get_settings
+
+        try:
+            async with asyncio.timeout(get_settings().llm_turn_deadline_seconds):
+                fused = await self.run_agentic_turn(
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                    response_schema=fused_schema,
+                    tool_executor=tool_executor,
+                    max_tool_calls=max_tool_calls,
+                    business_id=business_id,
+                )
+        except TimeoutError as exc:
+            raise LLMProviderError("Turn deadline exceeded") from exc
         reply = (getattr(fused, "reply", "") or "").strip()
+        if not reply:
+            raise LLMProviderError("Provider returned an empty reply")
         if on_reply is not None:
             reply = await on_reply(reply)
         analysis = analysis_schema.model_validate(fused.model_dump(exclude={"reply"}))

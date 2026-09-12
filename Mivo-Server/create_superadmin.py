@@ -15,7 +15,7 @@ import asyncio
 import getpass
 import sys
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.auth.models import User
 from app.core.db import async_session_factory
@@ -23,8 +23,9 @@ from app.core.security import hash_password
 
 
 async def main(email: str, password: str) -> None:
+    email = email.strip().lower()  # logins match case-insensitively
     async with async_session_factory() as db:
-        existing = await db.scalar(select(User).where(User.email == email))
+        existing = await db.scalar(select(User).where(func.lower(User.email) == email))
         if existing is not None:
             existing.is_superadmin = True
             existing.password_hash = hash_password(password)
@@ -43,8 +44,8 @@ if __name__ == "__main__":
         print("Usage: python create_superadmin.py <email> [password]")
         sys.exit(1)
     email_arg = sys.argv[1]
-    password_arg = sys.argv[2] if len(sys.argv) > 2 else getpass.getpass("Password (min 8 chars): ")
-    if len(password_arg) < 8:
-        print("Password must be at least 8 characters.")
+    password_arg = sys.argv[2] if len(sys.argv) > 2 else getpass.getpass("Password (min 12 chars): ")
+    if len(password_arg) < 12:
+        print("Password must be at least 12 characters — this account controls every business.")
         sys.exit(1)
     asyncio.run(main(email_arg, password_arg))

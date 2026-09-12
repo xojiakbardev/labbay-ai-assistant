@@ -1,7 +1,9 @@
 import datetime as dt
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.security import password_too_long
 
 
 class CreateBusinessRequest(BaseModel):
@@ -15,9 +17,16 @@ class CreateBusinessRequest(BaseModel):
     # for someone else, often just a placeholder the owner changes later, and
     # they're trusted to judge what's good enough (unlike a public signup
     # form, which is exactly why there isn't one — see module docstring).
-    password: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=72)
     business_name: str = Field(min_length=1, max_length=255)
     trial_days: int = Field(default=14, ge=0, le=365)
+
+    @field_validator("password")
+    @classmethod
+    def _fits_bcrypt(cls, value: str) -> str:
+        if password_too_long(value):
+            raise ValueError("password is longer than 72 bytes")
+        return value
 
 
 class SuperadminBusinessOut(BaseModel):
@@ -26,7 +35,9 @@ class SuperadminBusinessOut(BaseModel):
     id: uuid.UUID
     name: str
     owner_email: str
+    # The owner's own switch (read-only here) and the platform kill switch.
     ai_enabled: bool
+    ai_suspended: bool
     subscription_expires_at: dt.datetime | None
     subscription_active: bool
     created_at: dt.datetime
@@ -44,8 +55,11 @@ class ExtendSubscriptionRequest(BaseModel):
     payment_note: str | None = Field(default=None, max_length=500)
 
 
-class BusinessAiToggleRequest(BaseModel):
-    ai_enabled: bool
+class BusinessAiSuspendRequest(BaseModel):
+    """The platform kill switch. Separate from the owner's `ai_enabled`, which
+    the owner controls — a suspension is not something they can undo."""
+
+    ai_suspended: bool
 
 
 class StatsOut(BaseModel):

@@ -1,12 +1,14 @@
-"""OpenRouter implementation of LLMProvider — Production-hardened with retries,
-multi-model failover, bulletproof JSON repair, and self-correcting agentic loops.
+"""OpenRouter implementation of LLMProvider: bounded retries, a multi-model
+failover chain, a per-turn deadline, and per-call usage accounting.
 """
 import asyncio
+import copy
 import json
 import logging
 import os
 import random
 import re
+import time
 import uuid
 from typing import Any
 
@@ -33,12 +35,24 @@ _DEFAULT_FALLBACK_MODELS = [
 ]
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Only failures where the request provably never reached the model are retried
+# on the same model. A read timeout means the model may have run (and billed);
+# retrying it doubles the cost and still may not answer in time.
+_RETRYABLE_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+# Tool calls executed per round. Beyond this the model is told to narrow down.
+_MAX_TOOL_CALLS_PER_ROUND = 3
 
 
-async def _log_usage(business_id: uuid.UUID, kind: str, model: str, usage_events: list[dict]) -> None:
-    """Persists aggregated AiUsageLog for the turn. Never raises — usage logging
-    must never fail a customer-facing reply."""
-    if not usage_events:
+async def log_usage(business_id: uuid.UUID, kind: str, model: str, usage: dict) -> None:
+    """Persists one AiUsageLog row for one billed call — right after the call,
+    so calls billed before a later failure in the same turn are still counted.
+
+    Runs on its own short-lived session. A failure to write is logged at error
+    level and swallowed: it's accounting, and by the time it runs the call has
+    already happened — failing the customer's turn would not un-spend it.
+    """
+    if not usage:
         return
     try:
         from app.ai.models import AiUsageLog
@@ -48,17 +62,17 @@ async def _log_usage(business_id: uuid.UUID, kind: str, model: str, usage_events
             db.add(
                 AiUsageLog(
                     business_id=business_id,
-                    kind=kind,
-                    model=model,
-                    prompt_tokens=sum(u.get("prompt_tokens", 0) for u in usage_events),
-                    completion_tokens=sum(u.get("completion_tokens", 0) for u in usage_events),
-                    total_tokens=sum(u.get("total_tokens", 0) for u in usage_events),
-                    cost_usd=sum(u.get("cost", 0) or 0 for u in usage_events),
+                    kind=kind[:20],
+                    model=model[:100],
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(usage.get("completion_tokens") or 0),
+                    total_tokens=int(usage.get("total_tokens") or 0),
+                    cost_usd=float(usage.get("cost") or 0),
                 )
             )
             await db.commit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[ai_usage_log] failed to persist usage: {exc}")
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception("[ai_usage_log] failed to persist usage for business %s", business_id)
 
 
 def _tool_to_openai_shape(tool: ToolDefinition) -> dict:
@@ -73,15 +87,14 @@ def _tool_to_openai_shape(tool: ToolDefinition) -> dict:
 
 
 def _clean_and_parse_json(content: str | None, response_schema: type[T]) -> T:
-    """Extracts, cleans, and validates structured output from the model.
-    Handles markdown code fences, leading/trailing conversational text, and
-    escapes gracefully."""
+    """Extracts and validates structured output. Tolerates formatting noise
+    around the JSON (code fences, a sentence before/after it, trailing commas)
+    — the content itself is still validated strictly against the schema, so
+    none of this can let a wrong value through."""
     if not content or not content.strip():
         raise ValueError(f"Empty content returned by model for schema {response_schema.__name__}")
 
     raw = content.strip()
-
-    # 1. Strip markdown code fences (```json ... ``` or ``` ... ```)
     if "```" in raw:
         fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
         if fence_match:
@@ -90,56 +103,88 @@ def _clean_and_parse_json(content: str | None, response_schema: type[T]) -> T:
             raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
             raw = re.sub(r"\s*```$", "", raw).strip()
 
-    # 2. Try direct Pydantic JSON validation
-    try:
-        return response_schema.model_validate_json(raw)
-    except Exception:
-        pass
-
-    # 3. Extract the outermost JSON object { ... }
-    brace_start = raw.find("{")
-    brace_end = raw.rfind("}")
+    candidates = [raw]
+    brace_start, brace_end = raw.find("{"), raw.rfind("}")
     if brace_start != -1 and brace_end > brace_start:
-        candidate = raw[brace_start : brace_end + 1]
-        try:
-            return response_schema.model_validate_json(candidate)
-        except Exception:
-            pass
+        inner = raw[brace_start : brace_end + 1]
+        candidates += [inner, re.sub(r",\s*([\]\}])", r"\1", inner)]
 
-        # 4. Try json.loads to resolve minor encoding/dict issues
+    last_error: Exception | None = None
+    for candidate in candidates:
         try:
-            parsed = json.loads(candidate)
-            return response_schema.model_validate(parsed)
-        except Exception:
-            pass
+            return response_schema.model_validate(json.loads(candidate))
+        except (ValueError, TypeError) as exc:
+            last_error = exc
+    raise ValueError(f"Could not parse valid {response_schema.__name__} from output: {content[:200]} ({last_error})")
 
-        # 5. Clean trailing commas before closing braces/brackets
-        try:
-            cleaned_commas = re.sub(r",\s*([\]\}])", r"\1", candidate)
-            parsed = json.loads(cleaned_commas)
-            return response_schema.model_validate(parsed)
-        except Exception:
-            pass
 
-    raise ValueError(f"Could not parse valid {response_schema.__name__} from output: {content[:200]}")
+def _message_of(data: dict) -> dict:
+    """The assistant message of a completion, or LLMProviderError — a 200 with
+    an error body, no choices, or a truncated/filtered generation is a failed
+    call, not an empty answer."""
+    if not isinstance(data, dict):
+        raise LLMProviderError("OpenRouter returned a non-object response")
+    if data.get("error"):
+        raise LLMProviderError(f"OpenRouter returned an error body: {str(data['error'])[:200]}")
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise LLMProviderError("OpenRouter returned no choices")
+    choice = choices[0]
+    finish_reason = choice.get("finish_reason") or choice.get("native_finish_reason")
+    if finish_reason in ("length", "content_filter", "error"):
+        raise LLMProviderError(f"Generation stopped early (finish_reason={finish_reason})")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise LLMProviderError("OpenRouter choice has no message")
+    return message
 
 
 def _parse_structured(data: dict, response_schema: type[T]) -> T:
+    message = _message_of(data)
     try:
-        content = data["choices"][0]["message"]["content"]
-        return _clean_and_parse_json(content, response_schema)
-    except Exception as exc:
+        return _clean_and_parse_json(message.get("content"), response_schema)
+    except ValueError as exc:
         raise LLMProviderError(f"OpenRouter returned invalid structured output: {exc}") from exc
 
 
+def _strict_schema(schema: dict) -> tuple[dict, bool]:
+    """Makes a Pydantic JSON schema acceptable to strict structured-output
+    implementations (OpenAI's in particular, used by the fallback chain):
+    every object closed with additionalProperties=false and every property
+    listed as required (optional ones are already nullable), no `default`.
+
+    Returns (schema, strict_ok). A free-form object (a dict field) can't be
+    expressed in strict mode at all, and a strict request carrying one is
+    rejected outright — such a schema is sent non-strict instead, still
+    validated against the model on our side."""
+    schema = copy.deepcopy(schema)
+    strict_ok = True
+
+    def visit(node: Any) -> None:
+        nonlocal strict_ok
+        if isinstance(node, dict):
+            node.pop("default", None)
+            if node.get("type") == "object":
+                if "properties" in node:
+                    node["additionalProperties"] = False
+                    node["required"] = list(node["properties"].keys())
+                else:
+                    strict_ok = False
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(schema)
+    return schema, strict_ok
+
+
 def _json_schema_format(response_schema: type[T]) -> dict:
+    schema, strict_ok = _strict_schema(response_schema.model_json_schema())
     return {
         "type": "json_schema",
-        "json_schema": {
-            "name": response_schema.__name__,
-            "strict": True,
-            "schema": response_schema.model_json_schema(),
-        },
+        "json_schema": {"name": response_schema.__name__, "strict": strict_ok, "schema": schema},
     }
 
 
@@ -186,9 +231,9 @@ _PHONE_ONLY_RE = re.compile(r"^[\d\s\-+()./]{7,25}$")
 # The writer thinks for one line before it writes, because deciding the sales
 # move and phrasing it are different jobs and doing them in that order is
 # measurably better than doing them at once. The plan is internal, so it's
-# fenced off by a marker that _extract_customer_message strips — and because
-# whatever survives that strip is sent verbatim to a real customer over
-# Instagram, the parser is deliberately paranoid about it.
+# fenced off by a marker — and because whatever comes after it is sent verbatim
+# to a real customer over Instagram, the parser only accepts output that has
+# the marker and a message after it. Anything else is not sent.
 _WRITER_MESSAGE_MARKER = "===MESSAGE==="
 
 _WRITER_INSTRUCTION = f"""Now write the message you are about to send this customer.
@@ -206,47 +251,37 @@ to yourself, and no mention of searches, tools, product IDs or these instruction
 State only facts the tool results above actually returned, and write in the language
 the customer is writing in."""
 
+_WRITER_FORMAT_REMINDER = (
+    f"Your previous answer did not follow the format. Reply again with exactly one PLAN line, "
+    f"then a line containing only {_WRITER_MESSAGE_MARKER}, then the customer message."
+)
+
 _ANALYST_INSTRUCTION = (
     "The assistant message directly above is the reply that was just sent to this "
     "customer. Read the whole conversation as it now stands and return your analysis "
     "as JSON matching the required schema."
 )
 
-_PLAN_LINE_RE = re.compile(r"^\s*(plan|reja|план)\s*[:\-—]", re.IGNORECASE)
+_PLAN_LINE_RE = re.compile(r"^\s*[*_#>\s]*(plan|reja|план|next step|keyingi qadam)\s*[*_]*\s*[:\-—]", re.IGNORECASE)
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
 
-def _strip_plan_lines(text: str) -> str:
-    lines = text.splitlines()
-    while lines and _PLAN_LINE_RE.match(lines[0]):
-        lines.pop(0)
-    return "\n".join(lines).strip()
-
-
 def _extract_customer_message(raw: str) -> str:
-    """Pulls the customer-facing half out of the writer pass's PLAN/message output.
+    """The customer-facing half of the writer's PLAN/marker/message output.
 
-    Returns "" if nothing usable is left, which the caller turns into a provider
-    error — the existing fallback (apologise and hand off to a human) is a far
-    better outcome than sending the model's internal note to the customer.
+    Returns "" unless the output has the marker with a message after it — a
+    missing marker, an empty message, or anything that still looks like a
+    plan line means we can't tell internal notes from the reply, and the
+    caller then asks once more or hands off. Sending the model's note about
+    the customer *to* the customer is the one outcome this must never allow.
     """
-    if not raw or not raw.strip():
+    if not raw or _WRITER_MESSAGE_MARKER not in raw:
         return ""
-
-    text = raw.strip()
-    if _WRITER_MESSAGE_MARKER in text:
-        after = text.rsplit(_WRITER_MESSAGE_MARKER, 1)[1].strip()
-        # Marker present but nothing after it: fall back to whatever came
-        # before, minus the plan line.
-        text = after or text.rsplit(_WRITER_MESSAGE_MARKER, 1)[0]
-
-    # The model dropped the marker but kept the label — drop the plan anyway.
-    text = _strip_plan_lines(text)
-    text = _FENCE_RE.sub("", text).strip()
-
-    # Last line of defence: a leftover plan label means the split failed and we
-    # can't tell internal notes from the message, so send nothing.
-    if _PLAN_LINE_RE.match(text) or _WRITER_MESSAGE_MARKER in text:
+    text = raw.rsplit(_WRITER_MESSAGE_MARKER, 1)[1]
+    text = _FENCE_RE.sub("", text.strip()).strip()
+    # Only the first line: that's where a plan repeated after the marker
+    # lands. A later line starting "Reja:" is the message's own content.
+    if not text or _PLAN_LINE_RE.match(text.splitlines()[0]):
         return ""
     return text
 
@@ -258,53 +293,60 @@ def _needs_product_grounding(messages: list[dict[str, Any]]) -> bool:
     that looks like a product question forces a tool call. But a customer
     saying "qimmat ekan" or "rahmat, o'ylab ko'raman" isn't asking for product
     facts at all — forcing a search there produced a catalog dump in place of
-    an actual reply to what they said, which is one of the main reasons the
-    conversation reads like a query interface rather than a salesperson.
+    an actual reply to what they said.
 
-    A product hint anywhere in the message wins, so "qimmat ekan, arzonrog'i
-    bormi?" still gets grounded.
+    Looks at every customer message since the last assistant reply, not only
+    the newest: a debounced burst of "Air Max narxi qancha" + "rahmat" is still
+    a price question.
     """
-    if not messages:
-        return True
-
+    burst: list[dict[str, Any]] = []
     for m in reversed(messages):
-        if m.get("role") != "user":
-            continue
-
-        content_val = m.get("content")
-        if isinstance(content_val, list):
-            return True  # multimodal (image) — always look for a match in the catalog
-
-        text = str(content_val or "").strip().lower()
-        if not text:
-            return True
-
-        if any(hint in text for hint in _PRODUCT_HINTS):
-            return True
-
-        # A bare phone number is the customer answering "leave your number",
-        # not a product question.
-        if _PHONE_ONLY_RE.match(text):
-            return False
-
-        words = re.findall(r"[\w']+", text)
-        if not words:
-            return False
-
-        # A short message carrying a conversational signal — a greeting, a
-        # thank-you, an objection, "let me think about it" — is answered, not
-        # searched. Deliberately "any word", not "every word": requiring every
-        # token to be on a list meant one unlisted filler word ("qimmat ekan")
-        # dragged the whole message back to a forced search. Anything longer or
-        # with no such signal falls through to grounding, which is the safe
-        # default — the cost of an unnecessary search is a slower turn, the
-        # cost of a missing one is an invented price.
-        if len(words) <= 8 and any(w in _NO_GROUNDING_NEEDED for w in words):
-            return False
-
+        if m.get("role") == "user":
+            burst.append(m)
+        elif burst:
+            break
+    if not burst:
         return True
+    return any(_message_needs_grounding(m) for m in burst)
 
+
+def _message_needs_grounding(m: dict[str, Any]) -> bool:
+    content_val = m.get("content")
+    if isinstance(content_val, list):
+        return True  # multimodal (image) — always look for a match in the catalog
+
+    text = str(content_val or "").strip().lower()
+    if not text:
+        return True
+    if any(hint in text for hint in _PRODUCT_HINTS):
+        return True
+    # A bare phone number is the customer answering "leave your number".
+    if _PHONE_ONLY_RE.match(text):
+        return False
+    words = re.findall(r"[\w']+", text)
+    if not words:
+        return False
+    # A short message carrying a conversational signal is answered, not
+    # searched. Anything longer or with no such signal is grounded — the cost
+    # of an unnecessary search is a slower turn, the cost of a missing one is
+    # an invented price.
+    if len(words) <= 8 and any(w in _NO_GROUNDING_NEEDED for w in words):
+        return False
     return True
+
+
+class _Deadline:
+    """The time budget of one turn, shared by every call in it."""
+
+    def __init__(self, seconds: float) -> None:
+        self._at = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        return self._at - time.monotonic()
+
+    def check(self) -> None:
+        if self.remaining() <= 0:
+            raise LLMProviderError("Turn deadline exceeded")
 
 
 class OpenRouterProvider(LLMProvider):
@@ -313,17 +355,11 @@ class OpenRouterProvider(LLMProvider):
         if not settings.openrouter_api_key:
             raise LLMProviderError("OPENROUTER_API_KEY is not set.")
         self._api_key = settings.openrouter_api_key
-
-        model = settings.openrouter_model or "google/gemini-2.5-flash"
-        if "gemini-2.0-flash-001" in model or not model:
-            model = "google/gemini-2.5-flash"
-        self._model = model
-
-        # Fallback model list
-        self._fallback_models = [
-            m for m in _DEFAULT_FALLBACK_MODELS if m != self._model
-        ]
-        self._timeout = settings.llm_request_timeout_seconds or 30.0
+        self._model = settings.openrouter_model
+        self._fallback_models = [m for m in _DEFAULT_FALLBACK_MODELS if m != self._model]
+        self._timeout = settings.llm_request_timeout_seconds
+        self._turn_deadline = settings.llm_turn_deadline_seconds
+        self._retry_after_cap = settings.llm_retry_after_cap_seconds
 
         # Writing the customer's reply and scoring the lead are different jobs
         # with opposite sampling needs — see the note in app/core/config.py.
@@ -336,101 +372,105 @@ class OpenRouterProvider(LLMProvider):
         self._is_testing = "PYTEST_CURRENT_TEST" in os.environ
         self._max_retries = 2
 
+    def _backoff(self, attempt: int, retry_after: str | None = None) -> float:
+        if self._is_testing:
+            return 0.001
+        if retry_after and retry_after.isdigit():
+            return min(float(retry_after), self._retry_after_cap)
+        return min(0.4 * (2**attempt) + random.uniform(0.05, 0.15), self._retry_after_cap)
+
     async def _call_single_model(
         self,
         client: httpx.AsyncClient,
         payload: dict,
         model_name: str,
+        deadline: _Deadline | None = None,
     ) -> dict:
-        """Calls OpenRouter with a specific model, retrying on transient errors."""
-        payload_copy = dict(payload)
-        payload_copy["model"] = model_name
-
-        last_error: Exception | None = None
+        """Calls OpenRouter with one model, retrying only what's safe to retry
+        (429/5xx, connection never established), within the turn deadline."""
+        body = dict(payload, model=model_name, usage={"include": True})
+        last_error = ""
         for attempt in range(self._max_retries + 1):
+            if deadline is not None:
+                deadline.check()
+            timeout = self._timeout if deadline is None else max(1.0, min(self._timeout, deadline.remaining()))
             try:
-                response = await client.post(
-                    _OPENROUTER_URL,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "HTTP-Referer": "https://mivo.uz",
-                        "X-Title": "Mivo AI",
-                    },
-                    json=payload_copy,
-                )
-                if response.status_code in _RETRYABLE_STATUS_CODES:
-                    if attempt < self._max_retries:
-                        retry_after = response.headers.get("Retry-After")
-                        if self._is_testing:
-                            delay = 0.001
-                        elif retry_after and retry_after.isdigit():
-                            delay = float(retry_after)
-                        else:
-                            delay = 0.4 * (2 ** attempt) + random.uniform(0.05, 0.15)
-
-                        logger.warning(
-                            f"[openrouter] Model {model_name} returned HTTP {response.status_code}. "
-                            f"Retrying in {delay:.2f}s (attempt {attempt + 1}/{self._max_retries})..."
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    response.raise_for_status()
-
-                response.raise_for_status()
-                return response.json()
-
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                last_error = exc
-                if attempt < self._max_retries:
-                    delay = 0.001 if self._is_testing else (0.4 * (2 ** attempt) + random.uniform(0.05, 0.15))
-                    logger.warning(
-                        f"[openrouter] Network error on {model_name}: {exc}. "
-                        f"Retrying in {delay:.2f}s (attempt {attempt + 1}/{self._max_retries})..."
+                # httpx's timeout bounds each read, not the request: a response
+                # trickling in slower than that but never stalling would run
+                # past the turn deadline. This bounds the whole call.
+                async with asyncio.timeout(timeout):
+                    response = await client.post(
+                        _OPENROUTER_URL,
+                        headers={
+                            "Authorization": f"Bearer {self._api_key}",
+                            "HTTP-Referer": "https://mivo.uz",
+                            "X-Title": "Mivo AI",
+                        },
+                        json=body,
+                        timeout=timeout,
                     )
-                    await asyncio.sleep(delay)
+            except TimeoutError as exc:
+                raise LLMProviderError(f"OpenRouter call to {model_name} exceeded {timeout:.0f}s") from exc
+            except _RETRYABLE_TRANSPORT_ERRORS as exc:
+                last_error = f"{type(exc).__name__}"
+                if attempt < self._max_retries:
+                    await asyncio.sleep(self._backoff(attempt))
                     continue
-                raise LLMProviderError(f"OpenRouter request timed out or network failed for {model_name}: {exc}") from exc
+                raise LLMProviderError(f"OpenRouter unreachable for {model_name}: {last_error}") from exc
+            except httpx.HTTPError as exc:
+                raise LLMProviderError(f"OpenRouter request failed for {model_name}: {type(exc).__name__}") from exc
 
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                raise LLMProviderError(f"OpenRouter HTTP error {exc.response.status_code}: {exc.response.text[:200]}") from exc
-
-            except Exception as exc:
-                last_error = exc
-                raise LLMProviderError(f"OpenRouter call failed for {model_name}: {exc}") from exc
-
-        if last_error:
-            raise LLMProviderError(f"OpenRouter retries exhausted for {model_name}: {last_error}")
-        raise LLMProviderError(f"OpenRouter call failed for {model_name}")
+            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                delay = self._backoff(attempt, response.headers.get("Retry-After"))
+                logger.warning(
+                    "[openrouter] %s returned HTTP %s, retrying in %.2fs (attempt %d/%d)",
+                    model_name, response.status_code, delay, attempt + 1, self._max_retries,
+                )
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code >= 400:
+                raise LLMProviderError(
+                    f"OpenRouter HTTP error {response.status_code} for {model_name}: {response.text[:200]}"
+                )
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise LLMProviderError(f"OpenRouter returned non-JSON for {model_name}") from exc
+        raise LLMProviderError(f"OpenRouter retries exhausted for {model_name}: {last_error}")
 
     async def _call_with_fallback(
         self,
         client: httpx.AsyncClient,
         payload: dict,
         primary_model: str | None = None,
+        *,
+        deadline: _Deadline | None = None,
+        business_id: uuid.UUID | None = None,
+        kind: str = "conversation",
     ) -> tuple[dict, str]:
-        """Tries the primary model; if it fails with an LLMProviderError,
-        cascades to fallback models. `primary_model` overrides the configured
-        default for calls that want a different tier (the writer pass may run
-        on a stronger model than the analyst pass)."""
+        """Primary model, then the fallback chain. A response whose message is
+        unusable (error body, no choices, truncated) counts as that model
+        failing. Each billed call is logged as it completes."""
         primary = primary_model or self._model
         models_to_try = [primary] + [m for m in self._fallback_models if m != primary]
         errors = []
-
         for model_name in models_to_try:
             try:
-                data = await self._call_single_model(client, payload, model_name=model_name)
-                return data, model_name
+                data = await self._call_single_model(client, payload, model_name, deadline)
             except LLMProviderError as exc:
-                logger.warning(f"[openrouter] Model {model_name} failed: {exc}. Attempting next model...")
+                logger.warning("[openrouter] %s failed: %s", model_name, exc)
                 errors.append(f"{model_name}: {exc}")
-
+                continue
+            if business_id is not None:
+                await log_usage(business_id, kind, model_name, data.get("usage") or {})
+            try:
+                _message_of(data)
+            except LLMProviderError as exc:
+                logger.warning("[openrouter] %s gave an unusable response: %s", model_name, exc)
+                errors.append(f"{model_name}: {exc}")
+                continue
+            return data, model_name
         raise LLMProviderError(f"All LLM models failed: {'; '.join(errors)}")
-
-    async def _call(self, client: httpx.AsyncClient, payload: dict) -> dict:
-        """Standard call with failover, for backward compatibility."""
-        data, _ = await self._call_with_fallback(client, payload)
-        return data
 
     async def generate_structured(
         self,
@@ -448,10 +488,9 @@ class OpenRouterProvider(LLMProvider):
             "response_format": _json_schema_format(response_schema),
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            data, model_used = await self._call_with_fallback(client, payload)
-
-        if business_id is not None:
-            await _log_usage(business_id, "extraction", model_used, [data.get("usage") or {}])
+            data, _model_used = await self._call_with_fallback(
+                client, payload, business_id=business_id, kind="extraction"
+            )
         return _parse_structured(data, response_schema)
 
     async def _run_tool_loop(
@@ -463,84 +502,57 @@ class OpenRouterProvider(LLMProvider):
         tools: list[ToolDefinition],
         tool_executor: ToolExecutor,
         max_tool_calls: int,
-        usage_events: list[dict],
-    ) -> tuple[list[dict[str, Any]], str]:
-        """Runs the grounding loop and returns (conversation, model_used).
-
-        The returned conversation is the system prompt, the chat history, and
-        every assistant/tool exchange the loop produced — i.e. all the grounded
-        product facts the writer and analyst passes need in front of them.
-        """
+        deadline: _Deadline,
+        business_id: uuid.UUID | None,
+    ) -> list[dict[str, Any]]:
+        """Runs the grounding loop and returns the conversation: the system
+        prompt, the chat history, and every assistant/tool exchange the loop
+        produced — the grounded facts the writer and analyst need in view."""
         conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *messages]
         openai_tools = [_tool_to_openai_shape(t) for t in tools]
-        model_used = self._model
         needs_grounding = _needs_product_grounding(messages)
 
         for i in range(max_tool_calls):
-            # Force one grounding call up front only when the customer actually
-            # asked something a tool can answer — see _needs_product_grounding.
-            tool_choice = "required" if (i == 0 and needs_grounding) else "auto"
-
             payload = {
                 "messages": conversation,
                 "tools": openai_tools,
-                "tool_choice": tool_choice,
+                # Force one grounding call up front only when the customer
+                # actually asked something a tool can answer.
+                "tool_choice": "required" if (i == 0 and needs_grounding) else "auto",
             }
-            data, model_used = await self._call_with_fallback(client, payload)
-            usage_events.append(data.get("usage") or {})
-
-            message = data["choices"][0]["message"]
+            data, _model = await self._call_with_fallback(
+                client, payload, deadline=deadline, business_id=business_id
+            )
+            message = _message_of(data)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 break
 
-            conversation.append(
-                {
-                    "role": "assistant",
-                    "content": message.get("content"),
-                    "tool_calls": tool_calls,
-                }
-            )
-
-            for call in tool_calls:
-                name = call["function"]["name"]
-                raw_args = call["function"]["arguments"] or "{}"
-
-                try:
-                    arguments = json.loads(raw_args)
-                except json.JSONDecodeError as exc:
-                    # Attempt to fix single quotes or minor syntax errors
-                    try:
-                        arguments = json.loads(raw_args.replace("'", '"'))
-                    except Exception:
-                        logger.warning(f"[openrouter] Model sent malformed tool arguments: {raw_args} ({exc})")
-                        # Provide feedback to the model in the tool role so it self-corrects
-                        conversation.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call["id"],
-                                "content": json.dumps(
-                                    {"error": f"Invalid JSON arguments: {exc}. Please re-call with valid JSON."}
-                                ),
-                            }
-                        )
-                        continue
-
-                try:
-                    result = await tool_executor(name, arguments)
-                except Exception as exc:
-                    logger.warning(f"[openrouter] Tool execution error for '{name}': {exc}")
-                    result = {"error": f"Tool execution failed: {str(exc)}"}
-
-                conversation.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": json.dumps(result),
+            conversation.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+            for index, call in enumerate(tool_calls):
+                call_id = call.get("id") or f"call_{i}_{index}"
+                function = call.get("function") or {}
+                name = function.get("name") or ""
+                if index >= _MAX_TOOL_CALLS_PER_ROUND:
+                    result: dict = {
+                        "error": f"Only {_MAX_TOOL_CALLS_PER_ROUND} tool calls are run per step; "
+                        "this one was skipped. Narrow down and call again if still needed."
                     }
-                )
+                else:
+                    try:
+                        arguments = json.loads(function.get("arguments") or "{}")
+                        if not isinstance(arguments, dict):
+                            raise ValueError("arguments must be a JSON object")
+                    except ValueError as exc:
+                        # Told to the model so it re-calls correctly — never
+                        # "repaired" by guessing what it meant.
+                        logger.warning("[openrouter] malformed tool arguments for %s: %s", name, exc)
+                        result = {"error": f"Invalid JSON arguments: {exc}. Re-call with a valid JSON object."}
+                    else:
+                        result = await tool_executor(name, arguments)
+                conversation.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, default=str)})
 
-        return conversation, model_used
+        return conversation
 
     async def run_agentic_turn(
         self,
@@ -553,40 +565,71 @@ class OpenRouterProvider(LLMProvider):
         max_tool_calls: int = 4,
         business_id: uuid.UUID | None = None,
     ) -> T:
-        usage_events: list[dict] = []
-
+        deadline = _Deadline(self._turn_deadline)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            conversation, model_used = await self._run_tool_loop(
+            conversation = await self._run_tool_loop(
                 client,
                 system_prompt=system_prompt,
                 messages=messages,
                 tools=tools,
                 tool_executor=tool_executor,
                 max_tool_calls=max_tool_calls,
-                usage_events=usage_events,
+                deadline=deadline,
+                business_id=business_id,
             )
-
-            # Final call: no tools, constrained to the fused response schema.
             final_payload = {
                 "messages": [
                     *conversation,
                     {
                         "role": "user",
-                        "content": (
-                            "Using everything above, produce your final response now "
-                            "as JSON matching the required schema."
-                        ),
+                        "content": "Using everything above, produce your final response now as JSON matching the required schema.",
                     },
                 ],
+                "tools": [_tool_to_openai_shape(t) for t in tools],
+                "tool_choice": "none",
                 "response_format": _json_schema_format(response_schema),
                 "temperature": self._analyst_temperature,
             }
-            final_data, final_model = await self._call_with_fallback(client, final_payload)
-            usage_events.append(final_data.get("usage") or {})
-
-        if business_id is not None:
-            await _log_usage(business_id, "conversation", final_model or model_used, usage_events)
+            final_data, _model = await self._call_with_fallback(
+                client, final_payload, deadline=deadline, business_id=business_id
+            )
         return _parse_structured(final_data, response_schema)
+
+    async def _write_reply(
+        self,
+        client: httpx.AsyncClient,
+        conversation: list[dict[str, Any]],
+        tools: list[ToolDefinition],
+        deadline: _Deadline,
+        business_id: uuid.UUID | None,
+    ) -> str:
+        """The writer pass. Output without the marker gets one reminder and a
+        second attempt; still unusable is a provider error (-> handoff)."""
+        writer_messages = [*conversation, {"role": "system", "content": _WRITER_INSTRUCTION}]
+        raw = ""
+        for attempt in range(2):
+            payload = {
+                "messages": writer_messages,
+                # The conversation carries tool-call history, which several
+                # providers reject without the tool definitions present.
+                "tools": [_tool_to_openai_shape(t) for t in tools],
+                "tool_choice": "none",
+                "temperature": self._writer_temperature,
+            }
+            data, _model = await self._call_with_fallback(
+                client, payload, primary_model=self._writer_model, deadline=deadline, business_id=business_id
+            )
+            raw = _message_of(data).get("content") or ""
+            reply = _extract_customer_message(raw)
+            if reply:
+                return reply
+            logger.warning("[openrouter] writer output unusable (attempt %d): %r", attempt + 1, raw[:200])
+            writer_messages = [
+                *writer_messages,
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": _WRITER_FORMAT_REMINDER},
+            ]
+        raise LLMProviderError(f"Writer pass returned no customer-facing message (raw: {raw[:200]!r})")
 
     async def run_sales_turn(
         self,
@@ -605,53 +648,37 @@ class OpenRouterProvider(LLMProvider):
         """Grounding loop, then two separate passes: write, then analyse.
 
         `fused_schema` goes unused here — it exists for the single-pass default
-        in LLMProvider. Splitting the passes is the whole point: the writer runs
-        unconstrained and warm so the reply reads like a person typing, and the
-        analyst runs schema-constrained and cold over that finished reply, which
-        is also a better vantage point for scoring the lead than a schema field
-        filled in before the reply it's judging even exists.
-        """
-        usage_events: list[dict] = []
+        in LLMProvider. The writer runs unconstrained and warm so the reply
+        reads like a person typing; the analyst runs schema-constrained and
+        cold over that finished reply.
 
+        The turn deadline covers the grounding loop and the writer, which is
+        what the customer waits on. Delivery (on_reply) is never cut off
+        mid-send; the analyst gets whatever budget is left, with a floor, and
+        its failure only degrades the bookkeeping.
+        """
+        deadline = _Deadline(self._turn_deadline)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            conversation, model_used = await self._run_tool_loop(
+            conversation = await self._run_tool_loop(
                 client,
                 system_prompt=system_prompt,
                 messages=messages,
                 tools=tools,
                 tool_executor=tool_executor,
                 max_tool_calls=max_tool_calls,
-                usage_events=usage_events,
+                deadline=deadline,
+                business_id=business_id,
             )
-
-            # Pass 1 — the writer. No response_format, no tools: plain prose at
-            # a sampling temperature that leaves room to sound human.
-            writer_payload = {
-                "messages": [*conversation, {"role": "system", "content": _WRITER_INSTRUCTION}],
-                "temperature": self._writer_temperature,
-            }
-            writer_data, writer_model = await self._call_with_fallback(
-                client, writer_payload, primary_model=self._writer_model
-            )
-            usage_events.append(writer_data.get("usage") or {})
-
-            raw_reply = writer_data["choices"][0]["message"].get("content") or ""
-            reply = _extract_customer_message(raw_reply)
-            if not reply:
-                raise LLMProviderError(
-                    f"Writer pass returned no customer-facing message (raw: {raw_reply[:200]!r})"
-                )
+            reply = await self._write_reply(client, conversation, tools, deadline, business_id)
 
             # The customer's reply is ready and nothing below this line changes
             # it, so hand it over now rather than making them wait out the
-            # analysis. Whatever comes back is what the analyst then judges —
-            # the hook applies the safety guards, so it can rewrite the text.
+            # analysis. The hook applies the safety guards, so it can rewrite
+            # the text — what it returns is what the analyst judges.
             if on_reply is not None:
                 reply = await on_reply(reply)
 
-            # Pass 2 — the analyst. Same grounded conversation, different system
-            # prompt, with the reply that was just written in view as the last
-            # assistant turn.
+            analyst_deadline = _Deadline(max(deadline.remaining(), 15.0))
             analyst_payload = {
                 "messages": [
                     {"role": "system", "content": analyst_system_prompt},
@@ -659,15 +686,17 @@ class OpenRouterProvider(LLMProvider):
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": _ANALYST_INSTRUCTION},
                 ],
+                "tools": [_tool_to_openai_shape(t) for t in tools],
+                "tool_choice": "none",
                 "response_format": _json_schema_format(analysis_schema),
                 "temperature": self._analyst_temperature,
             }
-            analyst_data, _analyst_model = await self._call_with_fallback(
-                client, analyst_payload, primary_model=self._analyst_model
+            analyst_data, _model = await self._call_with_fallback(
+                client,
+                analyst_payload,
+                primary_model=self._analyst_model,
+                deadline=analyst_deadline,
+                business_id=business_id,
             )
-            usage_events.append(analyst_data.get("usage") or {})
             analysis = _parse_structured(analyst_data, analysis_schema)
-
-        if business_id is not None:
-            await _log_usage(business_id, "conversation", writer_model or model_used, usage_events)
         return reply, analysis

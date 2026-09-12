@@ -1,22 +1,24 @@
 import hashlib
 import hmac
+import json
+import logging
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.provider.base import LLMProvider
 from app.ai.provider.factory import get_llm_provider
 from app.businesses.models import Business
 from app.common.tenancy import get_current_business
 from app.core.config import get_settings
 from app.core.db import get_db
-from app.core.security import create_oauth_state_token, decode_oauth_state_token
-from app.instagram import service
-from app.instagram.client import MetaAPIError, MetaClient
+from app.instagram import pipeline, service
+from app.instagram.client import MetaClient
 
 router = APIRouter(tags=["instagram"])
+logger = logging.getLogger("app.instagram.router")
 
 
 def get_meta_client() -> MetaClient:
@@ -25,6 +27,10 @@ def get_meta_client() -> MetaClient:
 
 class ConnectResponse(BaseModel):
     oauth_url: str
+
+
+class CompleteConnectRequest(BaseModel):
+    completion_id: str = Field(min_length=10, max_length=64)
 
 
 class InstagramStatusResponse(BaseModel):
@@ -41,22 +47,35 @@ async def instagram_status(
     account = await service.get_account(db, business.id)
     if account is None or account.status != "connected":
         return InstagramStatusResponse(connected=False)
-    
+
     expires_str = account.token_expires_at.isoformat() if account.token_expires_at else None
-    return InstagramStatusResponse(
-        connected=True,
-        username=account.ig_username,
-        expires_at=expires_str,
-    )
+    return InstagramStatusResponse(connected=True, username=account.ig_username, expires_at=expires_str)
 
 
 @router.post("/integrations/instagram/connect", response_model=ConnectResponse)
 async def connect_instagram(
     business: Business = Depends(get_current_business),
+    db: AsyncSession = Depends(get_db),
     meta_client: MetaClient = Depends(get_meta_client),
 ):
-    state = create_oauth_state_token(str(business.id))
+    state = await service.start_oauth(db, business.id)
     return ConnectResponse(oauth_url=meta_client.build_oauth_url(state))
+
+
+@router.post("/integrations/instagram/complete", response_model=InstagramStatusResponse)
+async def complete_instagram_connect(
+    body: CompleteConnectRequest,
+    business: Business = Depends(get_current_business),
+    db: AsyncSession = Depends(get_db),
+    meta_client: MetaClient = Depends(get_meta_client),
+):
+    """Second half of the connect flow — see app/instagram/models.py:OAuthState."""
+    try:
+        account = await service.complete_oauth(db, business.id, body.completion_id, meta_client)
+    except service.OAuthFlowError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    expires_str = account.token_expires_at.isoformat() if account.token_expires_at else None
+    return InstagramStatusResponse(connected=True, username=account.ig_username, expires_at=expires_str)
 
 
 @router.delete("/integrations/instagram/disconnect", status_code=status.HTTP_204_NO_CONTENT)
@@ -70,151 +89,78 @@ async def disconnect_instagram(
 
 @router.get("/integrations/instagram/callback")
 async def instagram_callback(
-    code: str = Query(...),
-    state: str = Query(...),
+    state: str = Query(..., max_length=64),
+    code: str | None = Query(default=None, max_length=2048),
+    error: str | None = Query(default=None, max_length=200),
     db: AsyncSession = Depends(get_db),
-    meta_client: MetaClient = Depends(get_meta_client),
 ):
-    """Instagram redirects the browser HERE (the backend), never straight to the
-    frontend — the code -> token exchange needs client_secret, which must never
-    reach the browser. Once done, we redirect the browser on to the dashboard
-    (success or error) so the user lands back in the actual UI, not a bare
-    JSON/error page."""
-    settings = get_settings()
-    integrations_url = f"{settings.frontend_url}/integrations"
-
+    """Instagram redirects the browser HERE. The code is parked, not used:
+    the browser is sent back to the dashboard with a one-time completion id,
+    and the logged-in owner's dashboard finishes the connection
+    (POST /integrations/instagram/complete)."""
+    integrations_url = f"{get_settings().frontend_url}/integrations"
+    if error or not code:
+        return RedirectResponse(f"{integrations_url}?{urlencode({'instagram_error': 'denied'})}")
     try:
-        business_id = decode_oauth_state_token(state)
-    except Exception:
-        return RedirectResponse(f"{integrations_url}?instagram_error=invalid_state")
-
-    try:
-        account = await meta_client.exchange_code_for_account(code)
-    except MetaAPIError as exc:
-        print(f"[instagram_callback] Meta token exchange failed: {exc}")
-        return RedirectResponse(f"{integrations_url}?instagram_error=connect_failed")
-
-    import uuid as _uuid
-
-    await service.connect_account(db, _uuid.UUID(business_id), account)
-    return RedirectResponse(f"{integrations_url}?instagram_connected=1")
+        completion_id = await service.park_oauth_code(db, state, code)
+    except service.OAuthFlowError:
+        return RedirectResponse(f"{integrations_url}?{urlencode({'instagram_error': 'invalid_state'})}")
+    return RedirectResponse(f"{integrations_url}?{urlencode({'instagram_pending': completion_id})}")
 
 
 @router.get("/webhooks/instagram")
 async def verify_instagram_webhook(
     hub_mode: str = Query(alias="hub.mode"),
-    hub_challenge: str = Query(alias="hub.challenge"),
-    hub_verify_token: str = Query(alias="hub.verify_token"),
+    hub_challenge: str = Query(alias="hub.challenge", max_length=256),
+    hub_verify_token: str = Query(alias="hub.verify_token", max_length=256),
 ):
-    settings = get_settings()
-    if hub_mode != "subscribe" or hub_verify_token != settings.meta_webhook_verify_token:
+    expected = get_settings().meta_webhook_verify_token
+    if (
+        hub_mode != "subscribe"
+        or not expected
+        or not hmac.compare_digest(hub_verify_token.encode(), expected.encode())
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Verification failed.")
     return Response(content=hub_challenge, media_type="text/plain")
 
 
-def _verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
-    if not app_secret:
-        # No app secret configured (local dev without real Meta credentials) —
-        # skip verification rather than lock out an otherwise-working dev setup.
-        return True
-    if not signature_header or not signature_header.startswith("sha256="):
+def verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
+    """Fails closed: without an app secret nothing can be verified, so nothing
+    is accepted — an unverified webhook would let anyone inject messages into
+    a business's inbox and spend its LLM budget."""
+    if not app_secret or not signature_header or not signature_header.startswith("sha256="):
         return False
     computed = hmac.new(app_secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    received = signature_header.removeprefix("sha256=")
-    return hmac.compare_digest(computed, received)
+    return hmac.compare_digest(computed, signature_header.removeprefix("sha256="))
 
 
 @router.post("/webhooks/instagram")
 async def receive_instagram_webhook(
     request: Request,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
-    provider: LLMProvider = Depends(get_llm_provider),
     meta_client: MetaClient = Depends(get_meta_client),
     x_hub_signature_256: str | None = Header(default=None),
 ):
-    """Acks 200 immediately after processing — Meta expects a fast response and
-    retries on non-2xx (plan §11). MVP processes inline via FastAPI's async
-    request handling rather than a separate background job queue; at ~10k
-    msgs/month this is well within a single request's latency budget."""
+    """Verify, persist, 200 — the turn itself runs after the response (see
+    app/instagram/pipeline.py). Meta wants an answer within seconds; a turn is
+    several LLM calls, so running it here made Meta give up and retry.
+
+    The LLM provider is handed over as a factory, resolved only when a turn
+    actually runs: a misconfigured provider must not stop customer messages
+    from being recorded (the pipeline hands that conversation to a human)."""
+    provider_factory = request.app.dependency_overrides.get(get_llm_provider, get_llm_provider)
     raw_body = await request.body()
-    settings = get_settings()
-    if not _verify_signature(raw_body, x_hub_signature_256, settings.meta_app_secret):
+    if not verify_signature(raw_body, x_hub_signature_256, get_settings().meta_app_secret):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid webhook signature.")
 
-    body = await request.json()
-    for entry in body.get("entry", []):
-        for messaging_event in entry.get("messaging", []):
-            message = messaging_event.get("message")
-            if not message:
-                continue
+    try:
+        body = json.loads(raw_body)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body is not JSON.") from exc
 
-            message_text = message.get("text", "")
-            attachments = message.get("attachments", [])
-            attachment_url = None
-            attachment_type = None
-
-            for att in attachments:
-                att_type_candidate = att.get("type")
-                payload = att.get("payload", {}) if isinstance(att.get("payload"), dict) else {}
-                url_candidate = payload.get("url")
-
-                if att_type_candidate == "audio" and url_candidate:
-                    attachment_url = url_candidate
-                    attachment_type = "audio"
-                    try:
-                        from app.ai.audio import transcribe_audio_url
-                        transcribed = await transcribe_audio_url(url_candidate)
-                        if transcribed:
-                            message_text = transcribed
-                    except Exception as err:
-                        print(f"[InstagramWebhook] Audio transcription error: {err}")
-                    break
-                elif att_type_candidate == "image" and url_candidate:
-                    attachment_url = url_candidate
-                    attachment_type = "image"
-                    break
-
-            if not attachment_url and attachments:
-                att = attachments[0]
-                attachment_type = att.get("type", "media")
-                payload = att.get("payload", {}) if isinstance(att.get("payload"), dict) else {}
-                attachment_url = payload.get("url")
-
-            if not message_text.strip():
-                if attachment_type == "image":
-                    message_text = "[Mijoz rasm yubordi]"
-                elif attachment_type == "video":
-                    message_text = "[Video yuborildi]"
-                elif attachment_type in ("share", "ig_reel", "story_mention"):
-                    message_text = "[Reels / Story ulashildi]"
-                elif attachment_type:
-                    message_text = f"[{attachment_type.capitalize()} yuborildi]"
-
-            if not message_text.strip() and not attachment_url:
-                continue
-
-            if message.get("is_echo"):
-                await service.process_echo_message(
-                    db,
-                    ig_sender_id=messaging_event["sender"]["id"],
-                    customer_ig_scoped_id=messaging_event["recipient"]["id"],
-                    message_text=message_text,
-                    external_message_id=message.get("mid", ""),
-                    meta_client=meta_client,
-                    attachment_url=attachment_url,
-                    attachment_type=attachment_type,
-                )
-            else:
-                await service.process_incoming_message(
-                    db,
-                    provider,
-                    meta_client,
-                    ig_recipient_id=messaging_event["recipient"]["id"],
-                    customer_ig_scoped_id=messaging_event["sender"]["id"],
-                    message_text=message_text,
-                    external_message_id=message.get("mid", ""),
-                    attachment_url=attachment_url,
-                    attachment_type=attachment_type,
-                )
+    for event in pipeline.parse_webhook_body(body):
+        event_id = await pipeline.ingest_event(db, event)
+        if event_id is not None:
+            background.add_task(pipeline.process_event, event_id, provider=provider_factory, meta_client=meta_client)
     return {"status": "ok"}
-

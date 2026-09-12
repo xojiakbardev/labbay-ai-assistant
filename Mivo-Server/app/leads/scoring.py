@@ -62,6 +62,30 @@ def normalize_phone_candidate(raw: str) -> str | None:
     return None
 
 
+_GROUP_RE = re.compile(r"\+?\d+")
+_SEGMENT_SPLIT_RE = re.compile(r"\s*[/;\n]\s*|\s+-\s+")
+
+
+def _sub_candidates(raw: str):
+    """Narrower readings of a candidate whose digits as a whole aren't a number.
+
+    The candidate pattern is greedy, so two numbers separated by " / ", or a
+    number with a size or quantity stuck to it ("42 901234567"), arrive as one
+    blob. The blob is split on separators that clearly end a number, and each
+    piece is tried whole, then without its leading groups, then without its
+    trailing ones — never an arbitrary run from the middle, which is how
+    "1990 1234 5678"-style codes used to turn into phone numbers."""
+    for segment in _SEGMENT_SPLIT_RE.split(raw):
+        groups = _GROUP_RE.findall(segment)
+        if not groups:
+            continue
+        yield " ".join(groups)
+        for start in range(1, len(groups)):
+            yield " ".join(groups[start:])
+        for end in range(len(groups) - 1, 0, -1):
+            yield " ".join(groups[:end])
+
+
 def extract_valid_phone(text: str | None) -> str | None:
     """Extracts and normalizes the first valid phone number from raw text
     or LLM-proposed phone string. Returns normalized E.164 string or None."""
@@ -71,4 +95,8 @@ def extract_valid_phone(text: str | None) -> str | None:
         normalized = normalize_phone_candidate(match.group(0))
         if normalized:
             return normalized
+        for sub in _sub_candidates(match.group(0)):
+            normalized = normalize_phone_candidate(sub)
+            if normalized:
+                return normalized
     return None

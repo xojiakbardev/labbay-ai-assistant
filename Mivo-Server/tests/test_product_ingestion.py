@@ -16,7 +16,8 @@ class FakeLLMProvider(LLMProvider):
         self._response = response
         self._raise_error = raise_error
 
-    async def generate_structured(self, *, system_prompt, user_content, response_schema):
+    async def generate_structured(self, *, system_prompt, user_content, response_schema, business_id=None):
+        self.business_id = business_id
         if self._raise_error:
             from app.ai.provider.base import LLMProviderError
 
@@ -75,8 +76,11 @@ def test_preview_extracts_and_normalizes_without_writing(client) -> None:
         assert product["price"] == 250000
         assert len(product["images"]) == 1
         assert product["images"][0]["url"] == "https://example.com/nike-hoodie.jpg"
-        variant_types = {v["variant_type"] for v in product["variants"]}
-        assert variant_types == {"color", "size"}
+        # Colours x sizes become combination variants, each carrying both
+        # attributes so a search for "M" or "Qora" matches them exactly.
+        assert {v["variant_type"] for v in product["variants"]} == {"combination"}
+        assert len(product["variants"]) == 2 * 4
+        assert {"color": "Qora", "size": "M"} in [v["attributes"] for v in product["variants"]]
 
         # Nothing written yet.
         listed = client.get("/products", headers=headers)
@@ -197,3 +201,31 @@ def test_preview_rejects_empty_extraction(client) -> None:
 def test_import_endpoints_require_auth(client) -> None:
     resp = client.post("/products/import/preview", json={"text": "hi"})
     assert resp.status_code == 401
+
+
+def test_invalid_direct_json_is_reported_not_sent_to_the_llm(client) -> None:
+    """JSON that parses but isn't valid product data used to be silently
+    handed to the paid LLM; the owner is now told what's wrong."""
+    provider = FakeLLMProvider(NIKE_HOODIE_EXTRACTED)
+    app.dependency_overrides[get_llm_provider] = lambda: provider
+    try:
+        headers = _auth_headers(client)
+        resp = client.post(
+            "/products/import/preview",
+            json={"text": json.dumps([{"name": "x" * 300, "price": 1}])},
+            headers=headers,
+        )
+        assert resp.status_code == 422
+        assert "name" in resp.json()["detail"]
+        assert not hasattr(provider, "business_id")  # the LLM was never called
+    finally:
+        app.dependency_overrides.pop(get_llm_provider, None)
+
+
+def test_import_confirm_is_all_or_nothing(client) -> None:
+    headers = _auth_headers(client)
+    good = {"name": "Good", "price": 100}
+    bad = {"name": "Bad", "price": -5}
+    resp = client.post("/products/import/confirm", json={"products": [good, bad]}, headers=headers)
+    assert resp.status_code == 422
+    assert client.get("/products", headers=headers).json() == []

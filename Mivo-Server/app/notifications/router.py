@@ -1,53 +1,56 @@
 import asyncio
 import json
 import uuid
-import jwt
 from typing import AsyncGenerator
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import User
 from app.businesses.models import Business
-from app.common.tenancy import get_current_business
-from app.core.db import get_db
-from app.core.security import decode_token
+from app.common.tenancy import business_for_user, get_current_business, get_current_user, user_from_token
+from app.core.db import async_session_factory, get_db
+from app.core.security import SSE_TICKET_TTL, TOKEN_SSE, create_sse_ticket
 from app.notifications import service
 from app.notifications.broadcaster import broadcaster
 from app.notifications.schemas import MarkReadAllOut, NotificationOut, UnreadCountOut
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
-_bearer_scheme = HTTPBearer(auto_error=False)
+
+_HEARTBEAT_SECONDS = 15.0
+_REAUTH_EVERY_PINGS = 20  # ~5 minutes
 
 
-async def get_current_business_for_sse(
-    token: str | None = Query(None),
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-    db: AsyncSession = Depends(get_db),
-) -> Business:
-    """Authenticates SSE stream requests via Bearer header or ?token= query parameter."""
-    raw_jwt = credentials.credentials if credentials else token
-    if not raw_jwt:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
+async def _still_active(business_id: uuid.UUID) -> bool:
+    async with async_session_factory() as db:
+        business = await db.get(Business, business_id)
+        return business is not None and business.deleted_at is None
 
-    try:
-        payload = decode_token(raw_jwt)
-    except jwt.PyJWTError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token.") from exc
 
-    if payload.get("type") != "access":
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token type.")
+class StreamTicketOut(BaseModel):
+    ticket: str
+    expires_in: int
 
-    user = await db.get(User, uuid.UUID(payload["sub"]))
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists.")
 
-    business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
-    if business is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No business found for this account.")
-    return business
+@router.post("/stream-ticket", response_model=StreamTicketOut)
+async def issue_stream_ticket(
+    user: User = Depends(get_current_user),
+    _business: Business = Depends(get_current_business),
+) -> StreamTicketOut:
+    """A one-minute, stream-only credential for EventSource (which can't send
+    an Authorization header). The access token never goes into a URL."""
+    return StreamTicketOut(ticket=create_sse_ticket(str(user.id)), expires_in=int(SSE_TICKET_TTL.total_seconds()))
+
+
+async def _business_for_ticket(ticket: str) -> uuid.UUID:
+    # Its own short session: a stream stays open for hours, and it must not
+    # hold a pooled connection (or a transaction) for all of that.
+    async with async_session_factory() as db:
+        user = await user_from_token(db, ticket, TOKEN_SSE)
+        business = await business_for_user(db, user)
+        return business.id
 
 
 @router.get("", response_model=list[NotificationOut])
@@ -116,27 +119,35 @@ async def delete_notification(
 
 
 @router.get("/stream")
-async def stream_notifications(
-    business: Business = Depends(get_current_business_for_sse),
-):
-    """Server-Sent Events (SSE) real-time notification stream, strictly scoped to caller's business_id."""
+async def stream_notifications(ticket: str = Query(..., max_length=2048)):
+    """Server-Sent Events stream, scoped to the ticket holder's business."""
+    business_id = await _business_for_ticket(ticket)
+
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Send initial connection confirmation
-        yield "event: connected\ndata: {}\n\n"
-        
-        subscriber = broadcaster.subscribe(business.id)
+        # Registered before the first yield, so nothing broadcast between the
+        # handshake and the first wait is missed. Waiting on the queue itself
+        # (not on an async generator) is what lets the heartbeat time out
+        # without tearing the subscription down — wait_for on a generator's
+        # __anext__ cancelled it, and every idle stream died after one ping.
+        queue, unsubscribe = broadcaster.register(business_id)
+        pings = 0
         try:
+            yield "event: connected\ndata: {}\n\n"
             while True:
                 try:
-                    # Wait for next notification or send heartbeat ping every 15s
-                    event_data = await asyncio.wait_for(subscriber.__anext__(), timeout=15.0)
-                    yield f"event: notification\ndata: {json.dumps(event_data)}\n\n"
+                    event_data = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_SECONDS)
                 except asyncio.TimeoutError:
+                    pings += 1
+                    # A stream lives for hours: every few minutes, check the
+                    # business still may receive events (it may have been
+                    # deleted since the ticket was issued).
+                    if pings % _REAUTH_EVERY_PINGS == 0 and not await _still_active(business_id):
+                        return
                     yield "event: ping\ndata: {}\n\n"
-                except StopAsyncIteration:
-                    break
+                    continue
+                yield f"event: notification\ndata: {json.dumps(event_data, default=str)}\n\n"
         finally:
-            await subscriber.aclose()
+            unsubscribe()
 
     return StreamingResponse(
         event_generator(),

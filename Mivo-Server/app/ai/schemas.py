@@ -1,15 +1,18 @@
 import datetime as dt
 import uuid
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class FeedbackCreate(BaseModel):
     conversation_id: uuid.UUID | None = None
     message_id: uuid.UUID | None = None
-    rating: str  # 'thumb_up' or 'thumb_down'
-    customer_query: str | None = None
-    ai_response: str | None = None
-    correction: str | None = None
+    rating: Literal["thumb_up", "thumb_down"]
+    customer_query: str | None = Field(default=None, max_length=2000)
+    ai_response: str | None = Field(default=None, max_length=4000)
+    # Goes into every future system prompt of this business — bounded.
+    correction: str | None = Field(default=None, max_length=1000)
 
 
 class FeedbackOut(BaseModel):
@@ -28,9 +31,18 @@ class FeedbackOut(BaseModel):
 
 
 class SandboxMessageRequest(BaseModel):
-    content: str
-    attachment_url: str | None = None
+    content: str = Field(min_length=1, max_length=2000)
+    attachment_url: str | None = Field(default=None, max_length=2048)
     simulate_telegram: bool = False
+
+    @field_validator("attachment_url")
+    @classmethod
+    def _https_only(cls, value: str | None) -> str | None:
+        # Handed to the model provider as an image URL — a public https image,
+        # never a data: blob or an internal address.
+        if value is not None and not value.startswith("https://"):
+            raise ValueError("attachment_url must be an https URL")
+        return value
 
 
 class SandboxMessageOut(BaseModel):

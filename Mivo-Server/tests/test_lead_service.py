@@ -52,6 +52,7 @@ async def test_phone_detection_forces_hot_regardless_of_score(db_session) -> Non
     lead, became_hot = await apply_qualification(
         db_session, business.id, customer.id, conversation.id,
         _result(lead_score=15, phone_detected="+998 90 123 45 67", qualification_reason="gave phone"),
+        raw_message_text="+998 90 123 45 67",
     )
     assert lead.status == "hot"
     assert lead.phone == "+998901234567"
@@ -92,6 +93,47 @@ async def test_phone_captured_from_recent_messages_if_llm_omits_it(db_session) -
     assert became_hot is True
 
 
+async def test_model_proposed_phone_the_customer_never_typed_is_ignored(db_session) -> None:
+    """The analyst can mistake a number the shop quoted (delivery hotline in
+    the business settings, echoed in a reply) for the customer's. Only a
+    number the customer actually typed can make a lead hot."""
+    business, customer, conversation = await _seed(db_session)
+    await add_message(db_session, conversation, sender_type="ai", content="Savol bo'lsa +998 71 200 00 00 ga qo'ng'iroq qiling")
+    await db_session.commit()
+    lead, became_hot = await apply_qualification(
+        db_session, business.id, customer.id, conversation.id,
+        _result(lead_score=20, phone_detected="+998712000000"),
+        raw_message_text="rahmat",
+    )
+    assert lead.phone is None
+    assert lead.status == "cold"
+    assert became_hot is False
+
+
+async def test_interested_products_are_kept_across_turns_without_products(db_session) -> None:
+    business, customer, conversation = await _seed(db_session)
+    product = Product(business_id=business.id, name="Hoodie", currency="UZS", availability=True, attributes={}, source="manual")
+    db_session.add(product)
+    await db_session.commit()
+    await apply_qualification(
+        db_session, business.id, customer.id, conversation.id,
+        _result(lead_score=50, interested_product_ids=[str(product.id)]),
+    )
+    lead, _ = await apply_qualification(
+        db_session, business.id, customer.id, conversation.id, _result(lead_score=80), raw_message_text="90 123 45 67",
+    )
+    assert lead.interested_products == [{"id": str(product.id), "name": "Hoodie"}]
+
+
+async def test_summaries_are_only_what_the_analyst_wrote(db_session) -> None:
+    business, customer, conversation = await _seed(db_session)
+    lead, _ = await apply_qualification(
+        db_session, business.id, customer.id, conversation.id,
+        _result(lead_score=40, summary_uz="Qora hoodie so'radi", summary_ru=None, summary_en="Asked for a black hoodie"),
+    )
+    assert lead.summaries == {"uz": "Qora hoodie so'radi", "en": "Asked for a black hoodie"}
+
+
 async def test_hallucinated_phone_text_is_ignored(db_session) -> None:
     business, customer, conversation = await _seed(db_session)
     lead, became_hot = await apply_qualification(
@@ -112,6 +154,7 @@ async def test_status_re_evaluates_fresh_on_later_turns_after_phone_captured(db_
     first_lead, became_hot = await apply_qualification(
         db_session, business.id, customer.id, conversation.id,
         _result(lead_score=85, phone_detected="+998901234567"),
+        raw_message_text="+998901234567",
     )
     assert became_hot is True
     await mark_hot_notified(db_session, first_lead)
@@ -211,6 +254,21 @@ async def test_capture_phone_without_ai_turn_ignores_non_phone_text(db_session) 
     assert became_hot is False
 
 
+async def test_capture_phone_without_ai_turn_notifies_even_if_lead_was_already_hot(db_session) -> None:
+    """Regression: a lead already hot-notified (no phone) whose customer then
+    sent their number while a human was handling the chat never alerted the
+    owner — the number is the most actionable thing a customer can send."""
+    business, customer, conversation = await _seed(db_session)
+    lead, _ = await apply_qualification(db_session, business.id, customer.id, conversation.id, _result(lead_score=90))
+    await mark_hot_notified(db_session, lead)
+
+    lead, notify = await capture_phone_without_ai_turn(
+        db_session, business.id, customer.id, conversation.id, "90 123 45 67"
+    )
+    assert notify is True
+    assert lead.phone == "+998901234567"
+
+
 async def test_capture_phone_without_ai_turn_does_not_notify_twice(db_session) -> None:
     business, customer, conversation = await _seed(db_session)
 
@@ -250,7 +308,10 @@ async def test_tenant_isolation_leads(db_session) -> None:
     b1, c1, conv1 = await _seed(db_session)
     b2, c2, conv2 = await _seed(db_session)
 
-    lead1, _ = await apply_qualification(db_session, b1.id, c1.id, conv1.id, _result(lead_score=75, phone_detected="901112233"))
+    lead1, _ = await apply_qualification(
+        db_session, b1.id, c1.id, conv1.id, _result(lead_score=75, phone_detected="901112233"),
+        raw_message_text="901112233",
+    )
     lead2, _ = await apply_qualification(db_session, b2.id, c2.id, conv2.id, _result(lead_score=30))
 
     assert lead1.business_id == b1.id

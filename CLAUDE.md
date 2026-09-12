@@ -42,6 +42,7 @@ Frontend (`Mivo-Client/`):
 npm install --legacy-peer-deps   # the flag works around an npm@10 arborist bug on Nuxt's peer graph
 npm run dev                      # http://localhost:3000
 npm run build                    # or `npm run generate` for a static export
+npm run typecheck                # vue-tsc over the whole app — keep it at zero errors
 ```
 
 There is no linter or formatter configured in either app.
@@ -70,10 +71,13 @@ never learns which version wrote a reply — compare runs by score, never ask it
 ### Tests need a real Postgres
 
 `tests/conftest.py` points at a `mivo_test` database (`DATABASE_URL` /
-`DATABASE_URL_SYNC`), runs `alembic upgrade head` once per session, and TRUNCATEs
-every table between tests. Migration failure is only warned about, so tests that
-touch the DB fail confusingly if Postgres isn't up — start the `db` service first
-and create `mivo_test`. `asyncio_mode = auto` (pytest.ini): async tests need no
+`DATABASE_URL_SYNC`), runs `alembic upgrade head` once per session (a failed
+migration fails the run), and TRUNCATEs every table between tests — start the
+`db` service first and create `mivo_test`. conftest also sets every secret to a
+test-only value; webhook tests sign payloads with `sign_webhook()`. After adding a
+model or migration, `alembic check` against a freshly migrated database must
+report no drift (that's how the never-migrated `product_variants`/`customers.name`
+columns were found). `asyncio_mode = auto` (pytest.ini): async tests need no
 marker. Because asyncpg connections are bound to the loop that created them, the
 fixtures dispose the engine around each test and do teardown over plain sync
 `psycopg` — keep that pattern when adding fixtures.
@@ -95,36 +99,83 @@ Rules that hold across the codebase:
   autogenerate and the test-teardown TRUNCATE will silently miss them.
 - **Two DB URLs, one database:** `DATABASE_URL` (asyncpg) for the app,
   `DATABASE_URL_SYNC` (psycopg) for Alembic and test helpers.
-- **Secrets at rest** (Instagram/Telegram tokens) are Fernet-encrypted via
-  `app/core/security.py`; decrypt only at the point of use.
+- **Secrets at rest** (Instagram tokens, pending OAuth codes) are Fernet-encrypted
+  via `app/core/security.py` (`MultiFernet`: `FERNET_KEY=<new>,<old>` +
+  `rotate_fernet_key.py` to rotate); decrypt only at the point of use.
+- **Config refuses insecure values** (`app/core/config.py`): `JWT_SECRET`/`FERNET_KEY`
+  are required, any value that has appeared in this repo is rejected, and
+  `APP_ENV=production` also requires `DEBUG=false` and the Meta/Telegram webhook
+  secrets. Never add a default secret.
 - `settings.debug` drives SQLAlchemy `echo`, which logs PII in bind params — must
   stay off in production.
+- **Auth**: refresh tokens are persisted (`refresh_tokens`) and rotate on use;
+  reuse of a rotated token revokes the user's whole family. `/auth/logout` revokes.
+  Failed logins are throttled per email (`app/core/rate_limit.py`). Soft-deleting a
+  business revokes its owner's refresh tokens and `get_current_business` refuses it
+  immediately. The SSE stream authenticates with a 60-second `sse` ticket
+  (`POST /notifications/stream-ticket`), never the access token in a URL.
+- **Instagram OAuth** is session-bound: the callback only parks the code under a
+  one-time completion id (`oauth_states`); the owner's logged-in dashboard finishes
+  it with `POST /integrations/instagram/complete`. One Instagram account can be
+  linked to one business (unique `ig_business_id`).
 
 ### The conversation pipeline
 
-`POST /webhooks/instagram` (`app/instagram/router.py`, HMAC `X-Hub-Signature-256`)
-→ `app/instagram/service.py:process_incoming_message`:
+`POST /webhooks/instagram` (`app/instagram/router.py`) verifies the HMAC
+`X-Hub-Signature-256` (fails closed: no `META_APP_SECRET` → every webhook is
+rejected), then `app/instagram/pipeline.py` does the rest in two halves:
 
-1. `_claim_webhook_event` locks a `webhook_events` row (`SELECT … FOR UPDATE`,
-   status `processing`/`processed`) so Meta's 5-second retries can't run the
-   pipeline twice. Failures mark the event `failed` and re-raise so FastAPI returns
-   5xx and Meta retries.
-2. The customer message is persisted immediately, **whether or not the AI will
-   reply** — the owner must see every message.
-3. `_ai_should_reply`: `business.ai_enabled` AND subscription not expired AND
-   `conversation.status in ("ai_active", "active")`. If AI is off, a phone number is
-   still captured (`capture_phone_without_ai_turn`) and acknowledged.
-4. Debounce: sleep `DEBOUNCE_SECONDS`, then bail out if a *newer customer* message
-   arrived — that request will answer the whole burst. Deliberately ignores newer AI
-   messages (a persisted reply may never have been delivered).
-5. `app/ai/orchestrator.py:run_turn` — one agentic turn. It does *not* persist the
-   customer message; callers that haven't already should use `handle_customer_message`.
-6. The reply is persisted and sent via Meta Graph API **from inside that turn**,
-   through the `deliver` callback — before the analyst pass, and as one message per
-   `split_reply` part. Afterwards, product photos go out for `image_product_ids` and
-   `app/leads/service.py:apply_qualification` writes the lead, firing Telegram / Web
-   Push / in-app notifications on the first hot transition. Qualification is skipped
-   when `analysis_failed` is set (see the AI layer section).
+- **In the request** (`ingest_event`, fast, DB only): insert the `webhook_events`
+  row (`ON CONFLICT DO NOTHING` on the message id — a redelivery of a finished
+  event is a no-op), route to the business by **exact** recipient match
+  (an unknown recipient is recorded and dropped — never handed to "some other
+  connected account"), upsert customer + conversation (both `ON CONFLICT`),
+  persist the customer message **whether or not the AI will reply**, commit,
+  return 200. A failure here is a 5xx and Meta retries.
+- **In the background** (`process_event`, a BackgroundTask after the response,
+  at most 8 at once per process): claim the event (`received`/`failed`/stale
+  `processing` → `processing`, with a lease, only while `attempts < MAX_ATTEMPTS`),
+  fetch the profile once (`profile_fetched_at`), then:
+  1. `ai_may_reply(business)` (`app/businesses/service.py`: owner's `ai_enabled`,
+     not `ai_suspended`, not deleted, subscription active) and conversation status
+     `ai_active`/`active`. Otherwise a phone number is still captured
+     (`capture_phone_without_ai_turn`) and, during a handoff, acknowledged.
+  2. Debounce `DEBOUNCE_SECONDS`; bail if a newer customer message exists; commit
+     (a waiter holds one pooled connection, not two).
+  3. **`conversation_lock`** (`app/conversations/locks.py`, a Postgres advisory
+     lock on its own AUTOCOMMIT connection): everything that sends to a customer
+     runs under it, so turns never overlap.
+  4. Resend this message's undelivered AI reply (`undelivered_reply` in
+     `app/conversations/delivery.py`), then skip if
+     `conversation.last_answered_customer_message_at` already covers this message
+     (that's how a retry knows it was answered).
+  5. Transcribe this burst's voice notes (`app/ai/audio.py`, one configured
+     provider; failure → human handoff), spend guards (`app/ai/limits.py`; past a
+     limit → handoff + owner alert), and resolve the LLM provider — the router
+     passes a factory, so a misconfigured provider hands off instead of failing
+     the webhook.
+  6. `run_turn(..., outbound=True)`: reply parts are persisted as `pending`
+     outbox rows **and** `last_answered_customer_message_at` is set in the same
+     commit, then `send_outbound` marks them `sent`/`failed`. A delivery error is
+     returned in `escalation_state["delivery_error"]`; the pipeline does the lead
+     bookkeeping and alerts, then fails the event (retried with backoff, abandoned
+     after `MAX_ATTEMPTS` — or at once for a permanent Meta error — with an owner
+     alert). The retry resends the recorded reply, never regenerates it.
+  7. After delivery nothing may fail the event: product photos (also outbox rows),
+     `apply_qualification` (skipped when `analysis_failed`), and owner alerts
+     (`app/notifications/owner_alerts.py`: hot lead, handoff, limits) are logged on
+     error, not raised. Owners are alerted *before* a handoff line is sent.
+- `sweep_events` (scheduler, every 30s) re-drives `failed` events past their
+  backoff, orphaned `received` ones, and `processing` ones whose lease expired;
+  an expired lease with no attempts left is abandoned with an alert.
+
+Echoes (`is_echo`) run without the conversation lock. One whose id is recorded
+is ours; one that matches a recent outbound row still waiting for its id is ours
+too (`reconcile_echo` — the echo can beat the send response). Any other echo is
+a person replying from the Instagram app — recorded as `human`, and the
+conversation moves to `human_active` so the AI steps back (the owner is told
+once, when the status changes). Dashboard operator replies do the same
+(`POST /conversations/{id}/reply`, also via the outbox).
 
 Instagram-specific logic stays inside `app/instagram/`; everything else sees only
 the neutral conversations/messages/customers domain model. The same pipeline is
@@ -289,14 +340,24 @@ the whole catalog is never handed to the model.
 - Real-time dashboard updates are SSE via an in-process, tenant-isolated
   `NotificationBroadcaster` (`/notifications/stream`) — it does not survive multiple
   API replicas.
-- Two APScheduler jobs run in the app lifespan (`app/main.py`): daily Instagram token
-  refresh (long-lived tokens expire at 60 days; refreshing resets the clock, so owners
-  never reconnect manually) and a 15-minute smart follow-up sweep.
+- APScheduler jobs run in the app lifespan (`app/main.py`), each under a Postgres
+  advisory lock so extra processes never double-run them: daily Instagram token
+  refresh (long-lived tokens expire at 60 days; refreshing resets the clock), the
+  15-minute follow-up sweep (`app/ai/follow_up.py`: only when `ai_may_reply`, only
+  inside Meta's 24h window from the customer's last message, once per silence, via
+  the outbox), a 30-minute customer-profile backfill, and the 30-second webhook sweeper.
+- Owner alerts (`app/notifications/owner_alerts.py`) go to dashboard + push +
+  Telegram, each channel independent; dashboard links use `FRONTEND_URL`.
 - No self-serve signup. Businesses are created from `/superadmin/*`; the first
   superadmin is bootstrapped with `create_superadmin.py`, later ones by SQL.
   Payments are recorded manually (`Payment` model) — there is no payment gateway.
-- Root-level scripts (`reset_and_seed.py`, `sync_script.py`) are destructive/ops
-  helpers, not part of the app.
+- Root-level scripts are ops helpers, not part of the app: `reset_and_seed.py`
+  (dev only — refuses unless `APP_ENV=development` and `--yes-wipe-everything`),
+  `sync_script.py` (profile backfill now), `rotate_fernet_key.py`,
+  `backfill_embeddings.py`, `create_superadmin.py`.
+- Docker: one `Dockerfile`; `docker-compose.yml` (local, project `mivo-local`) and
+  `docker-compose.prod.yml` (standalone prod, project `mivo`, a one-shot `migrate`
+  service before `api`, DB not published) are independent files — not an override.
 
 ## Frontend architecture
 
@@ -305,10 +366,10 @@ Pages. Tailwind v4 + shadcn-vue (`app/components/ui/`, registered without a path
 prefix; the `index.ts` barrels are excluded from component scanning).
 
 - `composables/useApi.ts` — the only fetch wrapper. JWT access/refresh in
-  localStorage (header auth, not cookies: SPA and API are different domains). On a
-  401 *with* a token it refreshes once, then hard-navigates to `/login` via
-  `window.location`; a 401 without a token stays a normal error so login failures
-  surface properly.
+  localStorage (header auth, not cookies: SPA and API are different domains).
+  Refresh is single-flight and stores the rotated refresh token; only a 401 from
+  `/auth/refresh` (or no refresh token) logs out — a 5xx or network error is a
+  normal error. `/auth/login|refresh|logout` never get a bearer token or a retry.
 - `composables/useMivoApi.ts` — every backend endpoint, typed against
   `app/types/api.ts`. Add new endpoints here rather than calling `apiRequest`
   directly from pages. `useSuperadminApi.ts` mirrors it for `/superadmin/*`.
@@ -319,12 +380,13 @@ prefix; the `index.ts` barrels are excluded from component scanning).
   `uz`, persisted in localStorage. Customer-facing strings in the backend
   (`_PHONE_CAPTURED_CONFIRMATION`, fallbacks) are localized separately.
 - `functions/` — Cloudflare Pages Functions that proxy `/api`, `/integrations` and
-  `/webhooks` to a hardcoded upstream host. `NUXT_PUBLIC_API_BASE` defaults to
-  `/api`, which is what makes that proxy the production path.
+  `/webhooks` to `API_UPSTREAM` (a Pages environment variable). `NUXT_PUBLIC_API_BASE`
+  defaults to `/api`, which is what makes that proxy the production path.
 
 ## Environment
 
 Each app has its own `.env` from its `.env.example`; the backend's README documents
 the full first-deploy checklist (R2, OpenRouter, Meta app + webhook, Telegram bot,
-VAPID, CORS). `app/core/config.py` ships dev-only defaults for `JWT_SECRET`,
-`FERNET_KEY` and the VAPID keys — all must be overridden in production.
+VAPID, CORS). `app/core/config.py` has no default secrets: `JWT_SECRET` and
+`FERNET_KEY` are required, and any value that ever appeared in this repo (or,
+by SHA-256, leaked through git history) is rejected at startup.

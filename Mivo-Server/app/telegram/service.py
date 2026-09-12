@@ -50,8 +50,9 @@ async def disconnect(db: AsyncSession, business_id: uuid.UUID) -> None:
 
 
 def build_deep_link(token: str) -> str:
-    settings = get_settings()
-    username = (settings.telegram_bot_username or "MivoSalesBot").lstrip("@").strip()
+    username = get_settings().telegram_bot_username.lstrip("@").strip()
+    if not username:
+        raise RuntimeError("TELEGRAM_BOT_USERNAME is not configured.")
     return f"https://t.me/{username}?start={token}"
 
 
@@ -64,29 +65,20 @@ async def get_connection(db: AsyncSession, business_id: uuid.UUID) -> TelegramCo
 async def handle_start_command(
     db: AsyncSession, token: str, chat_id: str, username: str | None
 ) -> bool:
-    """Returns True if the token matched an unexpired connect request."""
+    """Returns True if the token matched an unexpired, unused connect request.
+
+    The token is single-use: it's expired the moment it connects a chat, so a
+    leaked deep link can't be replayed to re-point alerts at another chat."""
+    now = dt.datetime.now(dt.timezone.utc)
     connection = await db.scalar(
-        select(TelegramConnection).where(TelegramConnection.connect_token == token)
+        select(TelegramConnection).where(TelegramConnection.connect_token == token).with_for_update()
     )
-    if connection is None:
-        return False
-    if connection.connect_token_expires_at < dt.datetime.now(dt.timezone.utc):
+    if connection is None or connection.connect_token_expires_at <= now:
         return False
 
     connection.telegram_chat_id = str(chat_id)
     connection.telegram_username = username
-    connection.connected_at = dt.datetime.now(dt.timezone.utc)
+    connection.connected_at = now
+    connection.connect_token_expires_at = now
     await db.commit()
-
-    # Send confirmation message to the Telegram chat
-    try:
-        from app.telegram.client import TelegramClient
-        client = TelegramClient()
-        await client.send_message(
-            chat_id=str(chat_id),
-            text="✅ Mivo AI Sales Assistant-ga muvaffaqiyatli ulandingiz!\n\nEndi Instagram sahifangizdan keladigan 🔥 Hot Lead bildirishnomalari va kontaktlar ushbu bot orqali sizga lahzalik yuboriladi.",
-        )
-    except Exception as exc:
-        print(f"[TelegramService] Failed to send start confirmation: {exc}")
-
     return True

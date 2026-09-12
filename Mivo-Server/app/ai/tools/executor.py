@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import uuid
 from typing import Any
 
@@ -6,6 +7,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.conversation_state import fact_snapshot
+from app.ai.usage_context import billing_to
 from app.conversations.models import Conversation
 from app.discounts.models import Discount
 from app.products.discovery import (
@@ -16,14 +18,27 @@ from app.products.discovery import (
 )
 from app.products.media import get_display_image_url
 from app.products.models import Product
-from app.products.search import check_availability, get_product_by_id, search_products
+from app.products.search import check_availability, get_product_by_id, search_products, variant_matches
+
+# Tool results are re-sent on every later round, to the writer and to the
+# analyst, so each product costs its size several times over. The model needs
+# the facts, not the full marketing copy or the photo URLs (the backend sends
+# photos itself — the model only ever names product ids).
+_MAX_DESCRIPTION_CHARS = 600
+
+
+def _variant_available(v) -> bool:
+    return bool(v.availability and (v.stock_quantity is None or v.stock_quantity > 0))
 
 
 def _product_summary(product: Product) -> dict:
+    description = product.description or None
+    if description and len(description) > _MAX_DESCRIPTION_CHARS:
+        description = description[:_MAX_DESCRIPTION_CHARS].rstrip() + "…"
     summary: dict[str, Any] = {
         "id": str(product.id),
         "name": product.name,
-        "description": product.description,
+        "description": description,
         "price": float(product.price) if product.price is not None else None,
         "currency": product.currency,
         "availability": product.availability,
@@ -35,10 +50,8 @@ def _product_summary(product: Product) -> dict:
                 "variant_type": v.variant_type,
                 "value": v.value,
                 "stock_quantity": v.stock_quantity,
-                "image_url": v.image_url,
-                "has_photo": bool(v.image_url or (v.images and len(v.images) > 0)),
-                "photos": v.images or ([v.image_url] if v.image_url else []),
-                "availability": v.availability and (v.stock_quantity is None or v.stock_quantity > 0),
+                "has_photo": bool(v.image_url or v.images),
+                "availability": _variant_available(v),
                 "price": float(v.price_override) if v.price_override is not None else None,
                 "attributes": v.attributes or {},
             }
@@ -46,14 +59,9 @@ def _product_summary(product: Product) -> dict:
         ],
     }
     if product.attributes:
-        if product.attributes.get("ai_instructions"):
-            summary["ai_instructions"] = product.attributes["ai_instructions"]
-        if product.attributes.get("material"):
-            summary["material"] = product.attributes["material"]
-        if product.attributes.get("fit"):
-            summary["fit"] = product.attributes["fit"]
-        if product.attributes.get("gender"):
-            summary["gender"] = product.attributes["gender"]
+        for key in ("ai_instructions", "material", "fit", "gender"):
+            if product.attributes.get(key):
+                summary[key] = product.attributes[key]
     return summary
 
 
@@ -70,15 +78,20 @@ _INVALID_PRODUCT_ID = {
 }
 
 
+def _price_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: Conversation):
     """Returns (execute, escalation_state) — escalation_state is a plain dict
     the caller (run_turn) reads AFTER the turn to know whether request_human
-    fired, so it can guarantee the customer actually gets told a human is
-    coming instead of trusting the model's own final text alone (see the bug
-    this guards against: the model has echoed its own internal `reason`
-    argument back as the customer-facing reply, e.g. "Mijoz kimga murojaat
-    qilishi kerakligini so'radi." — a note about the customer, read out loud
-    to the customer)."""
+    fired, which products/prices the catalog actually returned, and which
+    discounts are real. The reply guards check the model's text against it."""
     escalation_state: dict[str, Any] = {
         "escalated": False,
         "reason": None,
@@ -89,15 +102,21 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
         # returned rather than ones the model remembered
         # (app/ai/conversation_state.py).
         "product_facts": {},
+        # Every product/variant price a tool returned this turn — the price
+        # guard's whitelist.
+        "catalog_prices": [],
     }
+    results_cache: dict[str, dict] = {}
 
     def _record_facts(*summaries: dict) -> None:
         for summary in summaries:
-            if summary and summary.get("id"):
-                escalation_state["product_facts"][summary["id"]] = fact_snapshot(summary)
+            if not summary or not summary.get("id"):
+                continue
+            escalation_state["product_facts"][summary["id"]] = fact_snapshot(summary)
+            prices = [summary.get("price"), *[v.get("price") for v in summary.get("variants") or []]]
+            escalation_state["catalog_prices"].extend(p for p in map(_price_or_none, prices) if p is not None)
 
-    async def execute(tool_name: str, arguments: dict[str, Any]) -> dict:
-        escalation_state["executed_tools"].append({"name": tool_name, "arguments": arguments})
+    async def _execute(tool_name: str, arguments: dict[str, Any]) -> dict:
         if tool_name == "search_products":
             requested_size = arguments.get("size")
             requested_color = arguments.get("color")
@@ -107,7 +126,7 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                 query=arguments.get("query"),
                 color=requested_color,
                 size=requested_size,
-                price_max=arguments.get("price_max"),
+                price_max=_price_or_none(arguments.get("price_max")),
             )
             summaries = [_product_summary(p) for p in products]
             _record_facts(*summaries)
@@ -118,31 +137,21 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
             # sees the product's real variants instead of an empty list — but
             # without this note it can misread "product came back" as "the size
             # I asked for is in stock". Spell it out so it states the miss
-            # honestly and offers what's actually available (plan §9's "never
-            # invent availability" — see the bug this fixed: a customer asking
-            # for a size that isn't carried getting told the whole product,
-            # sizes included, was out of stock).
-            def _has_variant(p, variant_type: str, value: str) -> bool:
-                target = value.strip().lower()
-                for v in p.variants:
-                    is_available = v.availability and (v.stock_quantity is None or v.stock_quantity > 0)
-                    if not is_available:
-                        continue
-                    if v.variant_type == variant_type and v.value.lower() == target:
-                        return True
-                    if target in v.value.lower():
-                        return True
-                    if v.attributes and target in str(v.attributes.get(variant_type, "")).lower():
-                        return True
-                return False
+            # honestly and offers what's actually available.
+            def _has(variant_type: str, value: str) -> bool:
+                return any(
+                    _variant_available(v) and variant_matches(v, variant_type, value)
+                    for p in products
+                    for v in p.variants
+                )
 
-            if requested_size and not any(_has_variant(p, "size", requested_size) for p in products):
+            if requested_size and not _has("size", requested_size):
                 response["note"] = (
                     f"None of these products have size '{requested_size}' in stock. "
                     "Tell the customer that size isn't available, and mention which sizes "
                     "each product's variants list actually shows as available instead."
                 )
-            elif requested_color and not any(_has_variant(p, "color", requested_color) for p in products):
+            elif requested_color and not _has("color", requested_color):
                 response["note"] = (
                     f"None of these products have color '{requested_color}' in stock. "
                     "Tell the customer that color isn't available, and mention which colors "
@@ -154,21 +163,16 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
             categories = await list_categories(db, business_id)
             sort_by = arguments.get("sort_by")
             category = arguments.get("category")
-            price_max = arguments.get("price_max")
+            price_max = _price_or_none(arguments.get("price_max"))
 
             if sort_by == "popular" and not category and price_max is None:
                 products = await popular_products(db, business_id)
             else:
-                products = await browse_products(
-                    db, business_id, category=category, price_max=price_max
-                )
+                products = await browse_products(db, business_id, category=category, price_max=price_max)
 
             summaries = [_product_summary(p) for p in products]
             _record_facts(*summaries)
-            browse_response: dict[str, Any] = {
-                "categories": categories,
-                "products": summaries,
-            }
+            browse_response: dict[str, Any] = {"categories": categories, "products": summaries}
             if category and not products:
                 # Don't let the model report an empty category as "we have
                 # nothing" — the categories list right there says otherwise.
@@ -210,10 +214,7 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                 product_id = uuid.UUID(str(arguments["product_id"]))
             except (KeyError, ValueError):
                 return _INVALID_PRODUCT_ID
-            available = await check_availability(
-                db, business_id, product_id, arguments.get("variant_value")
-            )
-            return {"available": available}
+            return await check_availability(db, business_id, product_id, arguments.get("variant_value"))
 
         if tool_name == "get_active_discounts":
             now = dt.datetime.now(dt.timezone.utc)
@@ -221,10 +222,10 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                 select(Discount).where(
                     Discount.business_id == business_id,
                     Discount.active.is_(True),
+                    Discount.valid_from <= now,
                     or_(Discount.valid_until.is_(None), Discount.valid_until >= now),
                 )
             )
-            discounts = list(disc_res.scalars().all())
             disc_list = [
                 {
                     "type": d.discount_type,
@@ -233,19 +234,32 @@ def build_tool_executor(db: AsyncSession, business_id: uuid.UUID, conversation: 
                     "conditions": d.conditions,
                     "code": d.code,
                 }
-                for d in discounts
+                for d in disc_res.scalars().all()
             ]
             escalation_state["active_discounts"] = disc_list
             return {"discounts": disc_list}
 
         if tool_name == "request_human":
-            reason = arguments.get("reason", "")
+            reason = str(arguments.get("reason", ""))[:500]
             escalation_state["escalated"] = True
             escalation_state["reason"] = reason
-            conversation.status = "human_needed"
-            await db.flush()
+            # The status itself is set by the reply hook (run_turn), together
+            # with the reply and only if no person took over meanwhile.
             return {"escalated": True, "reason": reason}
 
         return {"error": f"unknown tool: {tool_name}"}
+
+    async def execute(tool_name: str, arguments: dict[str, Any]) -> dict:
+        escalation_state["executed_tools"].append({"name": tool_name, "arguments": arguments})
+        # The same call twice in one turn returns the same answer without
+        # another round of queries (and the same result, so the model can't be
+        # shown two different "truths" in one turn).
+        key = f"{tool_name}:{json.dumps(arguments, sort_keys=True, default=str)}"
+        if key in results_cache and tool_name != "request_human":
+            return results_cache[key]
+        with billing_to(business_id):
+            result = await _execute(tool_name, arguments)
+        results_cache[key] = result
+        return result
 
     return execute, escalation_state

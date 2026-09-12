@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from typing import AsyncIterator
+from collections.abc import Callable
 
 logger = logging.getLogger("app.notifications.broadcaster")
 
@@ -13,28 +13,23 @@ class NotificationBroadcaster:
         self._subscribers: dict[uuid.UUID, set[asyncio.Queue]] = {}
         self._lock = asyncio.Lock()
 
-    def register(self, business_id: uuid.UUID) -> tuple[asyncio.Queue, callable]:
+    def register(self, business_id: uuid.UUID) -> tuple[asyncio.Queue, Callable[[], None]]:
+        """Returns (queue, unsubscribe). The caller must call unsubscribe when
+        its stream ends, or the queue leaks and keeps receiving events."""
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        if business_id not in self._subscribers:
-            self._subscribers[business_id] = set()
-        self._subscribers[business_id].add(queue)
+        self._subscribers.setdefault(business_id, set()).add(queue)
 
-        def unsubscribe():
-            if business_id in self._subscribers:
-                self._subscribers[business_id].discard(queue)
-                if not self._subscribers[business_id]:
+        def unsubscribe() -> None:
+            subscribers = self._subscribers.get(business_id)
+            if subscribers is not None:
+                subscribers.discard(queue)
+                if not subscribers:
                     del self._subscribers[business_id]
 
         return queue, unsubscribe
 
-    async def subscribe(self, business_id: uuid.UUID) -> AsyncIterator[dict]:
-        queue, unsubscribe = self.register(business_id)
-        try:
-            while True:
-                item = await queue.get()
-                yield item
-        finally:
-            unsubscribe()
+    def subscriber_count(self, business_id: uuid.UUID) -> int:
+        return len(self._subscribers.get(business_id, ()))
 
     async def broadcast(self, business_id: uuid.UUID, data: dict) -> int:
         """Pushes data to all active queues for the specified business."""

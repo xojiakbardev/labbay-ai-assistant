@@ -272,5 +272,14 @@ async def test_a_failure_before_any_reply_still_delivers_the_fallback(monkeypatc
     assert persisted == delivered[0]
     assert result.reply.strip()
     assert state["escalated"] is True
-    assert not state.get("analysis_failed")
-    assert conversation.status == "human_needed"
+    # There is no analysis of this turn at all — the result's cold/0 scores
+    # are placeholders, and a caller that wrote them would downgrade a real
+    # lead because the provider was down.
+    assert state["analysis_failed"] is True
+    # The handoff is written in SQL, conditional on the conversation still
+    # being AI-active (a person may have taken over during the turn).
+    from sqlalchemy.sql.dml import Update
+
+    updates = [c.args[0] for c in db.execute.await_args_list if c.args and isinstance(c.args[0], Update)]
+    assert len(updates) == 1 and updates[0].table.name == "conversations"
+    assert updates[0].compile().params["status"] == "human_needed"

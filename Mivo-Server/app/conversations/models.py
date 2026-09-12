@@ -1,7 +1,7 @@
 import datetime as dt
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, false, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, false, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -9,9 +9,33 @@ from app.common.mixins import UUIDPk
 from app.core.db import Base
 import app.customers.models  # noqa: F401
 
+# Every status a conversation can be in. "active" is the sandbox's own
+# always-on state; the rest are the human-handoff state machine.
+CONVERSATION_STATUSES = ("ai_active", "active", "human_needed", "human_active", "closed")
+
+# Outbound message delivery (the outbox): recorded as pending before the send,
+# then sent/failed. "unknown" marks rows from before the outbox existed.
+DELIVERY_PENDING = "pending"
+DELIVERY_SENT = "sent"
+DELIVERY_FAILED = "failed"
+
+# The stored text of a customer voice note nobody has transcribed yet.
+AUDIO_PLACEHOLDER = "[Ovozli xabar]"
+
+
+def is_untranscribed_voice_note(message) -> bool:
+    return (
+        getattr(message, "sender_type", None) == "customer"
+        and getattr(message, "attachment_type", None) == "audio"
+        and getattr(message, "content", None) == AUDIO_PLACEHOLDER
+    )
+
 
 class Conversation(Base, UUIDPk):
     __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint("business_id", "customer_id", name="uq_conversations_business_id_customer_id"),
+    )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
@@ -39,11 +63,22 @@ class Conversation(Base, UUIDPk):
         JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
     )
 
+    # The newest customer message a delivered AI turn had in view. A turn that
+    # starts after this covers only messages newer than it — which is how a
+    # retried webhook knows its message was already answered.
+    last_answered_customer_message_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    follow_up_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class Message(Base, UUIDPk):
     __tablename__ = "messages"
+    __table_args__ = (
+        Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at"),
+    )
 
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
@@ -55,4 +90,7 @@ class Message(Base, UUIDPk):
     flagged_for_review: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
     attachment_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     attachment_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Outbound (ai/human) only; null for customer messages. See DELIVERY_*.
+    delivery_status: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)

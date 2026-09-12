@@ -12,6 +12,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 
-# Local env
+# Local env — every variant, except the documented example
 .env
-.env.local
+.env.*
+!.env.example

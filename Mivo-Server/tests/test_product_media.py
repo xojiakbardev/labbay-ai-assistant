@@ -60,9 +60,9 @@ async def test_resolve_sendable_images_is_tenant_scoped(db_session) -> None:
     db_session.add_all([product_a, product_b])
     await db_session.commit()
 
-    urls = await resolve_sendable_images(db_session, business_a, [str(product_a.id), str(product_b.id)])
+    photos = await resolve_sendable_images(db_session, business_a, [str(product_a.id), str(product_b.id)])
 
-    assert urls == ["https://example.com/a.jpg"]  # business_b's product silently dropped
+    assert photos == [("A", "https://example.com/a.jpg")]  # business_b's product dropped
 
 
 @pytest.mark.asyncio

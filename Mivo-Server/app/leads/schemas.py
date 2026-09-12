@@ -10,7 +10,8 @@ class LeadOut(BaseModel):
     id: uuid.UUID
     customer_id: uuid.UUID
     customer_username: str | None = None
-    conversation_id: uuid.UUID
+    # None once the conversation was deleted — the lead outlives it.
+    conversation_id: uuid.UUID | None
     status: str
     score: int
     phone: str | None

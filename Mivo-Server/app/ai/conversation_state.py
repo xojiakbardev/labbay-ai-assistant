@@ -53,6 +53,15 @@ def fact_snapshot(product_summary: dict[str, Any]) -> dict[str, Any]:
     }
     if in_stock:
         snapshot["in_stock"] = in_stock[:MAX_VARIANTS_PER_PRODUCT]
+    # Variants priced differently from the product (a bigger size costing
+    # more): a price told to the customer in an earlier turn stays one the
+    # price guard recognises.
+    variant_prices = sorted(
+        {float(v["price"]) for v in variants if isinstance(v.get("price"), (int, float))}
+        - {product_summary.get("price")}
+    )
+    if variant_prices:
+        snapshot["variant_prices"] = variant_prices[:MAX_VARIANTS_PER_PRODUCT]
     return snapshot
 
 
@@ -169,6 +178,13 @@ def update_state(
     return state
 
 
+def _inert(value: Any, limit: int = 120) -> str:
+    """Analyst-recorded text that ultimately came from the customer, rendered
+    as a bounded quoted value — context, never an instruction."""
+    cleaned = " ".join(str(value).split())[:limit]
+    return '"' + cleaned.replace('"', "'") + '"'
+
+
 def render_state_block(state: dict[str, Any] | None) -> str:
     """Renders the state for the system prompt. Empty string when there's
     nothing worth saying, so a brand-new conversation carries no dead weight."""
@@ -185,8 +201,9 @@ def render_state_block(state: dict[str, Any] | None) -> str:
     focus_id = state.get("focus_product_id")
     if facts:
         lines.append(
-            "- Products already discussed with this customer, and exactly what you told them "
-            "(re-check with a tool before repeating any of it — stock moves):"
+            "- Products you looked up for this customer, with the price/stock the catalog returned "
+            "at the time (you may not have mentioned all of them; re-check with a tool before "
+            "repeating any of it — stock moves):"
         )
         for product_id, snapshot in facts.items():
             if not isinstance(snapshot, dict):
@@ -196,6 +213,9 @@ def render_state_block(state: dict[str, Any] | None) -> str:
             if price is not None:
                 currency = snapshot.get("currency") or ""
                 bits.append(f"{price:g} {currency}".strip())
+            variant_prices = snapshot.get("variant_prices")
+            if variant_prices:
+                bits.append("some variants: " + ", ".join(f"{p:g}" for p in variant_prices))
             if not snapshot.get("available", True):
                 bits.append("was out of stock")
             in_stock = snapshot.get("in_stock")
@@ -212,18 +232,18 @@ def render_state_block(state: dict[str, Any] | None) -> str:
     slots = {k: v for k, v in (state.get("slots") or {}).items() if k in DISCOVERY_SLOTS}
     if slots:
         lines.append(
-            "- What you already know about what they need: "
-            + " | ".join(f"{k}: {v}" for k, v in slots.items())
+            "- What they told you they need (their words): "
+            + " | ".join(f"{k}: {_inert(v)}" for k, v in slots.items())
             + "  (never ask for any of this again)"
         )
 
     question = state.get("open_question")
     if question:
-        lines.append(f"- You asked them this and haven't been answered yet: {question}")
+        lines.append(f"- You asked them this and haven't been answered yet: {_inert(question)}")
 
     objections = state.get("objections")
     if objections:
-        lines.append("- They've pushed back on: " + "; ".join(str(o) for o in objections))
+        lines.append("- They've pushed back on: " + "; ".join(_inert(o) for o in objections))
 
     # Only chase the gaps once the conversation has actually started — a bare
     # "you don't know anything yet" on someone's first hello is noise, and the

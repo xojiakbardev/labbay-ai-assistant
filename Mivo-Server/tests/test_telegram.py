@@ -24,8 +24,9 @@ class FakeTelegramClient:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
 
-    async def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML") -> dict:
+    async def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML", reply_markup: dict | None = None) -> dict:
         self.sent.append((chat_id, text))
+        self.reply_markup = reply_markup
         return {"ok": True}
 
 
@@ -65,6 +66,43 @@ async def test_start_command_connects_business(db_session) -> None:
     assert connection.telegram_chat_id == "12345"
     assert connection.telegram_username == "owner_tg"
     assert connection.connected_at is not None
+
+
+async def test_connect_token_is_single_use(db_session) -> None:
+    """A leaked deep link can't be replayed to re-point the business's hot-lead
+    alerts (customer names and phone numbers) at another chat."""
+    business = await _seed_business(db_session)
+    token, _ = await service.create_connect_token(db_session, business.id)
+    assert await service.handle_start_command(db_session, token, chat_id="owner-chat", username="owner") is True
+    assert await service.handle_start_command(db_session, token, chat_id="attacker-chat", username="x") is False
+
+
+def test_webhook_rejects_wrong_or_missing_secret(client) -> None:
+    body = {"message": {"text": "/start abc", "chat": {"id": 1}}}
+    for header in ({}, {"X-Telegram-Bot-Api-Secret-Token": "mivo-telegram-webhook-secret-2026"},
+                   {"X-Telegram-Bot-Api-Secret-Token": "replace-with-a-telegram-secret"}):
+        assert client.post("/webhooks/telegram", json=body, headers=header).status_code == 403
+
+
+def test_no_bot_token_means_no_client() -> None:
+    """There is no built-in fallback bot token any more."""
+    from unittest.mock import patch
+
+    with patch("app.telegram.client.get_settings") as settings:
+        settings.return_value.telegram_bot_token = ""
+        with pytest.raises(TelegramAPIError):
+            TelegramClient()
+
+
+@respx.mock
+async def test_telegram_errors_never_contain_the_bot_token() -> None:
+    client = TelegramClient(token="123:secret-token")
+    respx.post("https://api.telegram.org/bot123:secret-token/sendMessage").mock(
+        side_effect=httpx.ConnectError("boom for https://api.telegram.org/bot123:secret-token/sendMessage")
+    )
+    with pytest.raises(TelegramAPIError) as exc_info:
+        await client.send_message(chat_id="1", text="hi", backoff_factor=0.001)
+    assert "secret-token" not in str(exc_info.value)
 
 
 async def test_start_command_rejects_unknown_token(db_session) -> None:
@@ -123,6 +161,9 @@ async def test_notify_hot_lead_sends_formatted_message(db_session) -> None:
     assert "Customer confirmed purchase intent." in text
     assert "90/100" in text
     assert "Mivo Dashboard" in text
+    # Links point at the configured dashboard, not a hardcoded host.
+    assert "https://app.mivo.test/leads?id=" in text
+    assert all(b["url"].startswith("https://app.mivo.test/") for b in fake_client.reply_markup["inline_keyboard"][0])
 
 
 async def test_notify_hot_lead_skips_when_telegram_not_connected(db_session) -> None:

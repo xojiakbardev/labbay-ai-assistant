@@ -10,7 +10,7 @@ from app.common.tenancy import get_current_superadmin
 from app.core.db import get_db
 from app.superadmin import service
 from app.superadmin.schemas import (
-    BusinessAiToggleRequest,
+    BusinessAiSuspendRequest,
     CreateBusinessRequest,
     ExtendSubscriptionRequest,
     RevenuePoint,
@@ -35,7 +35,7 @@ async def create_business(
         user = await service.create_business(db, body.email, body.password, body.business_name, body.trial_days)
     except auth_service.AuthError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    access, refresh = auth_service.issue_tokens(user.id)
+    access, refresh = await auth_service.issue_tokens(db, user.id)
     return TokenResponse(access_token=access, refresh_token=refresh)
 
 
@@ -70,16 +70,16 @@ async def extend_subscription(
 
 
 @router.patch("/businesses/{business_id}/ai", response_model=SuperadminBusinessOut)
-async def toggle_ai(
+async def suspend_ai(
     business_id: uuid.UUID,
-    body: BusinessAiToggleRequest,
+    body: BusinessAiSuspendRequest,
     db: AsyncSession = Depends(get_db),
     _admin: User = Depends(get_current_superadmin),
 ) -> dict:
     business = await service.get_business_or_404(db, business_id)
     if business is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Business not found.")
-    await service.set_ai_enabled(db, business, body.ai_enabled)
+    await service.set_ai_suspended(db, business, body.ai_suspended)
     return await service.get_business_detail(db, business_id)
 
 

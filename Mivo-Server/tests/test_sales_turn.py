@@ -103,9 +103,11 @@ async def test_run_sales_turn_writes_prose_then_analyses_it() -> None:
     writer_body = json.loads(route.calls[2].request.content)
     analyst_body = json.loads(route.calls[3].request.content)
 
-    # The writer is unconstrained and warm; the analyst is constrained and cold.
+    # The writer is unconstrained and warm (it may not call tools — the
+    # definitions ride along only because the history holds tool calls); the
+    # analyst is constrained and cold.
     assert "response_format" not in writer_body
-    assert "tools" not in writer_body
+    assert writer_body["tool_choice"] == "none"
     assert writer_body["temperature"] > 0
     assert analyst_body["response_format"]["json_schema"]["name"] == "_Analysis"
     assert analyst_body["temperature"] == 0.0
@@ -126,6 +128,8 @@ async def test_run_sales_turn_rejects_a_reply_that_is_only_a_plan() -> None:
     route.side_effect = [
         _content_response("no tools needed"),
         _content_response("PLAN: greet them warmly and ask what they need"),
+        # Reminded of the format once, it still only plans.
+        _content_response("PLAN: greet them"),
     ]
 
     provider = OpenRouterProvider()
@@ -138,6 +142,54 @@ async def test_run_sales_turn_rejects_a_reply_that_is_only_a_plan() -> None:
             fused_schema=_Fused,
             analysis_schema=_Analysis,
             analyst_system_prompt="analyst-prompt",
+        )
+
+
+@respx.mock
+async def test_writer_that_forgets_the_format_is_asked_once_more() -> None:
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions")
+    route.side_effect = [
+        _content_response("no tools needed"),
+        _content_response("Assalomu alaykum!"),  # no marker: can't tell plan from message
+        _content_response("PLAN: greet\n===MESSAGE===\nAssalomu alaykum!"),
+        _content_response(json.dumps({"qualification_reason": "greeting", "lead_status": "cold", "lead_score": 5})),
+    ]
+    reply, _ = await OpenRouterProvider().run_sales_turn(
+        system_prompt="sales-prompt",
+        messages=[{"role": "user", "content": "salom"}],
+        tools=[_SEARCH_TOOL],
+        tool_executor=_noop_executor,
+        fused_schema=_Fused,
+        analysis_schema=_Analysis,
+        analyst_system_prompt="analyst-prompt",
+    )
+    assert reply == "Assalomu alaykum!"
+    assert route.call_count == 4
+
+
+@respx.mock
+async def test_error_body_with_http_200_is_a_provider_failure() -> None:
+    """A 200 carrying {"error": ...} and no choices used to crash with a
+    KeyError outside the provider-error handling (no apology, no handoff)."""
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions")
+    route.side_effect = [httpx.Response(200, json={"error": {"message": "overloaded"}})] * 3
+    with pytest.raises(LLMProviderError):
+        await OpenRouterProvider().run_sales_turn(
+            system_prompt="s", messages=[{"role": "user", "content": "salom"}], tools=[_SEARCH_TOOL],
+            tool_executor=_noop_executor, fused_schema=_Fused, analysis_schema=_Analysis, analyst_system_prompt="a",
+        )
+
+
+@respx.mock
+async def test_truncated_generation_is_not_accepted() -> None:
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions")
+    route.side_effect = [
+        httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": "Nike Hoodie — 45"}}]})
+    ] * 3
+    with pytest.raises(LLMProviderError):
+        await OpenRouterProvider().run_sales_turn(
+            system_prompt="s", messages=[{"role": "user", "content": "salom"}], tools=[_SEARCH_TOOL],
+            tool_executor=_noop_executor, fused_schema=_Fused, analysis_schema=_Analysis, analyst_system_prompt="a",
         )
 
 
@@ -240,13 +292,24 @@ async def test_single_pass_provider_still_works_through_the_default() -> None:
     [
         ("PLAN: quote the price\n===MESSAGE===\nNarxi 450 000 so'm.", "Narxi 450 000 so'm."),
         ("===MESSAGE===\nSalom!", "Salom!"),
-        # Marker dropped but the label kept — the plan must still not be sent.
-        ("PLAN: greet them\nAssalomu alaykum!", "Assalomu alaykum!"),
-        ("Reja: salomlashish\nAssalomu alaykum!", "Assalomu alaykum!"),
-        # No plan at all: the whole thing is the message.
-        ("Assalomu alaykum! Nima qidiryapsiz?", "Assalomu alaykum! Nima qidiryapsiz?"),
         # Some models wrap the message in a fence.
         ("===MESSAGE===\n```\nSalom\n```", "Salom"),
+        # Without the marker there's no telling plan from message — nothing
+        # is sent (the writer is asked once more, then the turn hands off).
+        ("PLAN: greet them\nAssalomu alaykum!", ""),
+        ("Reja: salomlashish\nAssalomu alaykum!", ""),
+        ("Assalomu alaykum! Nima qidiryapsiz?", ""),
+        ("**PLAN:** greet them\nAssalomu alaykum!", ""),
+        # Regression: marker with nothing after it used to fall back to the
+        # text BEFORE the marker, leaking plan lines.
+        ("PLAN: narx so'radi.\nKeyingi qadam: razmer so'rash.\n===MESSAGE===", ""),
+        ("PLAN: x\n===MESSAGE===\nKeyingi qadam: razmer so'rash", ""),
+        # A later line that happens to start like a plan is the message's own
+        # content, not a leak.
+        (
+            "PLAN: x\n===MESSAGE===\nBuyurtma tartibi:\nReja: ertaga yetkazamiz",
+            "Buyurtma tartibi:\nReja: ertaga yetkazamiz",
+        ),
         # Nothing usable.
         ("PLAN: only a plan, no message at all", ""),
         ("", ""),
@@ -274,6 +337,16 @@ def test_extract_customer_message(raw: str, expected: str) -> None:
 )
 def test_needs_product_grounding(text: str, needs_grounding: bool) -> None:
     assert _needs_product_grounding([{"role": "user", "content": text}]) is needs_grounding
+
+
+def test_a_debounced_burst_is_judged_as_a_whole() -> None:
+    """"Air Max narxi qancha" + "rahmat" is still a price question."""
+    burst = [
+        {"role": "assistant", "content": "Salom!"},
+        {"role": "user", "content": "Air Max narxi qancha"},
+        {"role": "user", "content": "rahmat"},
+    ]
+    assert _needs_product_grounding(burst) is True
 
 
 def test_image_message_always_grounds() -> None:

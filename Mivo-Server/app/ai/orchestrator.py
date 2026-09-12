@@ -13,6 +13,7 @@ import re
 from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, Field
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ from app.ai.reply_parts import split_reply
 from app.ai.tools.definitions import ALL_TOOLS
 from app.ai.tools.executor import build_tool_executor
 from app.businesses.models import Business
-from app.conversations.models import Conversation, Message
+from app.conversations.models import DELIVERY_PENDING, Conversation, Message, is_untranscribed_voice_note
 from app.conversations.service import add_message, get_recent_messages
 
 FALLBACK_REPLY = "Kechirasiz, hozircha javob bera olmadim — tez orada siz bilan bog'lanamiz."
@@ -255,6 +256,7 @@ async def run_turn(
     conversation: Conversation,
     escalation_state_out: dict | None = None,
     deliver: Callable[[list[Message]], Awaitable[None]] | None = None,
+    outbound: bool = False,
 ) -> ConversationTurnResult:
     """Runs one agentic LLM turn against whatever's already persisted in the
     conversation's message history, and persists the AI's reply. Does NOT
@@ -277,9 +279,28 @@ async def run_turn(
     degrades the analysis rather than sending a second message. When that
     happens `escalation_state_out["analysis_failed"]` is set and the caller
     must skip lead qualification — the lead's previous assessment is a better
-    answer than one derived from nothing.
+    answer than one derived from nothing. The same flag is set when the
+    provider failed outright and the customer got the handoff reply: there is
+    no assessment then either.
+
+    `outbound=True` records the reply parts as `pending` outbox messages (the
+    Instagram path); `deliver` marks them sent/failed. In the same commit that
+    records the reply, the conversation notes the newest customer message this
+    turn saw — a retried event uses it to tell "already answered" from "still
+    owed an answer".
     """
     history = await get_recent_messages(db, conversation.id)
+    # The newest customer message this turn answers. A voice note that landed
+    # after its burst was transcribed isn't answered here (the turn only sees
+    # a placeholder) — its own event transcribes it and replies.
+    latest_customer_at = max(
+        (
+            m.created_at
+            for m in history
+            if getattr(m, "sender_type", None) == "customer" and not is_untranscribed_voice_note(m)
+        ),
+        default=None,
+    )
     system_prompt = await build_system_prompt_with_learnings(
         db, business, conversation.customer_id, working_state=conversation.working_state
     )
@@ -299,6 +320,9 @@ async def run_turn(
     recent_texts = [
         getattr(m, "content", "") for m in (history[-3:] if history else []) if getattr(m, "content", None)
     ]
+    customer_texts = [
+        m.content for m in history[-8:] if getattr(m, "sender_type", None) == "customer" and getattr(m, "content", None)
+    ]
 
     delivered_reply: str | None = None
     flagged_for_review = False
@@ -313,10 +337,23 @@ async def run_turn(
         nonlocal delivered_reply, flagged_for_review
 
         safe_reply, flagged_for_review = _apply_reply_guards(
-            reply_text, business, escalation_state, recent_texts
+            reply_text,
+            business,
+            escalation_state,
+            recent_texts,
+            working_state=conversation.working_state,
+            customer_texts=customer_texts,
         )
         if escalation_state["escalated"]:
-            conversation.status = "human_needed"
+            # Only from an AI-active status: someone who took the conversation
+            # over while this turn was running (a reply from the Instagram app
+            # sets human_active) keeps it.
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == conversation.id, Conversation.status.in_(("ai_active", "active")))
+                .values(status="human_needed")
+                .execution_options(synchronize_session=False)
+            )
 
         persisted = []
         for part in split_reply(safe_reply):
@@ -324,15 +361,27 @@ async def run_turn(
                 await add_message(
                     db, conversation, sender_type="ai", content=part,
                     flagged_for_review=flagged_for_review,
+                    delivery_status=DELIVERY_PENDING if outbound else None,
                 )
             )
+        if latest_customer_at is not None:
+            conversation.last_answered_customer_message_at = latest_customer_at
         # Recorded before sent, never the other way round: a message the
         # customer has but the database doesn't is one the owner can't see.
         await db.commit()
+        if escalation_state["escalated"]:
+            await db.refresh(conversation, ["status"])
 
         delivered_reply = safe_reply
         if deliver is not None:
-            await deliver(persisted)
+            try:
+                await deliver(persisted)
+            except Exception as exc:  # noqa: BLE001 — handed to the caller, see below
+                # The reply is recorded (pending/failed) and will be resent by
+                # the caller's retry. The turn itself carries on so the analysis
+                # still happens; the caller gets the error via
+                # escalation_state_out["delivery_error"] and decides.
+                escalation_state["delivery_error"] = exc
         return safe_reply
 
     try:
@@ -377,6 +426,9 @@ async def run_turn(
                 business.id,
                 exc,
             )
+            # No analysis exists for this turn; the placeholder scores below
+            # only satisfy the result type and must never reach the lead.
+            escalation_state["analysis_failed"] = True
             pref_lang = detect_preferred_language(business.language, recent_texts)
 
             if has_latest_image:
@@ -409,6 +461,13 @@ async def run_turn(
             # persisting and delivering.
             await _guard_persist_and_deliver(result.reply)
 
+    finally:
+        # Whatever happened, the caller learns what the turn did (escalated?
+        # delivery failed? analysis missing?) — it needs that to alert the
+        # owner even when this function raises.
+        if escalation_state_out is not None:
+            escalation_state_out.update(escalation_state)
+
     # Carry the sale forward. Product facts come off the tool results rather
     # than the model's own output, so a price recorded here is one the catalog
     # actually returned this turn (app/ai/conversation_state.py).
@@ -429,18 +488,36 @@ async def run_turn(
     return result
 
 
+_DISCOUNT_GUARD_REPLY = {
+    "ru": "Извините, точную информацию о скидках я сейчас подтвердить не могу, наш оператор проверит и обязательно свяжется с вами.",
+    "en": "Apologies, I cannot confirm a specific discount right now. Our team will verify and get back to you shortly.",
+    "uz": "Aniq chegirma haqida hozir tasdiqlab bera olmayman, operatorimiz tekshirib sizga ma'lumot beradi.",
+}
+_PRICE_GUARD_REPLY = {
+    "ru": "Извините, точную цену уточнит наш оператор — он скоро с вами свяжется.",
+    "en": "Apologies, our team will confirm the exact price and get back to you shortly.",
+    "uz": "Aniq narxni operatorimiz tekshirib, tez orada sizga yozadi.",
+}
+
+
 def _apply_reply_guards(
     reply: str,
     business: Business,
     escalation_state: dict,
     recent_texts: list[str],
+    working_state: dict | None = None,
+    customer_texts: list[str] | None = None,
 ) -> tuple[str, bool]:
     """The last checks on text about to reach a customer.
 
-    Returns (reply_to_send, flagged_for_review). Both guards replace the
+    Returns (reply_to_send, flagged_for_review). The guards replace the
     model's words outright rather than trusting them, which is the same
     deterministic-backend-decides pattern the phone override and score clamping
     use — the model proposes, the backend decides what actually goes out.
+
+    A reply the discount or price guard rewrites promises that an operator will
+    follow up, so the guard also escalates for real: the conversation goes to
+    human_needed and the owner is alerted. The promise is never an empty one.
     """
     flagged = False
 
@@ -451,26 +528,27 @@ def _apply_reply_guards(
         if fixed != reply:
             reply = fixed
 
-    # Defence in depth: the prompt forbids unverified discounts, this catches
-    # the times it does it anyway.
+    guard_reply: dict | None = None
     if _contains_unverified_discount_claim(
         reply,
         escalation_state.get("executed_tools", []),
         escalation_state.get("active_discounts", []),
+        _catalog_prices(escalation_state, working_state),
     ):
-        logger.warning(
-            "Unverified discount claim intercepted in reply for business %s. Original: %s",
-            business.id,
-            reply,
-        )
+        guard_reply, reason = _DISCOUNT_GUARD_REPLY, "AI tasdiqlanmagan chegirma aytmoqchi bo'ldi — tekshirib javob bering."
+    elif _contains_unverified_price(
+        reply,
+        _allowed_prices(escalation_state, working_state, business, customer_texts or []),
+    ):
+        guard_reply, reason = _PRICE_GUARD_REPLY, "AI katalogda yo'q narx aytmoqchi bo'ldi — narxni tasdiqlab javob bering."
+
+    if guard_reply is not None:
+        logger.warning("Reply guard intercepted a reply for business %s. Original: %s", business.id, reply)
         flagged = True
         lang = detect_preferred_language(business.language, recent_texts)
-        if lang == "ru":
-            reply = "Извините, точную информацию о скидках я сейчас подтвердить не могу, наш оператор проверит и обязательно свяжется с вами."
-        elif lang == "en":
-            reply = "Apologies, I cannot confirm a specific discount right now. Our team will verify and get back to you shortly."
-        else:
-            reply = "Aniq chegirma haqida hozir tasdiqlab bera olmayman, operatorimiz tekshirib sizga ma'lumot beradi."
+        reply = guard_reply.get(lang, guard_reply["uz"])
+        escalation_state["escalated"] = True
+        escalation_state["reason"] = reason
 
     return reply, flagged
 
@@ -479,13 +557,46 @@ _DISCOUNT_TERMS = [
     "chegirma", "aksiya", "arzon qilib", "skidka", "скидк", "акци",
     "discount", "% off", "foiz chegirma", "promo", "promokod", "kupon", "купон"
 ]
+# Ways to lower a price without saying "discount" — "10% arzonroq", "уступлю".
+_PRICE_LOWERING_TERMS = [
+    "arzonroq", "arzonlashtir", "tushirib", "tushiraman", "kamaytirib", "kamaytiraman",
+    "cheaper", "less than", "дешевле", "уступ", "сбавл",
+]
+# "chegirma yo'q", "скидок нет", "no discount right now" — honest denials.
+# Stripped before looking for claims, so a denial can't hide a claim elsewhere
+# in the same reply, and "100% paxta, chegirma yo'q" isn't read as a 100% one.
+_DENIAL_RE = re.compile(
+    r"(?:chegirma\w*|skidka\w*|скидк\w*|discount\w*|aksiya\w*|акци\w*)\s+"
+    r"(?:hozircha\s+|hozir\s+|umuman\s+|сейчас\s+)?"
+    r"(?:mavjud\s+emas|yo'?q|emas|bo'?lmaydi|нет|не\s+предусмотрен\w*|none|not\s+available)"
+    r"|(?:no|нет)\s+(?:active\s+)?(?:discount|скидок)\w*",
+    re.IGNORECASE,
+)
+_PCT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:%|foiz|процент\w*|percent)", re.IGNORECASE)
+
+
+# Punctuation that ends a clause — but not a "." or "," inside a number.
+_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.,;!?\n]|[.,;!?\n](?!\d)")
+
+
+def _clause_around(text: str, start: int, end: int) -> str:
+    left = max((m.end() for m in _CLAUSE_BREAK_RE.finditer(text, 0, start)), default=0)
+    right = next((m.start() for m in _CLAUSE_BREAK_RE.finditer(text, end)), len(text))
+    return text[left:right]
 
 
 def extract_discount_numbers(text: str) -> list[float]:
+    """Percentages and amounts the text presents as a discount. A percentage
+    only counts with discount/price-lowering wording in the same clause —
+    "100% paxtadan, 10% chegirma bilan" offers 10%, not 100%."""
+    lowered = _DENIAL_RE.sub(" ", text.lower())
     # Normalize thousand separators like "50 000" -> "50000"
-    cleaned = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
-    pct_matches = re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:%|foiz|процент|percent)", cleaned, re.IGNORECASE)
-    numbers = [float(x.replace(",", ".")) for x in pct_matches]
+    cleaned = re.sub(r"(?<=\d)\s+(?=\d)", "", lowered)
+    numbers: list[float] = []
+    for m in _PCT_RE.finditer(cleaned):
+        clause = _clause_around(cleaned, m.start(), m.end())
+        if any(term in clause for term in _DISCOUNT_TERMS + _PRICE_LOWERING_TERMS):
+            numbers.append(float(m.group(1).replace(",", ".")))
     for term in _DISCOUNT_TERMS:
         # e.g. "chegirma: 50000", "skidka 10000", "aksiya 20000"
         for m in re.finditer(rf"{term}\s*(?:narxi|miqdori|summasi|—|-|:)?\s*(\d+(?:[.,]\d+)?)", cleaned, re.IGNORECASE):
@@ -502,45 +613,225 @@ def extract_discount_numbers(text: str) -> list[float]:
     return list(dict.fromkeys(numbers))
 
 
+_PROMISE_PATTERNS = [
+    r"chegirma\s+(?:qilib\s+)?ber(?:amiz|aman|iladi)",
+    r"chegirma\s+mavjud(?!\s+(?:emas|yo'?q))",
+    r"aksiyamiz\s+bor(?!\s+(?:emas|yo'?q))",
+    r"arzon(?:roq)?\s+qilib\s+ber(?:amiz|aman)",
+    r"(?:tushirib|kamaytirib)\s+ber(?:amiz|aman)",
+    r"сдела(?:ем|ю)\s+вам\s+скидку",
+    r"скидк[ау]\s+предостав",
+    r"уступ(?:лю|им)",
+    r"give\s+you\s+a\s+discount",
+    r"offer\s+a\s+discount",
+]
+
+
+def _verified_discount_numbers(active_discounts: list[dict], catalog_prices: set[float]) -> set[float]:
+    """What a real discount lets the reply say next to discount wording: its
+    value, the list price it applies to ("780 000 so'm chegirmadan keyin
+    702 000"), what it comes to on that price (amount off, price after), and
+    the amounts in its own description/conditions ("500 000 so'mdan ortiq")."""
+    verified: set[float] = set(catalog_prices)
+    for d in active_discounts:
+        value = float(d.get("value") or 0)
+        verified.add(value)
+        for p in catalog_prices:
+            if d.get("type") == "percentage":
+                verified.add(round(p * value / 100, 2))
+                verified.add(round(p * (1 - value / 100), 2))
+            else:
+                verified.add(p - value)
+        verified.update(_amounts_in(d.get("description"), d.get("conditions")))
+    return verified
+
+
 def _contains_unverified_discount_claim(
     response_text: str,
     executed_tools: list[dict],
     active_discounts: list[dict],
+    catalog_prices: set[float] | None = None,
 ) -> bool:
     """Detects whether the LLM generated an unverified discount or promotional promise."""
-    t = response_text.lower()
-    has_discount_term = any(term in t for term in _DISCOUNT_TERMS)
-    claimed_numbers = extract_discount_numbers(t)
+    t = _DENIAL_RE.sub(" ", response_text.lower())
+    called_tool = any(call.get("name") == "get_active_discounts" for call in executed_tools)
 
-    # 1. If text explicitly mentions discount terms and quotes numbers
-    if has_discount_term and claimed_numbers:
-        called_tool = any(call.get("name") == "get_active_discounts" for call in executed_tools)
+    has_term = any(term in t for term in _DISCOUNT_TERMS + _PRICE_LOWERING_TERMS)
+    claimed_numbers = extract_discount_numbers(response_text)
+    if has_term and claimed_numbers:
         if not called_tool:
             return True
-        verified_values = {float(d.get("value", 0)) for d in active_discounts}
-        if any(num not in verified_values for num in claimed_numbers):
+        verified = _verified_discount_numbers(active_discounts, catalog_prices or set())
+        if any(not any(abs(num - v) <= max(0.01, v * _PRICE_TOLERANCE) for v in verified) for num in claimed_numbers):
             return True
 
-    # 2. If it is an explicit denial (e.g. 'chegirma yo'q', 'chegirma mavjud emas'), do not flag
-    if re.search(r"(?:chegirma|skidka|скидк|discount)\w*\s+(?:yo'?q|emas|bo'?lmaydi|нет|не\s+предусмотрен|none|not\s+available)", t):
-        return False
-
-    # 3. Check promises of discounts without specific numbers if no active discounts exist
-    promise_patterns = [
-        r"chegirma\s+(?:qilib\s+)?ber(?:amiz|aman|iladi)",
-        r"chegirma\s+mavjud(?!\s+(?:emas|yo'?q))",
-        r"aksiyamiz\s+bor(?!\s+(?:emas|yo'?q))",
-        r"arzon\s+qilib\s+ber(?:amiz|aman)",
-        r"сдела(?:ем|ю)\s+вам\s+скидку",
-        r"скидк[ау]\s+предостав",
-        r"give\s+you\s+a\s+discount",
-        r"offer\s+a\s+discount",
-    ]
-    if any(re.search(pat, t) for pat in promise_patterns):
-        called_tool = any(call.get("name") == "get_active_discounts" for call in executed_tools)
+    if any(re.search(pat, t) for pat in _PROMISE_PATTERNS):
         if not called_tool or not active_discounts:
             return True
 
+    return False
+
+
+# "780 000 so'm", "780.000 сум", "1 250 000 UZS", "500 ming so'm", "25 $".
+_PRICE_RE = re.compile(
+    r"(?<![\d.,])(\d{1,3}(?:[  .,]\d{3})+|\d+)\s*(ming\s*)?(?:so['‘’`ʻ]?m|sum\b|сум|uzs|usd|\$|dollar)",
+    re.IGNORECASE,
+)
+# "1,2 mln so'm", "1.5 млн", "2 million" — a price with or without a currency.
+_MILLION_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(?:mln|million|млн)(?![a-zа-я])", re.IGNORECASE)
+_BARE_NUMBER_RE = re.compile(r"(?<![\d.,])(\d{1,3}(?:[  .,]\d{3})+|\d{4,})(?![\d])")
+_GROUP_SPLIT_RE = re.compile(r"[  ]")
+
+
+def _parse_amount(digits: str, thousands: bool = False) -> float | None:
+    cleaned = re.sub(r"[  .,]", "", digits)
+    if not cleaned.isdigit():
+        return None
+    value = float(cleaned)
+    return value * 1000 if thousands else value
+
+
+def _price_readings(text: str) -> list[list[float]]:
+    """Every price in the text, each as its possible readings. A number stuck
+    in front of a space-grouped price is often not part of it — "Air Max 90
+    780 000 so'm" is 780 000, not 90 780 000 — so such a price can also be
+    read without its leading group."""
+    readings: list[list[float]] = []
+    for m in _PRICE_RE.finditer(text):
+        thousands = bool(m.group(2))
+        full = _parse_amount(m.group(1), thousands)
+        if full is None:
+            continue
+        options = [full]
+        groups = _GROUP_SPLIT_RE.split(m.group(1))
+        if len(groups) >= 3:
+            tail = _parse_amount("".join(groups[1:]), thousands)
+            if tail is not None:
+                options.append(tail)
+        readings.append(options)
+    for m in _MILLION_RE.finditer(text):
+        readings.append([float(m.group(1).replace(",", ".")) * 1_000_000])
+    return readings
+
+
+def _quoted_prices(text: str) -> list[float]:
+    """Prices as written (first reading of each)."""
+    return [options[0] for options in _price_readings(text)]
+
+
+def _amounts_in(*texts: str | None) -> set[float]:
+    """Every amount written in free text — a business's delivery fee, a
+    discount's threshold — whether or not a currency follows it."""
+    found: set[float] = set()
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        found.update(_quoted_prices(text))
+        for m in _BARE_NUMBER_RE.finditer(text):
+            value = _parse_amount(m.group(1))
+            if value is not None:
+                found.add(value)
+        for m in re.finditer(r"(\d+)\s*ming", text, re.IGNORECASE):
+            found.add(float(m.group(1)) * 1000)
+    return found
+
+
+def _catalog_prices(escalation_state: dict, working_state: dict | None) -> set[float]:
+    """Product and variant prices the catalog returned this turn or told this
+    customer in an earlier one."""
+    catalog = {float(p) for p in escalation_state.get("catalog_prices") or [] if isinstance(p, (int, float))}
+    for snapshot in ((working_state or {}).get("product_facts") or {}).values():
+        if not isinstance(snapshot, dict):
+            continue
+        for value in [snapshot.get("price"), *(snapshot.get("variant_prices") or [])]:
+            if isinstance(value, (int, float)):
+                catalog.add(float(value))
+    return catalog
+
+
+# Words that make a customer's number their budget ("500 minggacha",
+# "около 300 000", "budget 50$"). Only those numbers are theirs to repeat —
+# anything else they typed (a phone, an order code, a size) is not a price.
+_BUDGET_TERMS = (
+    "gacha", "atrofida", "atrof", "byudjet", "budjet", "budget", "oraliq", "dan oshmasin",
+    "до ", "около", "бюджет", "в пределах", "up to", "around", "under ",
+)
+_BUDGET_WINDOW = 25
+
+
+def _customer_budget_numbers(text: str) -> set[float]:
+    lowered = text.lower()
+    found: set[float] = set()
+    candidates = [(m, bool(m.group(2))) for m in _PRICE_RE.finditer(lowered)]
+    candidates += [(m, False) for m in _BARE_NUMBER_RE.finditer(lowered)]
+    for m, thousands in candidates:
+        window = lowered[max(0, m.start() - _BUDGET_WINDOW) : m.end() + _BUDGET_WINDOW]
+        if not any(term in window for term in _BUDGET_TERMS):
+            continue
+        value = _parse_amount(m.group(1), thousands)
+        if value is not None:
+            found.add(value)
+    for m in re.finditer(r"(\d+)\s*ming", lowered):
+        window = lowered[max(0, m.start() - _BUDGET_WINDOW) : m.end() + _BUDGET_WINDOW]
+        if any(term in window for term in _BUDGET_TERMS):
+            found.add(float(m.group(1)) * 1000)
+    return found
+
+
+def _allowed_prices(
+    escalation_state: dict,
+    working_state: dict | None,
+    business: Business,
+    customer_texts: list[str],
+) -> set[float]:
+    """Every amount the reply may legitimately state: catalog prices returned
+    this turn or recorded earlier, amounts the business itself wrote (delivery
+    fee...) and the active discounts carry (threshold, amount off), the
+    customer's stated budget — and the arithmetic a salesperson does with
+    those: up to 10 pieces, two different items together, the price after a
+    discount, and any of these plus a fee."""
+    catalog = _catalog_prices(escalation_state, working_state)
+    discounts = escalation_state.get("active_discounts") or []
+
+    unit_prices = set(catalog)
+    discount_amounts: set[float] = set()
+    for d in discounts:
+        value = float(d.get("value") or 0)
+        if d.get("type") == "percentage":
+            unit_prices.update(round(p * (1 - value / 100), 2) for p in catalog)
+            discount_amounts.update(round(p * value / 100, 2) for p in catalog)
+        else:
+            unit_prices.update(p - value for p in catalog)
+            discount_amounts.add(value)
+
+    fees = _amounts_in(
+        business.delivery_info, business.payment_info, business.discount_policy,
+        business.rules_text, business.description, business.handoff_instructions,
+        *(d.get("description") for d in discounts), *(d.get("conditions") for d in discounts),
+    )
+
+    totals = {p * k for p in unit_prices for k in range(1, 11)}
+    ordered = sorted(catalog)[:40]
+    totals.update(a + b for i, a in enumerate(ordered) for b in ordered[i + 1 :])
+
+    allowed = totals | fees | discount_amounts
+    allowed.update(t + f for t in totals for f in fees)
+    for text in customer_texts:
+        if isinstance(text, str) and text:
+            allowed.update(_customer_budget_numbers(text))
+    return allowed
+
+
+_PRICE_TOLERANCE = 0.01
+
+
+def _contains_unverified_price(reply: str, allowed: set[float]) -> bool:
+    """A price in the reply that no tool result, business setting or customer
+    budget backs up is an invented price. 1% tolerance covers rounding
+    ("779 000" for 779 500)."""
+    for options in _price_readings(reply):
+        if not any(abs(quoted - a) <= max(1.0, a * _PRICE_TOLERANCE) for quoted in options for a in allowed):
+            return True
     return False
 
 

@@ -47,6 +47,9 @@ def test_sandbox_message_turn_and_reset(client):
     headers = create_business_and_headers(f"owner_{uuid.uuid4().hex[:6]}@test.com", "Sandbox Biz 2")
     mock_provider = MockSandboxProvider(reply="Bizda Nike krossovkalar bor, narxi 350,000 so'm", lead_status="warm", score=55)
     app.dependency_overrides[get_llm_provider] = lambda: mock_provider
+    # The price in the reply must come from the catalog (the price guard
+    # rejects prices no tool returned), so the product exists.
+    assert client.post("/products", json={"name": "Nike krossovka", "price": 350000}, headers=headers).status_code == 201
 
     try:
         # 1. Send simulated customer message
@@ -84,3 +87,23 @@ def test_sandbox_message_turn_and_reset(client):
         assert state_after_reset["lead_status"] is None
     finally:
         app.dependency_overrides.pop(get_llm_provider, None)
+
+
+def test_sandbox_invented_price_is_intercepted(client):
+    headers = create_business_and_headers(f"owner_{uuid.uuid4().hex[:6]}@test.com", "Sandbox Biz 3")
+    app.dependency_overrides[get_llm_provider] = lambda: MockSandboxProvider(reply="Faqat siz uchun 199 000 so'm!")
+    try:
+        resp = client.post("/ai/sandbox/message", headers=headers, json={"content": "arzonroq bo'ladimi?"})
+        assert resp.status_code == 200
+        assert "199 000" not in resp.json()["reply"]
+        assert "operatorimiz" in resp.json()["reply"]
+    finally:
+        app.dependency_overrides.pop(get_llm_provider, None)
+
+
+def test_sandbox_rejects_non_https_attachments_and_huge_messages(client):
+    headers = create_business_and_headers(f"owner_{uuid.uuid4().hex[:6]}@test.com", "Sandbox Biz 4")
+    assert client.post(
+        "/ai/sandbox/message", headers=headers, json={"content": "x", "attachment_url": "http://169.254.169.254/"}
+    ).status_code == 422
+    assert client.post("/ai/sandbox/message", headers=headers, json={"content": "x" * 5000}).status_code == 422

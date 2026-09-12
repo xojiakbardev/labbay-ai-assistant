@@ -1,3 +1,6 @@
+import hmac
+import logging
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,8 +10,10 @@ from app.common.tenancy import get_current_business
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.telegram import service
+from app.telegram.client import TelegramAPIError, TelegramClient
 
 router = APIRouter(tags=["telegram"])
+logger = logging.getLogger("app.telegram.router")
 
 
 class TelegramConnectResponse(BaseModel):
@@ -30,7 +35,7 @@ async def telegram_status(
     connection = await service.get_connection(db, business.id)
     if connection is None or not connection.telegram_chat_id:
         return TelegramStatusResponse(connected=False)
-    
+
     return TelegramStatusResponse(
         connected=True,
         username=connection.telegram_username,
@@ -42,6 +47,8 @@ async def telegram_status(
 async def connect_telegram(
     business: Business = Depends(get_current_business), db: AsyncSession = Depends(get_db)
 ):
+    if not get_settings().telegram_bot_username or not get_settings().telegram_bot_token:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Telegram bot is not configured on this server.")
     token, expires_at = await service.create_connect_token(db, business.id)
     return TelegramConnectResponse(deep_link=service.build_deep_link(token), expires_at=expires_at.isoformat())
 
@@ -53,22 +60,33 @@ async def disconnect_telegram(
     await service.disconnect(db, business.id)
 
 
+def _secret_is_valid(received: str | None) -> bool:
+    expected = get_settings().telegram_webhook_secret
+    # No configured secret means nothing can be verified, so nothing is
+    # accepted — an unauthenticated webhook here would let anyone bind their
+    # own chat to a business's hot-lead alerts.
+    if not expected or not received:
+        return False
+    return hmac.compare_digest(received.encode(), expected.encode())
+
+
+async def _reply(chat_id: str, text: str) -> None:
+    try:
+        await TelegramClient().send_message(chat_id=chat_id, text=text)
+    except TelegramAPIError as exc:
+        logger.warning("[TelegramWebhook] reply to chat %s failed: %s", chat_id, exc)
+
+
 @router.post("/webhooks/telegram")
 async def receive_telegram_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
-    settings = get_settings()
-    expected_secret = settings.telegram_webhook_secret
-    valid_secrets = {expected_secret, "mivo-telegram-webhook-secret-2026", "replace-with-a-telegram-secret"}
-    
-    if expected_secret and x_telegram_bot_api_secret_token not in valid_secrets:
-        print(f"[TelegramWebhook] 403 Forbidden - Received secret: {x_telegram_bot_api_secret_token}, expected: {expected_secret}")
+    if not _secret_is_valid(x_telegram_bot_api_secret_token):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid webhook secret.")
 
     body = await request.json()
-    print(f"[TelegramWebhook] Received update body: {body}")
     message = body.get("message") or {}
     text = (message.get("text") or "").strip()
     chat = message.get("chat") or {}
@@ -77,40 +95,36 @@ async def receive_telegram_webhook(
     if not chat_id:
         return {"status": "ok"}
 
+    integrations_url = f"{get_settings().frontend_url}/integrations"
     if text.startswith("/start"):
         parts = text.split(maxsplit=1)
         if len(parts) == 2:
-            token = parts[1].strip()
-            connected = await service.handle_start_command(db, token, str(chat_id), chat.get("username"))
-            if not connected:
-                try:
-                    from app.telegram.client import TelegramClient
-                    client = TelegramClient()
-                    await client.send_message(
-                        chat_id=str(chat_id),
-                        text="⚠️ Havolaning amal qilish muddati tugagan yoki noto'g'ri.\n\nIltimos, platformadagi Integratsiyalar sahifasiga o'tib, yangi ulanish havolasini oling:\n👉 https://mivo.nasriddinov.dev/integrations",
-                    )
-                except Exception as exc:
-                    print(f"[TelegramWebhook] Send failed: {exc}")
-        else:
-            try:
-                from app.telegram.client import TelegramClient
-                client = TelegramClient()
-                await client.send_message(
-                    chat_id=str(chat_id),
-                    text="👋 Assalomu alaykum!\n\n🤖 <b>Mivo AI Sales Bot</b>ga xush kelibsiz.\n\nUshbu bot orqali siz Instagram sahifangizdan keladigan barcha 🔥 <b>Issiq Lidlar (Hot Leads)</b> va xaridorlarning telefon raqamlarini lahzalik qabul qilasiz.\n\n🔗 Botni o'z profilingizga ulash uchun:\n1. <a href=\"https://mivo.nasriddinov.dev/integrations\">Mivo AI Integratsiyalar</a> sahifasiga kiring\n2. <b>'Telegram-ni ulash'</b> tugmasini bosing.",
+            connected = await service.handle_start_command(db, parts[1].strip(), str(chat_id), chat.get("username"))
+            if connected:
+                await _reply(
+                    str(chat_id),
+                    "✅ Mivo AI Sales Assistant-ga muvaffaqiyatli ulandingiz!\n\nEndi Instagram sahifangizdan "
+                    "keladigan 🔥 Hot Lead bildirishnomalari va kontaktlar ushbu bot orqali sizga lahzalik yuboriladi.",
                 )
-            except Exception as exc:
-                print(f"[TelegramWebhook] Send failed: {exc}")
-    else:
-        try:
-            from app.telegram.client import TelegramClient
-            client = TelegramClient()
-            await client.send_message(
-                chat_id=str(chat_id),
-                text="ℹ️ Mivo AI bildirishnomalari sozlamalari uchun platformaga kiring:\n👉 https://mivo.nasriddinov.dev/integrations",
+            else:
+                await _reply(
+                    str(chat_id),
+                    "⚠️ Havolaning amal qilish muddati tugagan yoki noto'g'ri.\n\nIltimos, platformadagi "
+                    f"Integratsiyalar sahifasiga o'tib, yangi ulanish havolasini oling:\n👉 {integrations_url}",
+                )
+        else:
+            await _reply(
+                str(chat_id),
+                "👋 Assalomu alaykum!\n\n🤖 <b>Mivo AI Sales Bot</b>ga xush kelibsiz.\n\nUshbu bot orqali siz "
+                "Instagram sahifangizdan keladigan barcha 🔥 <b>Issiq Lidlar (Hot Leads)</b> va xaridorlarning "
+                "telefon raqamlarini lahzalik qabul qilasiz.\n\n🔗 Botni o'z profilingizga ulash uchun:\n"
+                f"1. <a href=\"{integrations_url}\">Mivo AI Integratsiyalar</a> sahifasiga kiring\n"
+                "2. <b>'Telegram-ni ulash'</b> tugmasini bosing.",
             )
-        except Exception as exc:
-            print(f"[TelegramWebhook] Send failed: {exc}")
+    else:
+        await _reply(
+            str(chat_id),
+            f"ℹ️ Mivo AI bildirishnomalari sozlamalari uchun platformaga kiring:\n👉 {integrations_url}",
+        )
 
     return {"status": "ok"}

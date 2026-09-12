@@ -45,6 +45,9 @@ async def subscribe_push(
     db: AsyncSession = Depends(get_db),
 ):
     """Saves or updates a Web Push subscription for the authenticated user and business."""
+    settings = get_settings()
+    if not settings.vapid_public_key or not settings.vapid_private_key:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Push notifications are not configured.")
     await service.save_subscription(
         db=db,
         business_id=business.id,
