@@ -24,7 +24,7 @@ async def list_leads(
     result = await db.execute(
         select(Lead, Customer)
         .join(Customer, Lead.customer_id == Customer.id)
-        .where(Lead.business_id == business.id)
+        .where(Lead.business_id == business.id, Customer.is_sandbox.is_(False))
         .order_by(Lead.updated_at.desc(), Lead.id)
         .limit(limit)
         .offset(offset)

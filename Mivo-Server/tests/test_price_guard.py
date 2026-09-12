@@ -6,10 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from app.ai.orchestrator import (
-    _allowed_prices,
     _contains_unverified_discount_claim,
-    _contains_unverified_price,
     extract_discount_numbers,
+    find_unverified_prices,
 )
 
 
@@ -27,8 +26,32 @@ def _state(prices, discounts=None, called_discounts=True):
 
 
 def _invented(reply, state, business=None, customer_texts=(), working_state=None) -> bool:
-    allowed = _allowed_prices(state, working_state, business or _business(), list(customer_texts))
-    return _contains_unverified_price(reply, allowed)
+    return bool(find_unverified_prices(reply, state, working_state, business or _business(), list(customer_texts)))
+
+
+def test_made_up_prices_near_real_ones_are_caught() -> None:
+    """A price 5-20% off a real one, with no quantity, total or delivery in the
+    reply, is invented. The old guard let most of these through (every price
+    ×1-10, every pair sum, every number in the settings)."""
+    catalog = [99000.0, 149000.0, 199000.0, 249000.0, 299000.0, 349000.0, 399000.0, 449000.0, 499000.0, 549000.0]
+    business = _business(description="2019 yildan beri ishlaymiz, karta 8600 1234", rules_text="Tel: 90 123 45 67")
+    offsets = (0.95, 0.93, 0.9, 0.88, 0.85, 0.82, 1.05, 1.07, 1.1, 1.12, 1.15, 1.2)
+    fakes = [round(p * f, -3) for p in catalog for f in offsets]
+    # Some land on another real price; those aren't invented.
+    fakes = [x for x in fakes if not any(abs(x - a) <= a * 0.01 for a in catalog)]
+    passed = [x for x in fakes if not _invented(f"Narxi {int(x):,} so'm".replace(",", " "), _state(catalog), business)]
+    assert passed == []
+
+
+def test_arithmetic_needs_the_reply_to_say_so() -> None:
+    state = _state([780000.0, 520000.0])
+    business = _business(delivery_info="Yetkazib berish 25 000 so'm")
+    assert _invented("Narxi 1 560 000 so'm", state)  # no quantity stated
+    assert not _invented("2 ta olsangiz 1 560 000 so'm", state)
+    assert _invented("Narxi 1 300 000 so'm", state)  # a sum, but no "jami"
+    assert not _invented("Ikkalasi jami 1 300 000 so'm", state)
+    assert _invented("Narxi 805 000 so'm", state, business)  # price + fee without delivery
+    assert not _invented("Yetkazib berish bilan 805 000 so'm", state, business)
 
 
 @pytest.mark.parametrize(

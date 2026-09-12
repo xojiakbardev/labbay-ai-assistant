@@ -482,6 +482,45 @@ async def test_burst_of_rapid_messages_gets_one_combined_reply(db_session, alert
     ]
 
 
+async def test_debounce_gives_the_processing_slot_back(db_session, alerts, monkeypatch) -> None:
+    """With one slot, a second customer's turn runs while the first customer's
+    event is still in its debounce wait."""
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0.5)
+    monkeypatch.setattr(pipeline, "_PROCESS_SLOTS", asyncio.Semaphore(1))
+    await _seed(db_session)
+    meta = FakeMetaClient()
+
+    waiting_id = await pipeline.ingest_event(db_session, _event("slot-1", "Salom", customer="slot-a"))
+    waiting = asyncio.create_task(pipeline.process_event(waiting_id, provider=FakeProvider(_result("A")), meta_client=meta))
+    await asyncio.sleep(0.05)
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    other_id = await pipeline.ingest_event(db_session, _event("slot-2", "Salom", customer="slot-b"))
+    await asyncio.wait_for(pipeline.process_event(other_id, provider=FakeProvider(_result("B")), meta_client=meta), 0.3)
+
+    assert [s["text"] for s in meta.sent] == ["B"]
+    await waiting
+    assert [s["text"] for s in meta.sent] == ["B", "A"]
+    assert pipeline._PROCESS_SLOTS._value == 1
+
+
+async def test_shutdown_hands_interrupted_events_back(db_session, alerts, monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 5)
+    await _seed(db_session)
+    event_id = await pipeline.ingest_event(db_session, _event("cut-1", "Salom", customer="cut"))
+    task = asyncio.create_task(pipeline.process_event(event_id, provider=FakeProvider(_result()), meta_client=FakeMetaClient()))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await pipeline.release_interrupted()
+
+    row = await _event_row(db_session, "cut-1")
+    assert (row.status, row.attempts, row.last_error) == ("failed", 0, "interrupted by shutdown")
+    assert row.next_attempt_at <= dt.datetime.now(dt.timezone.utc)
+    assert pipeline._IN_FLIGHT == set()
+
+
 async def test_message_during_a_running_turn_waits_and_gets_its_own_reply(db_session, alerts) -> None:
     """Regression: a message that arrived while the previous turn was still in
     the LLM started a parallel turn. Now the second waits for the first, then

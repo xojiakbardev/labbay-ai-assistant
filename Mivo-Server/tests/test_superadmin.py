@@ -16,7 +16,14 @@ def test_unauthenticated_is_rejected(client) -> None:
     assert resp.status_code == 401
 
 
-def test_create_list_and_extend_business(client) -> None:
+def test_create_list_and_extend_business(client, monkeypatch) -> None:
+    from app.superadmin import service
+
+    async def fake_balance():
+        return 12.5, 20.0
+
+    # The live OpenRouter account API is never called from tests.
+    monkeypatch.setattr(service, "get_openrouter_balance", fake_balance)
     admin_headers = create_superadmin_and_headers()
 
     create_resp = client.post(
@@ -53,6 +60,7 @@ def test_create_list_and_extend_business(client) -> None:
     stats = stats_resp.json()
     assert stats["total_businesses"] >= 1
     assert stats["income_this_month"].get("UZS") == 500000.0
+    assert (stats["openrouter_balance_usd"], stats["openrouter_limit_usd"]) == (12.5, 20.0)
 
 
 def test_superadmin_suspension_cannot_be_undone_by_the_owner(client) -> None:

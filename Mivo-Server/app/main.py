@@ -108,6 +108,9 @@ async def _webhook_sweep_job() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if not settings.scheduler_enabled:
+        yield
+        return
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         _refresh_instagram_tokens_job,
@@ -126,6 +129,10 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         scheduler.shutdown(wait=False)
+        try:
+            await pipeline.release_interrupted()
+        except Exception:  # noqa: BLE001 — the lease rescues them anyway, just later
+            logger.exception("[shutdown] could not hand interrupted events back")
 
 
 _docs_enabled = not settings.is_production
@@ -185,5 +192,12 @@ app.include_router(superadmin_router)
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health():
+    """Up means the database answers too — a deploy is checked against this."""
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001 — reported as 503, logged
+        logger.exception("[health] database unreachable")
+        return JSONResponse(status_code=503, content={"status": "db_unavailable"})
     return {"status": "ok"}

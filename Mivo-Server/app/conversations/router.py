@@ -102,7 +102,7 @@ async def list_conversations(
         select(Conversation, Customer, last)
         .join(Customer, Conversation.customer_id == Customer.id)
         .outerjoin(last, true())
-        .where(Conversation.business_id == business.id)
+        .where(Conversation.business_id == business.id, Customer.is_sandbox.is_(False))
         .order_by(Conversation.last_message_at.desc().nullslast(), Conversation.id)
         .limit(limit)
         .offset(offset)

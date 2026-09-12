@@ -19,6 +19,7 @@ from app.ai.orchestrator import (
     claims_to_see_media,
     detect_preferred_language,
     extract_discount_numbers,
+    find_unverified_prices,
     strip_internal_markers,
 )
 from app.ai.provider.openrouter import _PLAN_LINE_RE, _WRITER_MESSAGE_MARKER
@@ -26,10 +27,6 @@ from app.ai.provider.openrouter import _PLAN_LINE_RE, _WRITER_MESSAGE_MARKER
 # Instagram DM, not a product page: a wall of text is itself a failure.
 MAX_REPLY_CHARS = 600
 MAX_QUESTIONS_PER_REPLY = 1
-
-# Below this, a number in a reply is a size, a quantity or a house number —
-# not a price someone could be misled by.
-MIN_PRICE_LIKE = 1000
 
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 
@@ -91,18 +88,6 @@ def _normalize_numbers(text: str) -> str:
     return re.sub(r"(?<=\d)[\s ](?=\d)", "", text)
 
 
-def price_like_numbers(text: str) -> set[float]:
-    numbers = set()
-    for raw in re.findall(r"\d+(?:[.,]\d+)?", _normalize_numbers(text)):
-        try:
-            value = float(raw.replace(",", "."))
-        except ValueError:
-            continue
-        if value >= MIN_PRICE_LIKE:
-            numbers.add(value)
-    return numbers
-
-
 def check_no_internal_leakage(reply: str, ctx: CheckContext) -> list[Finding]:
     """Nothing meant for the machine may reach the customer."""
     findings = []
@@ -155,23 +140,24 @@ def check_language_matches(reply: str, ctx: CheckContext) -> list[Finding]:
 
 
 def check_prices_are_grounded(reply: str, ctx: CheckContext) -> list[Finding]:
-    """Every price-shaped number must be one the catalog actually carries.
+    """Every price must be one the catalog backs — the runtime guard itself.
 
     This is the check that catches the failure that costs a business real money:
     an invented price a customer then holds them to.
     """
     if not ctx.catalog_prices:
         return []
-    invented = {n for n in price_like_numbers(reply) if n not in ctx.catalog_prices}
+    state = {"catalog_prices": sorted(ctx.catalog_prices), "active_discounts": ctx.active_discounts}
+    invented = find_unverified_prices(reply, state, None, None, [ctx.customer_message])
     return [
-        Finding("invented_price", "error", f"quoted {value:g}, which is not a catalog price")
-        for value in sorted(invented)
+        Finding("invented_price", "error", f"quoted {value:.0f}, which the catalog doesn't back")
+        for value in sorted(set(invented))
     ]
 
 
 def check_no_unverified_discount(reply: str, ctx: CheckContext) -> list[Finding]:
     """Delegates to the runtime's own guard, so eval and production can't drift."""
-    if _contains_unverified_discount_claim(reply, ctx.executed_tools, ctx.active_discounts):
+    if _contains_unverified_discount_claim(reply, ctx.executed_tools, ctx.active_discounts, ctx.catalog_prices):
         return [
             Finding(
                 "unverified_discount",

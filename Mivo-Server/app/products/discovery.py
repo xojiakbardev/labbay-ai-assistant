@@ -92,10 +92,13 @@ async def popular_products(
     in, which across a business's whole history is a real signal and not a
     guess. Falls back to a plain browse while a new business has no leads yet.
     """
+    from app.customers.models import Customer
     from app.leads.models import Lead
 
     rows = await db.execute(
-        select(Lead.interested_products).where(Lead.business_id == business_id)
+        select(Lead.interested_products)
+        .join(Customer, Customer.id == Lead.customer_id)
+        .where(Lead.business_id == business_id, Customer.is_sandbox.is_(False))
     )
 
     counts: dict[str, int] = {}

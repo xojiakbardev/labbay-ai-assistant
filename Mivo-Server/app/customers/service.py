@@ -14,7 +14,12 @@ PROFILE_RETRY_AFTER = dt.timedelta(hours=get_settings().profile_retry_hours)
 
 
 async def get_or_create_customer(
-    db: AsyncSession, business_id: uuid.UUID, ig_scoped_id: str, username: str | None = None
+    db: AsyncSession,
+    business_id: uuid.UUID,
+    ig_scoped_id: str,
+    username: str | None = None,
+    *,
+    is_sandbox: bool = False,
 ) -> Customer:
     """Atomic upsert. Two webhooks for a brand-new customer arriving together
     both land on the same row — the second no longer dies on the unique
@@ -27,6 +32,7 @@ async def get_or_create_customer(
             business_id=business_id,
             ig_scoped_id=ig_scoped_id,
             username=username,
+            is_sandbox=is_sandbox,
             first_seen_at=now,
             last_seen_at=now,
         )

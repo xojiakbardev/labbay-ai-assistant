@@ -37,7 +37,9 @@ def _product_summary(product: Product) -> dict:
     description = product.description or None
     if description and len(description) > _MAX_DESCRIPTION_CHARS:
         description = description[:_MAX_DESCRIPTION_CHARS].rstrip() + "…"
-    summary: dict[str, Any] = {
+    # Empty fields are left out: every tool result is re-sent on each model
+    # call, so nulls and {} are pure token cost.
+    summary: dict[str, Any] = _compact({
         "id": str(product.id),
         "name": product.name,
         "description": description,
@@ -45,26 +47,29 @@ def _product_summary(product: Product) -> dict:
         "currency": product.currency,
         "availability": product.availability,
         "has_photo": get_display_image_url(product) is not None,
-        "variants": [
-            {
-                "sku": v.sku,
-                "name": v.value,
-                "variant_type": v.variant_type,
-                "value": v.value,
-                "stock_quantity": v.stock_quantity,
-                "has_photo": bool(v.image_url or v.images),
-                "availability": _variant_available(v),
-                "price": float(v.price_override) if v.price_override is not None else None,
-                "attributes": v.attributes or {},
-            }
-            for v in product.variants
-        ],
-    }
+    })
+    summary["variants"] = [
+        _compact({
+            "sku": v.sku,
+            "variant_type": v.variant_type,
+            "value": v.value,
+            "stock_quantity": v.stock_quantity,
+            "has_photo": bool(v.image_url or v.images),
+            "availability": _variant_available(v),
+            "price": float(v.price_override) if v.price_override is not None else None,
+            "attributes": v.attributes,
+        })
+        for v in product.variants
+    ]
     if product.attributes:
         for key in ("ai_instructions", "material", "fit", "gender"):
             if product.attributes.get(key):
                 summary[key] = product.attributes[key]
     return summary
+
+
+def _compact(fields: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in fields.items() if v is not None and v != {} and v != ""}
 
 
 # A model that never saw a real product UUID this turn (e.g. it's working from a

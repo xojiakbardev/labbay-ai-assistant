@@ -1,7 +1,7 @@
 import datetime as dt
 import uuid
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, false
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,6 +23,9 @@ class Customer(Base, UUIDPk):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The owner's own AI tester (app/ai/router.py): kept out of the inbox,
+    # the leads and anything measured from them.
+    is_sandbox: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     # Last time the Instagram profile lookup ran, successful or not — a profile
     # Meta won't return is not re-requested on every message/page load.
     profile_fetched_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

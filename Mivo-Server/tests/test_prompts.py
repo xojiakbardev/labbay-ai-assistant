@@ -25,5 +25,6 @@ def test_lexicon_has_every_list_the_code_reads() -> None:
     for key in (
         "discount_terms", "price_lowering_terms", "budget_terms", "product_hints", "no_grounding_needed",
         "cyrillic_to_latin", "synonyms", "currency_aliases", "uz_phone_prefixes", "embedded_attributes",
+        "language_markers", "price_arithmetic",
     ):
         assert lexicon[key], key

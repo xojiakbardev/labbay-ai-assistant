@@ -38,29 +38,33 @@ from app.leads.scoring import COLD_MAX_SCORE, WARM_MAX_SCORE
 from app.core.config import get_settings
 from app import prompts
 
+_LANGUAGE_MARKERS = prompts.lexicon()["language_markers"]
+
+
+def _has_word(text: str, words: list[str]) -> bool:
+    return any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", text) for w in words)
+
 
 def detect_preferred_language(
     business_language: str | None = None,
     text_samples: list[str] | None = None,
 ) -> str:
-    """Detects 'uz', 'ru', or 'en' based on recent conversation text and business language.
-    Prevents accidentally defaulting to Russian when business has 'o'zbek, rus, ingliz'.
-    """
+    """'uz', 'ru' or 'en' from what the customer wrote (pass their messages
+    only — our own replies would echo our language back), else the business's
+    language. Uzbek written in Cyrillic is Uzbek, not Russian."""
     if text_samples:
         combined = " ".join(t for t in text_samples if t).lower()
-        has_cyrillic = bool(re.search(r"[а-яё]", combined))
-        uzbek_markers = [
-            "salom", "assalomu", "rahmat", "qanaqa", "qancha", "bor mi", "bormi",
-            "kerak", "narxi", "xa", "ha", "yoq", "yo'q", "bo'ladi", "boladi",
-            "siz", "kepka", "yordam", "otding", "tilidan", "tushundim", "aka", "uka",
-        ]
-        has_uzbek = any(re.search(rf"\b{re.escape(m)}\b", combined) for m in uzbek_markers) or "o'" in combined or "g'" in combined or "oʻ" in combined or "gʻ" in combined
-        if has_uzbek and not has_cyrillic:
-            return "uz"
-        if has_cyrillic:
+        if re.search(r"[а-яёўқғҳ]", combined):
+            if any(ch in combined for ch in _LANGUAGE_MARKERS["uz_cyrillic_letters"]) or _has_word(
+                combined, _LANGUAGE_MARKERS["uz_cyrillic"]
+            ):
+                return "uz"
             return "ru"
-        english_markers = ["hello", "hi", "price", "how much", "discount", "thank you", "thanks", "do you have", "what", "please"]
-        if any(re.search(rf"\b{re.escape(m)}\b", combined) for m in english_markers):
+        if _has_word(combined, _LANGUAGE_MARKERS["uz"]) or any(
+            f in combined for f in _LANGUAGE_MARKERS["uz_fragments"]
+        ):
+            return "uz"
+        if _has_word(combined, _LANGUAGE_MARKERS["en"]):
             return "en"
 
     biz_lang = (business_language or "").strip().lower()
@@ -322,9 +326,10 @@ async def run_turn(
             or getattr(latest, "message_type", None) == "image"
         )
     )
+    # The customer's own words pick the reply language (ready-made replies).
     recent_texts = [
-        getattr(m, "content", "") for m in (history[-3:] if history else []) if getattr(m, "content", None)
-    ]
+        m.content for m in history[-8:] if getattr(m, "sender_type", None) == "customer" and getattr(m, "content", None)
+    ][-3:]
     # Did the customer, since our last message, share something the model
     # can't see (a Reel with no caption)? Then a reply describing it is made up.
     unseen_media = False
@@ -588,10 +593,7 @@ def _apply_reply_guards(
         _catalog_prices(escalation_state, working_state),
     ):
         guard_reply, reason = "discount_unconfirmed", "AI tasdiqlanmagan chegirma aytmoqchi bo'ldi — tekshirib javob bering."
-    elif _contains_unverified_price(
-        reply,
-        _allowed_prices(escalation_state, working_state, business, customer_texts or []),
-    ):
+    elif find_unverified_prices(reply, escalation_state, working_state, business, customer_texts or []):
         guard_reply, reason = "price_unconfirmed", "AI katalogda yo'q narx aytmoqchi bo'ldi — narxni tasdiqlab javob bering."
 
     if guard_reply is not None:
@@ -727,6 +729,8 @@ _MILLION_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(?:mln|million|млн)
 _BARE_NUMBER_RE = re.compile(r"(?<![\d.,])(\d{1,3}(?:[  .,]\d{3})+|\d{4,})(?![\d])")
 _GROUP_SPLIT_RE = re.compile(r"[  ]")
 
+_PRICE_TOLERANCE = get_settings().guard_price_tolerance
+
 
 def _parse_amount(digits: str, thousands: bool = False) -> float | None:
     cleaned = re.sub(r"[  .,]", "", digits)
@@ -820,20 +824,43 @@ def _customer_budget_numbers(text: str) -> set[float]:
     return found
 
 
+# What a reply has to say for arithmetic on catalog prices to be legitimate:
+# a quantity ("2 ta", "x3"), a total ("jami"), delivery ("yetkazib berish bilan").
+_ARITHMETIC = prompts.lexicon()["price_arithmetic"]
+_QUANTITY_RE = re.compile(
+    r"(?<![\d.,])(\d{1,2})\s*-?\s*(?:"
+    + "|".join(re.escape(u) for u in sorted(_ARITHMETIC["quantity_units"], key=len, reverse=True))
+    + r")(?!\w)|(?<!\w)x\s*(\d{1,2})(?!\w)",
+    re.IGNORECASE,
+)
+_TOTAL_WORDS = tuple(_ARITHMETIC["total_terms"])
+_DELIVERY_WORDS = tuple(_ARITHMETIC["delivery_terms"])
+_MAX_QUANTITY = 20
+
+
+def _quantities(reply: str) -> set[int]:
+    found = {1}
+    for m in _QUANTITY_RE.finditer(reply):
+        k = int(m.group(1) or m.group(2))
+        if 1 <= k <= _MAX_QUANTITY:
+            found.add(k)
+    return found
+
+
 def _allowed_prices(
     escalation_state: dict,
     working_state: dict | None,
-    business: Business,
+    business: Business | None,
     customer_texts: list[str],
+    reply: str,
 ) -> set[float]:
-    """Every amount the reply may legitimately state: catalog prices returned
-    this turn or recorded earlier, amounts the business itself wrote (delivery
-    fee...) and the active discounts carry (threshold, amount off), the
-    customer's stated budget — and the arithmetic a salesperson does with
-    those: up to 10 pieces, two different items together, the price after a
-    discount, and any of these plus a fee."""
+    """Every amount this reply may legitimately state: catalog and discounted
+    prices, the delivery fee and discount thresholds the shop wrote, the
+    customer's budget — and arithmetic only when the reply says so: a quantity
+    it names ("2 ta"), a total ("jami") of two items, a price plus delivery."""
     catalog = _catalog_prices(escalation_state, working_state)
     discounts = escalation_state.get("active_discounts") or []
+    lowered = reply.lower()
 
     unit_prices = set(catalog)
     discount_amounts: set[float] = set()
@@ -846,35 +873,43 @@ def _allowed_prices(
             unit_prices.update(p - value for p in catalog)
             discount_amounts.add(value)
 
-    fees = _amounts_in(
-        business.delivery_info, business.payment_info, business.discount_policy,
-        business.rules_text, business.description, business.handoff_instructions,
-        *(d.get("description") for d in discounts), *(d.get("conditions") for d in discounts),
-    )
+    # Only amounts the shop wrote with a currency, in the fields that hold fees.
+    delivery_info = getattr(business, "delivery_info", None)
+    fees = set(_quoted_prices(delivery_info)) if isinstance(delivery_info, str) else set()
+    thresholds: set[float] = set()
+    for d in discounts:
+        for text in (d.get("description"), d.get("conditions")):
+            if isinstance(text, str):
+                thresholds.update(_quoted_prices(text))
 
-    totals = {p * k for p in unit_prices for k in range(1, 11)}
-    ordered = sorted(catalog)[:40]
-    totals.update(a + b for i, a in enumerate(ordered) for b in ordered[i + 1 :])
+    totals = {p * k for p in unit_prices for k in _quantities(reply)}
+    if any(word in lowered for word in _TOTAL_WORDS):
+        ordered = sorted(catalog)[:40]
+        totals.update(a + b for i, a in enumerate(ordered) for b in ordered[i + 1 :])
 
-    allowed = totals | fees | discount_amounts
-    allowed.update(t + f for t in totals for f in fees)
+    allowed = totals | fees | thresholds | discount_amounts
+    if any(word in lowered for word in _DELIVERY_WORDS):
+        allowed.update(t + f for t in totals for f in fees)
     for text in customer_texts:
         if isinstance(text, str) and text:
             allowed.update(_customer_budget_numbers(text))
     return allowed
 
 
-_PRICE_TOLERANCE = get_settings().guard_price_tolerance
-
-
-def _contains_unverified_price(reply: str, allowed: set[float]) -> bool:
-    """A price in the reply that no tool result, business setting or customer
-    budget backs up is an invented price. 1% tolerance covers rounding
-    ("779 000" for 779 500)."""
-    for options in _price_readings(reply):
-        if not any(abs(quoted - a) <= max(1.0, a * _PRICE_TOLERANCE) for quoted in options for a in allowed):
-            return True
-    return False
+def find_unverified_prices(
+    reply: str,
+    escalation_state: dict,
+    working_state: dict | None,
+    business: Business | None,
+    customer_texts: list[str],
+) -> list[float]:
+    """Prices in the reply that nothing backs — the runtime guard and the eval
+    check both use this."""
+    allowed = _allowed_prices(escalation_state, working_state, business, customer_texts, reply)
+    return [
+        options[0] for options in _price_readings(reply)
+        if not any(abs(q - a) <= max(1.0, a * _PRICE_TOLERANCE) for q in options for a in allowed)
+    ]
 
 
 def _normalize_for_comparison(text: str) -> str:

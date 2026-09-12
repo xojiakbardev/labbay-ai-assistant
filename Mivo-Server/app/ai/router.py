@@ -110,7 +110,7 @@ async def _get_or_create_sandbox_session(
     from app.customers.service import get_or_create_customer
 
     customer = await get_or_create_customer(
-        db, business.id, ig_scoped_id=f"sandbox_{business.id}", username="sandbox_tester"
+        db, business.id, ig_scoped_id=f"sandbox_{business.id}", username="sandbox_tester", is_sandbox=True
     )
     conversation = await get_or_create_conversation(db, business.id, customer.id)
 

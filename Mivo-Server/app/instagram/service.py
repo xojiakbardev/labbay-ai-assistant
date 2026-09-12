@@ -184,7 +184,7 @@ async def backfill_customer_profiles(db: AsyncSession, meta_client: MetaClient, 
                 InstagramAccount.status == "connected",
                 or_(Customer.username.is_(None), Customer.name.is_(None)),
                 or_(Customer.profile_fetched_at.is_(None), Customer.profile_fetched_at < now - PROFILE_RETRY_AFTER),
-                ~Customer.ig_scoped_id.startswith("sandbox_"),
+                Customer.is_sandbox.is_(False),
             )
             .order_by(Customer.last_seen_at.desc())
             .limit(limit)

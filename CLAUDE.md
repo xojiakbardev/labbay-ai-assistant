@@ -80,7 +80,10 @@ report no drift (that's how the never-migrated `product_variants`/`customers.nam
 columns were found). `asyncio_mode = auto` (pytest.ini): async tests need no
 marker. Because asyncpg connections are bound to the loop that created them, the
 fixtures dispose the engine around each test and do teardown over plain sync
-`psycopg` — keep that pattern when adding fixtures.
+`psycopg` — keep that pattern when adding fixtures. The scheduler is off in tests
+(`SCHEDULER_ENABLED=false`): a lifespan job cut off mid-transaction by a closing
+TestClient left a lock that hung the next TRUNCATE. CI (`.github/workflows/ci.yml`)
+runs the suite, `alembic check`, and the client's typecheck + generate.
 
 ## Backend architecture
 
@@ -168,6 +171,10 @@ rejected), then `app/instagram/pipeline.py` does the rest in two halves:
 - `sweep_events` (scheduler, every 30s) re-drives `failed` events past their
   backoff, orphaned `received` ones, and `processing` ones whose lease expired;
   an expired lease with no attempts left is abandoned with an alert.
+- An event holds one of `WEBHOOK_CONCURRENCY` slots, but gives it (and its DB
+  connection) back during the debounce. On shutdown (uvicorn waits 75 s for running
+  turns) events still in flight go back to `failed`, due now, attempt not counted
+  (`release_interrupted`). `/health` answers 503 when the database doesn't.
 
 Echoes (`is_echo`) run without the conversation lock. One whose id is recorded
 is ours; one that matches a recent outbound row still waiting for its id is ours
@@ -180,6 +187,8 @@ once, when the status changes). Dashboard operator replies do the same
 Instagram-specific logic stays inside `app/instagram/`; everything else sees only
 the neutral conversations/messages/customers domain model. The same pipeline is
 reachable from the dashboard sandbox (`/ai/sandbox/*`) for testing without Instagram.
+Its customer has `is_sandbox` set and stays out of the inbox, the leads list and
+"popular products" (AI cost it runs up still counts — it's real spend).
 
 ### The AI layer (`app/ai/`)
 
@@ -267,7 +276,13 @@ follow from that:
   (`replies.json`) and word lists (`lexicon.json`) are files in `app/prompts/`, loaded by
   `app.prompts.load/render/lexicon`; a business overrides reply texts from the AI settings
   page (`businesses.reply_texts`). Constants left in code are data contracts: status/event
-  names, token types, regexes, security lists, protocol URLs.
+  names, token types, regexes, security lists, protocol URLs. Settings are bounded
+  (positive counts, fractions in 0..1) and cross-checked at startup
+  (`_refuse_contradictory_tuning`): a bad `.env` stops the app, not a conversation.
+- The price guard (`find_unverified_prices`) is also the eval's price check. It
+  allows catalog/variant prices, discounted ones, the delivery fee and discount
+  thresholds, the customer's stated budget — and arithmetic only when the reply
+  says so (a quantity, "jami", delivery; words in `lexicon.json` `price_arithmetic`).
 - `closing.py` — knowing when the conversation is over. A short, plain-text,
   question-free burst after our last message ("hop", "ok", 👍) goes to a small
   structured call (`ClosingDecision`): if the model says it's finished, nothing is

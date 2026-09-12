@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +64,8 @@ _RETRY_BACKOFF = tuple(_settings.webhook_retry_backoff_seconds)
 _ORPHAN_AFTER = dt.timedelta(seconds=_settings.webhook_orphan_after_seconds)
 # Each event holds up to two pooled connections; this bounds the burst.
 _PROCESS_SLOTS = asyncio.Semaphore(_settings.webhook_concurrency)
+# Events this process claimed and hasn't finished.
+_IN_FLIGHT: set[uuid.UUID] = set()
 
 # Conversation statuses under which the AI answers. Everything else is a human
 # handoff state: messages are recorded for the owner, the AI stays silent.
@@ -275,35 +277,89 @@ async def process_event(
 ) -> None:
     """Runs one event in its own session. Never raises: failures are retried with
     backoff, then abandoned with an owner alert."""
-    async with _PROCESS_SLOTS, async_session_factory() as db:
+    async with _Slot() as slot, async_session_factory() as db:
         event = await _claim(db, event_id)
         if event is None:
             return  # already done, another worker holds it, or out of attempts
-        # Read before anything can expire the object: after a rollback,
-        # touching an attribute would try a lazy load, which async SQLAlchemy
-        # refuses — and the failure handler itself would crash.
-        attempts = event.attempts
-        kind = event.payload.get("kind")
-        try:
-            if kind == "echo":
-                await _process_echo(db, event)
-            else:
-                await _process_customer_message(db, event, provider, meta_client)
-        except Exception as exc:  # noqa: BLE001 — recorded and retried, see docstring
-            logger.exception("[pipeline] event %s failed (attempt %s)", event_id, attempts)
-            try:
-                await db.rollback()
-                await _record_failure(db, event_id, exc)
-            except Exception:  # noqa: BLE001 — never let the handler take the worker down
-                logger.exception("[pipeline] could not record the failure of event %s", event_id)
-            return
+        _IN_FLIGHT.add(event_id)
+        await _run_claimed(db, event, slot, provider, meta_client)
+        # Not reached when the task is cancelled (shutdown): the id stays for
+        # release_interrupted().
+        _IN_FLIGHT.discard(event_id)
 
+
+async def _run_claimed(db: AsyncSession, event: WebhookEvent, slot: "_Slot", provider, meta_client) -> None:
+    # Read before anything can expire the object: after a rollback, touching
+    # an attribute would try a lazy load, which async SQLAlchemy refuses — and
+    # the failure handler itself would crash.
+    event_id = event.id
+    attempts = event.attempts
+    kind = event.payload.get("kind")
+    try:
+        if kind == "echo":
+            await _process_echo(db, event)
+        else:
+            await _process_customer_message(db, event, slot, provider, meta_client)
+    except Exception as exc:  # noqa: BLE001 — recorded and retried, see process_event
+        logger.exception("[pipeline] event %s failed (attempt %s)", event_id, attempts)
+        try:
+            await db.rollback()
+            await _record_failure(db, event_id, exc)
+        except Exception:  # noqa: BLE001 — never let the handler take the worker down
+            logger.exception("[pipeline] could not record the failure of event %s", event_id)
+        return
+
+    await db.execute(
+        update(WebhookEvent)
+        .where(WebhookEvent.id == event_id)
+        .values(status=EVENT_PROCESSED, processed_at=dt.datetime.now(dt.timezone.utc), last_error=None)
+    )
+    await db.commit()
+
+
+class _Slot:
+    """One of _PROCESS_SLOTS, given back while the event only waits (the
+    debounce), so a burst of typists doesn't starve everyone else."""
+
+    def __init__(self) -> None:
+        self.held = False
+
+    async def __aenter__(self) -> "_Slot":
+        await _PROCESS_SLOTS.acquire()
+        self.held = True
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        if self.held:
+            self.held = False
+            _PROCESS_SLOTS.release()
+
+    async def sleep(self, seconds: float) -> None:
+        await self.__aexit__()
+        await asyncio.sleep(seconds)
+        await self.__aenter__()
+
+
+async def release_interrupted() -> None:
+    """On shutdown: events cut off mid-turn go straight back to the queue
+    instead of waiting out their lease, and the attempt doesn't count."""
+    if not _IN_FLIGHT:
+        return
+    ids = list(_IN_FLIGHT)
+    _IN_FLIGHT.clear()
+    async with async_session_factory() as db:
         await db.execute(
             update(WebhookEvent)
-            .where(WebhookEvent.id == event_id)
-            .values(status=EVENT_PROCESSED, processed_at=dt.datetime.now(dt.timezone.utc), last_error=None)
+            .where(WebhookEvent.id.in_(ids), WebhookEvent.status == EVENT_PROCESSING)
+            .values(
+                status=EVENT_FAILED,
+                next_attempt_at=dt.datetime.now(dt.timezone.utc),
+                attempts=func.greatest(WebhookEvent.attempts - 1, 0),
+                last_error="interrupted by shutdown",
+            )
         )
         await db.commit()
+    logger.info("[pipeline] handed %d interrupted event(s) back to the queue", len(ids))
 
 
 async def _record_failure(db: AsyncSession, event_id: uuid.UUID, exc: Exception) -> None:
@@ -374,8 +430,11 @@ async def _newer_customer_message_exists(db: AsyncSession, conversation: Convers
     return newer is not None
 
 
-def _language(business: Business, texts: list[str]) -> str:
-    return detect_preferred_language(business.language, texts)
+def _language(business: Business, recent: list[Message]) -> str:
+    """The customer's language, from their own messages."""
+    return detect_preferred_language(
+        business.language, [m.content for m in recent if m.sender_type == "customer" and m.content]
+    )
 
 
 class _Context:
@@ -422,6 +481,7 @@ class _Context:
 async def _process_customer_message(
     db: AsyncSession,
     event: WebhookEvent,
+    slot: _Slot,
     provider: LLMProvider | Callable[[], LLMProvider],
     meta_client: MetaClient,
 ) -> None:
@@ -460,8 +520,10 @@ async def _process_customer_message(
         return
 
     # Debounce: if they're still typing, the newest message's event replies.
+    # The connection and the slot are given back while waiting.
+    await db.commit()
     if DEBOUNCE_SECONDS > 0:
-        await asyncio.sleep(DEBOUNCE_SECONDS)
+        await slot.sleep(DEBOUNCE_SECONDS)
     if await _newer_customer_message_exists(db, conversation, message):
         return
     # End the transaction before waiting: a waiter should hold one pooled
@@ -624,8 +686,7 @@ async def _without_ai(db: AsyncSession, ctx: _Context) -> None:
     await ctx.reload(db)
     if ai_may_reply(ctx.business) and ctx.conversation.status in _HANDOFF_STATUSES:
         recent = await get_recent_messages(db, ctx.conversation_id, limit=4)
-        lang = _language(ctx.business, [m.content for m in recent if m.content])
-        await ctx.send_new(db, reply_text(ctx.business, "phone_received", lang))
+        await ctx.send_new(db, reply_text(ctx.business, "phone_received", _language(ctx.business, recent)))
 
 
 async def _hand_off(db: AsyncSession, ctx: _Context, *, alert_type: str, title: str, reason: str) -> None:
@@ -640,8 +701,7 @@ async def _hand_off(db: AsyncSession, ctx: _Context, *, alert_type: str, title: 
     )
     await ctx.reload(db)
     recent = await get_recent_messages(db, ctx.conversation_id, limit=4)
-    lang = _language(ctx.business, [m.content for m in recent if m.content])
-    await ctx.send_new(db, reply_text(ctx.business, "handoff", lang))
+    await ctx.send_new(db, reply_text(ctx.business, "handoff", _language(ctx.business, recent)))
 
 
 async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider) -> None:

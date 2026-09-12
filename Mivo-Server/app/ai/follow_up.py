@@ -64,6 +64,9 @@ async def _candidate_ids(db: AsyncSession, now: dt.datetime) -> list[uuid.UUID]:
             Conversation.status == "ai_active",
             Lead.status.in_(("warm", "hot")),
             Conversation.last_message_at <= now - _FOLLOW_UP_AFTER,
+            # Implied by the window check below; lets the planner skip every
+            # long-dead conversation before running the subqueries.
+            Conversation.last_message_at >= now - _MESSAGING_WINDOW,
             _last_sender_type() == "ai",
             last_customer_at >= now - _MESSAGING_WINDOW,
             or_(Conversation.follow_up_sent_at.is_(None), Conversation.follow_up_sent_at < last_customer_at),
@@ -127,7 +130,9 @@ async def _follow_up_one(db: AsyncSession, conversation_id: uuid.UUID, client: M
             (p.get("name") for p in (lead.interested_products or []) if isinstance(p, dict) and p.get("name")),
             None,
         )
-        lang = detect_preferred_language(business.language, [m.content for m in recent if m.content])
+        lang = detect_preferred_language(
+            business.language, [m.content for m in recent if m.sender_type == "customer" and m.content]
+        )
         text = (
             reply_text(business, "follow_up", lang, product=product) if product
             else reply_text(business, "follow_up_generic", lang)

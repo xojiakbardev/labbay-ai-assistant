@@ -1,6 +1,6 @@
 import datetime as dt
 import uuid
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,6 +37,11 @@ class AiUsageLog(Base):
     place the raw token/cost numbers exist; see app/ai/provider/openrouter.py."""
 
     __tablename__ = "ai_usage_logs"
+    # The per-turn spend check (app/ai/limits.py) sums one business's day
+    # straight from the index.
+    __table_args__ = (
+        Index("ix_ai_usage_logs_business_created", "business_id", "created_at", postgresql_include=["cost_usd"]),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     business_id: Mapped[uuid.UUID | None] = mapped_column(

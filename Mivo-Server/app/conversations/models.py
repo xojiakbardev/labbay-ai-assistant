@@ -80,6 +80,16 @@ class Conversation(Base, UUIDPk):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# The inbox order (app/conversations/router.py:list_conversations), read
+# straight off the index a page at a time.
+Index(
+    "ix_conversations_business_recent",
+    Conversation.business_id,
+    Conversation.last_message_at.desc().nullslast(),
+    Conversation.id,
+)
+
+
 class Message(Base, UUIDPk):
     __tablename__ = "messages"
     __table_args__ = (

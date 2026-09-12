@@ -15,8 +15,9 @@ outstanding, what the customer pushed back on — come from the analyst pass.
 """
 import datetime as dt
 import uuid
-from typing import Any
-from app.core.config import get_settings
+from typing import Any, get_args
+
+from app.core.config import DiscoverySlot, get_settings
 
 # Enough to keep the current thread of the sale coherent without turning the
 # system prompt into a second catalog.
@@ -30,11 +31,11 @@ STAGES = ("greeting", "discovery", "recommendation", "objection", "closing", "ha
 # so the AI can see what it's still missing instead of waiting for the customer
 # to volunteer it — a customer who has to supply all of this unprompted is
 # writing a search query, not having a conversation.
-DISCOVERY_SLOTS = ("use_case", "size", "color", "budget", "recipient")
+DISCOVERY_SLOTS = get_args(DiscoverySlot)
 
 # The subset actually worth chasing. Colour and who it's for are useful when
 # offered but not worth interrogating anyone about.
-ESSENTIAL_SLOTS = tuple(s for s in get_settings().essential_slots if s in DISCOVERY_SLOTS)
+ESSENTIAL_SLOTS = tuple(get_settings().essential_slots)
 
 
 def fact_snapshot(product_summary: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +187,16 @@ def _inert(value: Any, limit: int = 120) -> str:
     return '"' + cleaned.replace('"', "'") + '"'
 
 
+def _price(value: Any) -> str:
+    """1250000 -> "1 250 000" (never "1.25e+06"); cents kept when present."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{number:,.0f}" if number.is_integer() else f"{number:,.2f}"
+    return text.replace(",", " ")
+
+
 def render_state_block(state: dict[str, Any] | None) -> str:
     """Renders the state for the system prompt. Empty string when there's
     nothing worth saying, so a brand-new conversation carries no dead weight."""
@@ -213,10 +224,10 @@ def render_state_block(state: dict[str, Any] | None) -> str:
             price = snapshot.get("price")
             if price is not None:
                 currency = snapshot.get("currency") or ""
-                bits.append(f"{price:g} {currency}".strip())
+                bits.append(f"{_price(price)} {currency}".strip())
             variant_prices = snapshot.get("variant_prices")
             if variant_prices:
-                bits.append("some variants: " + ", ".join(f"{p:g}" for p in variant_prices))
+                bits.append("some variants: " + ", ".join(_price(p) for p in variant_prices))
             if not snapshot.get("available", True):
                 bits.append("was out of stock")
             in_stock = snapshot.get("in_stock")

@@ -63,6 +63,14 @@ def test_state_records_products_and_the_one_in_focus() -> None:
     assert "43" not in block.split("available:")[1]
 
 
+def test_big_prices_render_as_plain_numbers() -> None:
+    snapshot = fact_snapshot(_summary(price=1250000.0, variants=[{"value": "XL", "availability": True, "price": 1400000.5}]))
+    block = render_state_block(update_state(None, product_facts={PID: snapshot}))
+    assert "1 250 000 so'm" in block
+    assert "some variants: 1 400 000.50" in block
+    assert "e+" not in block
+
+
 def test_focus_must_be_a_product_that_was_actually_looked_up() -> None:
     """The model proposes interested_product_ids; anything not backed by a real
     tool result this conversation is dropped rather than trusted."""

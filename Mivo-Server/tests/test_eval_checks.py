@@ -18,7 +18,6 @@ from evals.checks import (
     check_no_unverified_discount,
     check_prices_are_grounded,
     check_shape,
-    price_like_numbers,
     run_checks,
     summarise,
 )
@@ -36,12 +35,6 @@ def _ctx(**over) -> CheckContext:
 # --- price grounding: the check that protects real money -------------------
 
 
-def test_price_like_numbers_handles_spaced_thousands() -> None:
-    assert price_like_numbers("Narxi 780 000 so'm") == {780000.0}
-    # Sizes, quantities and small numbers are not prices.
-    assert price_like_numbers("42 razmer, 3 dona bor") == set()
-
-
 def test_invented_price_is_caught() -> None:
     findings = check_prices_are_grounded("Nike Air Max — 690 000 so'm.", _ctx())
     assert [f.check for f in findings] == ["invented_price"]
@@ -49,7 +42,7 @@ def test_invented_price_is_caught() -> None:
 
 
 def test_real_price_passes_however_it_is_written() -> None:
-    for reply in ("Narxi 780000 so'm", "Narxi 780 000 so'm", "780 000 so'mdan"):
+    for reply in ("Narxi 780000 so'm", "Narxi 780 000 so'm", "780 000 so'mdan", "2 tasi 1 560 000 so'm"):
         assert check_prices_are_grounded(reply, _ctx()) == []
 
 

@@ -512,7 +512,7 @@ class OpenRouterProvider(LLMProvider):
                         result = {"error": f"Invalid JSON arguments: {exc}. Re-call with a valid JSON object."}
                     else:
                         result = await tool_executor(name, arguments)
-                conversation.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, default=str)})
+                conversation.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, default=str, ensure_ascii=False, separators=(",", ":"))})
 
         return conversation
 

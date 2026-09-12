@@ -27,6 +27,9 @@ os.environ["EMBEDDING_API_KEY"] = ""
 os.environ.setdefault("OPENROUTER_API_KEY", "test-openrouter-key")
 os.environ["STT_PROVIDER"] = ""
 os.environ["FRONTEND_URL"] = "https://app.mivo.test"
+# A job the app's lifespan starts can be cut off mid-transaction when a
+# TestClient closes its loop, leaving a lock the next test's TRUNCATE waits on.
+os.environ["SCHEDULER_ENABLED"] = "false"
 
 import datetime as dt
 import hashlib
