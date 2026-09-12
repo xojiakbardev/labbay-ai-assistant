@@ -23,6 +23,11 @@ MAX_INTERESTED_PRODUCTS = get_settings().lead_max_interested_products
 PHONE_LOOKBACK_MESSAGES = get_settings().lead_phone_lookback_messages
 
 
+def _by_language(uz: str | None, ru: str | None, en: str | None) -> dict[str, str]:
+    """{lang: text} of the languages actually written."""
+    return {lang: text.strip() for lang, text in (("uz", uz), ("ru", ru), ("en", en)) if text and text.strip()}
+
+
 async def _validate_interested_products(
     db: AsyncSession, business_id: uuid.UUID, product_ids: list[str]
 ) -> list[dict]:
@@ -147,17 +152,15 @@ async def apply_qualification(
     lead.status = final_status
     lead.score = result.lead_score
     lead.qualification_reason = result.qualification_reason
+    # Replaced every turn, even with nothing: an older translation next to a
+    # new score would explain the wrong thing.
+    lead.qualification_reasons = _by_language(result.reason_uz, result.reason_ru, result.reason_en)
 
     # Only what the analyst actually wrote. Missing languages stay missing —
     # the dashboard shows the Uzbek summary instead of an untranslated copy
-    # pretending to be Russian or English. The qualification reason is the
-    # analyst's own reasoning (often in English), not an owner-facing summary:
-    # a turn without summaries leaves the previous ones in place.
-    summaries = {
-        lang: text.strip()
-        for lang, text in (("uz", result.summary_uz), ("ru", result.summary_ru), ("en", result.summary_en))
-        if text and text.strip()
-    }
+    # pretending to be Russian or English. A turn without summaries leaves the
+    # previous ones in place.
+    summaries = _by_language(result.summary_uz, result.summary_ru, result.summary_en)
     if summaries:
         lead.summaries = summaries
         if "uz" in summaries:
@@ -231,6 +234,7 @@ async def capture_phone_without_ai_turn(
             interested_products=[],
             summary=captured["uz"],
             qualification_reason=captured["uz"],
+            qualification_reasons=captured,
             summaries=captured,
         )
         db.add(lead)

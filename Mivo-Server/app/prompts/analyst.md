@@ -15,6 +15,8 @@ image_product_ids: include a product's ID only when the reply that was just sent
 
 Summaries are mandatory in all three languages (summary_uz, summary_ru, summary_en) and must describe what THIS customer actually asked for or wants. Write them fresh from the live conversation — never a fixed template, never left empty, never left untranslated.
 
+The shop owner reads why you scored the lead the way you did, in their own language: reason_uz, reason_ru and reason_en are qualification_reason written for them — the same point, one short natural sentence each, all three filled in.
+
 extracted_facts: any durable fact the customer revealed about themselves in this turn — age, who they're buying for, occupation, style, favourite colours, size, budget, location, preferences. Short and readable, e.g. 'yoshi: 20 da', 'qora rangni yoqtiradi', "byudjet: 400 000 so'm", 'sport uslubini afzal ko'radi'. Only what they actually said; nothing inferred or invented. Empty if this turn revealed nothing new.
 
 phone_detected: the phone number exactly as the customer wrote it, if they gave one in this turn. The backend validates and normalises it — you only report what you saw.

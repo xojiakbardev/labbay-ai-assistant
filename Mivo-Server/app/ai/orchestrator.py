@@ -122,6 +122,17 @@ class TurnAnalysis(BaseModel):
             "you've exchanged or how promising it looked a few turns ago."
         ),
     )
+    # The reason above is the model's own reasoning; these are the same point
+    # for the shop owner, in each dashboard language.
+    reason_uz: str | None = Field(
+        default=None, description="qualification_reason for the shop owner, in Uzbek: the same point, one short sentence."
+    )
+    reason_ru: str | None = Field(
+        default=None, description="qualification_reason for the shop owner, in Russian: the same point, one short sentence."
+    )
+    reason_en: str | None = Field(
+        default=None, description="qualification_reason for the shop owner, in English: the same point, one short sentence."
+    )
     stage: str | None = Field(
         default=None,
         description=(

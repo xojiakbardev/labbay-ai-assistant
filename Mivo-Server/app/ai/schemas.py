@@ -68,6 +68,7 @@ class SandboxTurnResponse(BaseModel):
     lead_status: str
     lead_score: int
     qualification_reason: str
+    qualification_reasons: dict[str, str] = {}
     phone_detected: str | None = None
     extracted_facts: list[str] = []
     known_facts: list[dict] = []
@@ -88,6 +89,7 @@ class SandboxStateResponse(BaseModel):
     lead_score: int | None = None
     phone: str | None = None
     qualification_reason: str | None = None
+    qualification_reasons: dict[str, str] = {}
     known_facts: list[dict] = []
     interested_products: list[SandboxProductOut] = []
 

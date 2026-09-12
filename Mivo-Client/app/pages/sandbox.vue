@@ -26,7 +26,7 @@ import type { SandboxMessage, SandboxProduct, SandboxState } from "~/types/api";
 definePageMeta({ layout: "dashboard" });
 
 const api = useMivoApi();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 
 const messages = ref<SandboxMessage[]>([]);
 const inputMessage = ref("");
@@ -43,6 +43,11 @@ const leadStatus = ref<"cold" | "warm" | "hot" | null>(null);
 const leadScore = ref<number | null>(null);
 const phoneDetected = ref<string | null>(null);
 const qualificationReason = ref<string | null>(null);
+// The reason in the viewer's language, else Uzbek, else the model's own.
+const qualificationReasons = ref<Record<string, string>>({});
+const shownReason = computed(
+  () => qualificationReasons.value[locale.value] || qualificationReasons.value.uz || qualificationReason.value
+);
 const knownFacts = ref<{ text: string; noted_at: string }[]>([]);
 const interestedProducts = ref<SandboxProduct[]>([]);
 const executedTools = ref<{ name: string; arguments: Record<string, any> }[]>([]);
@@ -127,6 +132,7 @@ async function loadSandboxState() {
     leadScore.value = state.lead_score;
     phoneDetected.value = state.phone;
     qualificationReason.value = state.qualification_reason;
+    qualificationReasons.value = state.qualification_reasons || {};
     knownFacts.value = state.known_facts || [];
     interestedProducts.value = state.interested_products || [];
     await nextTick();
@@ -176,6 +182,7 @@ async function onSendMessage(quickText?: string) {
     leadScore.value = res.lead_score;
     phoneDetected.value = res.phone_detected ?? null;
     qualificationReason.value = res.qualification_reason;
+    qualificationReasons.value = res.qualification_reasons || {};
     knownFacts.value = res.known_facts || [];
     interestedProducts.value = res.interested_products || [];
     executedTools.value = res.executed_tools || [];
@@ -208,6 +215,7 @@ async function onResetSandbox() {
     leadScore.value = null;
     phoneDetected.value = null;
     qualificationReason.value = null;
+    qualificationReasons.value = {};
     knownFacts.value = [];
     interestedProducts.value = [];
     executedTools.value = [];
@@ -563,7 +571,7 @@ onMounted(() => {
             <div class="space-y-1">
               <span class="text-xs font-semibold text-muted-foreground">{{ t("sandbox.reasoning") }}</span>
               <p class="text-sm text-foreground bg-muted/20 p-2.5 rounded-lg border border-border/50 leading-relaxed">
-                {{ qualificationReason || t("sandbox.analyzing") }}
+                {{ shownReason || t("sandbox.analyzing") }}
               </p>
             </div>
           </CardContent>

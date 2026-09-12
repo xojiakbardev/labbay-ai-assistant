@@ -126,7 +126,7 @@ const filteredLeads = computed(() => {
     result = result.filter((l) => {
       const username = (l.customer_username || "").toLowerCase();
       const phone = (l.phone || "").toLowerCase();
-      const reason = (l.qualification_reason || "").toLowerCase();
+      const reason = [l.qualification_reason, ...Object.values(l.qualification_reasons || {})].join(" ").toLowerCase();
       const summary = (l.summary || "").toLowerCase();
       const products = (l.interested_products || []).map((p) => (p.name || "").toLowerCase()).join(" ");
       return (
@@ -162,7 +162,8 @@ function formatAiReason(lead: Lead | null | undefined): string {
   if (!lead) return "";
   // `||`, not `??`: an empty string is "not written" too.
   const reason =
-    lead.summaries?.[locale.value] || lead.summaries?.uz || lead.summary || lead.qualification_reason;
+    lead.summaries?.[locale.value] || lead.summaries?.uz || lead.summary ||
+    lead.qualification_reasons?.[locale.value] || lead.qualification_reasons?.uz || lead.qualification_reason;
   if (!reason) return t("leads.reasonAnalyzing");
   // Fixed English reasons the backend writes for two special cases.
   if (reason.includes("initiated conversation with a general greeting")) return t("leads.reasonGreeting");

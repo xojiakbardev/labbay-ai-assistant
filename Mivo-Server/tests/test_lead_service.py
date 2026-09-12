@@ -134,6 +134,23 @@ async def test_summaries_are_only_what_the_analyst_wrote(db_session) -> None:
     assert lead.summaries == {"uz": "Qora hoodie so'radi", "en": "Asked for a black hoodie"}
 
 
+async def test_the_reason_is_kept_per_language_and_replaced_each_turn(db_session) -> None:
+    business, customer, conversation = await _seed(db_session)
+    lead, _ = await apply_qualification(
+        db_session, business.id, customer.id, conversation.id,
+        _result(lead_score=40, qualification_reason="Asked the price of a hoodie.",
+                reason_uz="Hoodie narxini so'radi.", reason_ru="Спросил цену худи.", reason_en="Asked the hoodie's price."),
+    )
+    assert lead.qualification_reasons == {
+        "uz": "Hoodie narxini so'radi.", "ru": "Спросил цену худи.", "en": "Asked the hoodie's price.",
+    }
+    # A later turn without translations must not leave the old ones beside a new reason.
+    lead, _ = await apply_qualification(
+        db_session, business.id, customer.id, conversation.id, _result(lead_score=5, qualification_reason="Went quiet."),
+    )
+    assert (lead.qualification_reason, lead.qualification_reasons) == ("Went quiet.", {})
+
+
 async def test_hallucinated_phone_text_is_ignored(db_session) -> None:
     business, customer, conversation = await _seed(db_session)
     lead, became_hot = await apply_qualification(

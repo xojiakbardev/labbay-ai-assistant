@@ -144,6 +144,8 @@ export interface Lead {
   interested_products: { id: string; name: string }[];
   summary: string | null;
   qualification_reason: string | null;
+  // The same reason for the owner, per language (only those written).
+  qualification_reasons?: Record<string, string>;
   // Only the locales the AI actually wrote (uz always, ru/en maybe).
   summaries?: Record<string, string> | null;
   hot_notified_at: string | null;
@@ -379,6 +381,7 @@ export interface SandboxTurnResponse {
   lead_status: "cold" | "warm" | "hot";
   lead_score: number;
   qualification_reason: string;
+  qualification_reasons?: Record<string, string>;
   phone_detected?: string | null;
   extracted_facts: string[];
   known_facts: { text: string; noted_at: string }[];
@@ -399,6 +402,7 @@ export interface SandboxState {
   lead_score: number | null;
   phone: string | null;
   qualification_reason: string | null;
+  qualification_reasons?: Record<string, string>;
   known_facts: { text: string; noted_at: string }[];
   interested_products: SandboxProduct[];
 }

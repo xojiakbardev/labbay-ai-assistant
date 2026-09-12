@@ -218,6 +218,7 @@ async def get_sandbox_state(
         lead_score=lead.score if lead else None,
         phone=lead.phone if lead else None,
         qualification_reason=lead.qualification_reason if lead else None,
+        qualification_reasons=(lead.qualification_reasons or {}) if lead else {},
         known_facts=lead.known_facts if lead and lead.known_facts else [],
         interested_products=interested_products,
     )
@@ -270,6 +271,7 @@ async def post_sandbox_message(
                 lead_status=lead.status if lead else "cold",
                 lead_score=lead.score if lead else 0,
                 qualification_reason=(lead.qualification_reason or "") if lead else "",
+                qualification_reasons=(lead.qualification_reasons or {}) if lead else {},
                 phone_detected=lead.phone if lead else None,
                 known_facts=lead.known_facts if lead and lead.known_facts else [],
                 messages=[
@@ -359,6 +361,10 @@ async def post_sandbox_message(
         lead_status=turn_result.lead_status,
         lead_score=turn_result.lead_score,
         qualification_reason=turn_result.qualification_reason,
+        qualification_reasons={
+            lang: text for lang, text in
+            (("uz", turn_result.reason_uz), ("ru", turn_result.reason_ru), ("en", turn_result.reason_en)) if text
+        },
         phone_detected=turn_result.phone_detected,
         extracted_facts=turn_result.extracted_facts or [],
         known_facts=lead.known_facts if lead and lead.known_facts else [],

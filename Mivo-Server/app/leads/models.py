@@ -33,6 +33,8 @@ class Lead(Base, UUIDPk, TimestampMixin):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     qualification_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     summaries: Mapped[dict | None] = mapped_column(JSONB, default=dict, server_default="{}", nullable=True)
+    # qualification_reason for the owner, {lang: text}, from the same turn.
+    qualification_reasons: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
     known_facts: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]", nullable=False)
 
     # Set on HOT transition; gates one-time Telegram notification per HOT event.

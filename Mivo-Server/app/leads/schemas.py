@@ -18,6 +18,9 @@ class LeadOut(BaseModel):
     interested_products: list
     summary: str | None
     qualification_reason: str | None
+    # The reason for the owner, {lang: text}; missing languages fall back to
+    # qualification_reason.
+    qualification_reasons: dict = {}
     summaries: dict | None = None
     hot_notified_at: dt.datetime | None
     created_at: dt.datetime
