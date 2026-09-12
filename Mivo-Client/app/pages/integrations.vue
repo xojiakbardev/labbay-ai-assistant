@@ -212,15 +212,43 @@ function stopTelegramCountdown() {
   }
 }
 
+// While a link is waiting, the status is re-checked every few seconds, so the
+// card turns "Connected" as soon as the owner presses Start in Telegram —
+// no page reload needed.
+const TELEGRAM_CHECK_EVERY_S = 4;
+let telegramCheckInFlight = false;
+
+async function checkTelegramConnected() {
+  if (telegramCheckInFlight) return;
+  telegramCheckInFlight = true;
+  try {
+    const status = await api.getTelegramStatus();
+    if (status.connected && telegramLink.value) {
+      stopTelegramCountdown();
+      telegramLink.value = null;
+      isTelegramConnected.value = true;
+      telegramUsername.value = status.username ?? null;
+    }
+  } catch (err) {
+    // The next tick asks again; the link itself still works.
+    console.error("Failed to re-check Telegram status", err);
+  } finally {
+    telegramCheckInFlight = false;
+  }
+}
+
 function startTelegramCountdown(expiresAt: string) {
   stopTelegramCountdown();
+  let ticks = 0;
   const tick = () => {
     const secs = Math.round((new Date(expiresAt).getTime() - Date.now()) / 1000);
     telegramSecondsLeft.value = Math.max(secs, 0);
     if (secs <= 0) {
       stopTelegramCountdown();
       telegramLink.value = null; // token actually expired server-side — back to a plain "connect" state
+      return;
     }
+    if (ticks++ % TELEGRAM_CHECK_EVERY_S === TELEGRAM_CHECK_EVERY_S - 1) checkTelegramConnected();
   };
   tick();
   telegramTimer = setInterval(tick, 1000);
@@ -410,22 +438,29 @@ async function onDisconnectTelegram() {
             </div>
           </div>
 
-          <div v-else-if="telegramLink" class="bg-muted/50 border border-dashed border-primary/50 p-3 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center">
-            <div class="flex items-center justify-between mb-1">
-              <p class="text-xs font-semibold text-foreground truncate">{{ t("integrations.stepFinal") }}</p>
-              <span class="inline-flex items-center gap-1 text-[11px] font-mono font-semibold text-muted-foreground shrink-0" :title="t('integrations.linkExpiresIn')">
-                <Clock :size="11" /> {{ telegramCountdownLabel }}
+          <div v-else-if="telegramLink" class="bg-muted/50 border border-dashed border-primary/50 p-3 rounded-xl mb-4 min-h-[66px] flex flex-col justify-center gap-1.5">
+            <div class="flex items-start justify-between gap-2">
+              <p class="text-sm font-medium text-foreground">{{ t("integrations.stepFinal") }}</p>
+              <span class="inline-flex items-center gap-1 text-xs font-mono font-semibold text-muted-foreground shrink-0" :title="t('integrations.linkExpiresIn')">
+                <Clock :size="12" /> {{ telegramCountdownLabel }}
               </span>
             </div>
             <div class="flex items-center gap-2">
-              <a :href="telegramLink" target="_blank" rel="noreferrer" class="min-w-0 flex-1 text-xs font-semibold truncate text-primary hover:underline">
-                {{ telegramLink }}
-              </a>
-              <Button type="button" variant="outline" size="icon" class="h-7 w-7 shrink-0" :title="t('integrations.copyLink')" @click="copyTelegramLink">
-                <Check v-if="telegramCopied" :size="13" class="text-emerald-600 dark:text-emerald-400" />
-                <Copy v-else :size="13" />
+              <span class="min-w-0 flex-1 text-xs text-muted-foreground truncate">{{ telegramLink }}</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                class="h-9 w-9 shrink-0"
+                :title="t('integrations.copyLink')"
+                :aria-label="t('integrations.copyLink')"
+                @click="copyTelegramLink"
+              >
+                <Check v-if="telegramCopied" :size="15" class="text-emerald-600 dark:text-emerald-400" />
+                <Copy v-else :size="15" />
               </Button>
             </div>
+            <p class="text-xs text-muted-foreground" role="status">{{ t("integrations.telegramWaiting") }}</p>
           </div>
         </div>
 
@@ -443,14 +478,25 @@ async function onDisconnectTelegram() {
             <LogOut :size="14" />
             <span>{{ t("integrations.telegramDisconnectBtn") }}</span>
           </Button>
+          <!-- Link ready: opening Telegram is the one next step -->
+          <div v-else-if="telegramLink" class="flex flex-col gap-1.5">
+            <Button as-child class="w-full h-10 gap-2 text-sm font-medium">
+              <a :href="telegramLink" target="_blank" rel="noreferrer">
+                <TelegramIcon :size="16" />
+                <span>{{ t("integrations.telegramReopenBtn") }}</span>
+              </a>
+            </Button>
+            <Button variant="ghost" class="w-full h-10 text-sm text-muted-foreground" @click="onConnectTelegram">
+              {{ t("integrations.telegramRegenerateBtn") }}
+            </Button>
+          </div>
           <Button
             v-else
-            :variant="telegramLink ? 'outline' : 'default'"
-            class="w-full h-9 gap-2 text-xs sm:text-sm font-medium"
+            class="w-full h-10 gap-2 text-sm font-medium"
             @click="onConnectTelegram"
           >
             <TelegramIcon :size="16" />
-            <span>{{ telegramLink ? t("integrations.telegramRegenerateBtn") : t("integrations.telegramConnectBtn") }}</span>
+            <span>{{ t("integrations.telegramConnectBtn") }}</span>
           </Button>
         </div>
       </Card>

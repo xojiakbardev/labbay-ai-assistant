@@ -48,7 +48,8 @@
     --secondary: 240 4.8% 95.9%;
     --secondary-foreground: 240 5.9% 10%;
     --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
+    /* 42% (was 46%) keeps secondary text at >= 4.5:1 on the muted surfaces too. */
+    --muted-foreground: 240 4% 42%;
     --accent: 240 4.8% 95.9%;
     --accent-foreground: 240 5.9% 10%;
     --destructive: 0 84.2% 60.2%;
@@ -64,6 +65,10 @@
     --warm-soft: rgba(245, 158, 11, 0.1);
     --cold: #64748b;
     --cold-soft: rgba(100, 116, 139, 0.1);
+
+    /* The fixed mobile chrome, including the notch / home-indicator areas. */
+    --mobile-header-h: calc(3.5rem + env(safe-area-inset-top));
+    --mobile-nav-h: calc(3.75rem + env(safe-area-inset-bottom));
   }
 
   .dark, [data-theme="dark"] {
@@ -81,11 +86,12 @@
     --muted-foreground: 240 5% 64.9%;
     --accent: 240 3.7% 12%;
     --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 30.6%;
+    /* Error text on the dark background: the old 30% red read at ~2:1. */
+    --destructive: 0 84% 65%;
     --destructive-foreground: 0 0% 98%;
     --border: 240 3.7% 15%;
     --input: 240 3.7% 15%;
-    --ring: 243 75% 59%;
+    --ring: 243 75% 65%;
 
     --hot: #f87171;
     --hot-soft: rgba(248, 113, 113, 0.12);
@@ -106,28 +112,48 @@
     padding: 0;
     width: 100%;
     min-height: 100vh;
+    min-height: 100dvh;
+  }
+
+  /* A visible keyboard focus on every control that doesn't draw its own ring
+     (the shadcn components do, and their utilities override this). */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *:not(.animate-spin),
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
 /* Base Utility Layout Classes */
 .app-layout {
-  @apply flex w-full min-h-screen bg-background text-foreground;
+  @apply flex w-full min-h-dvh bg-background text-foreground;
 }
 
 .sidebar {
-  @apply w-[250px] min-w-[250px] max-w-[250px] bg-card border-r border-border flex flex-col p-5 h-screen sticky top-0 shrink-0 z-40 justify-between;
+  @apply w-[250px] min-w-[250px] max-w-[250px] bg-card border-r border-border flex flex-col p-5 h-dvh sticky top-0 shrink-0 z-40;
 }
 
 .desktop-top-header {
-  @apply hidden md:flex h-14 items-center justify-between px-6 border-b border-border bg-card/60 backdrop-blur-md sticky top-0 z-30 shrink-0;
+  @apply hidden h-14 items-center justify-between px-6 border-b border-border bg-card/60 backdrop-blur-md sticky top-0 z-30 shrink-0;
 }
 
 .content {
-  @apply flex-1 min-w-0 p-6 md:p-8 min-h-screen bg-background box-border !m-0;
+  @apply flex-1 min-w-0 p-6 md:p-8 bg-background box-border m-0;
 }
 
-.content:has(.conversations-page) {
-  @apply !p-0 overflow-hidden h-full max-h-full md:h-[calc(100vh-3.5rem)] md:min-h-0 flex flex-col;
+/* The chat fills the space between the headers; its panes scroll, never the page. */
+.content.content-chat {
+  @apply p-0 min-h-0 overflow-hidden flex flex-col;
 }
 
 /* Page Containers */
@@ -141,7 +167,7 @@
 }
 
 .conversations-page {
-  @apply w-full h-full max-w-full;
+  @apply w-full h-full min-h-0 max-w-full;
 }
 
 .page-header h1 {
@@ -154,11 +180,11 @@
 
 /* Sidebar Navigation Links */
 .nav-link {
-  @apply flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-muted-foreground font-medium text-sm transition-all duration-200 border border-transparent hover:text-foreground hover:bg-accent;
+  @apply flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-muted-foreground font-medium text-sm transition-colors duration-200 border border-transparent hover:text-foreground hover:bg-accent;
 }
 
 .nav-link.active {
-  @apply bg-primary/10 text-primary border-primary/20 font-semibold shadow-sm;
+  @apply bg-primary/10 text-primary border-primary/20 font-semibold;
 }
 
 .nav-link.active svg {
@@ -167,20 +193,34 @@
 
 /* Mobile Top Header (hidden on desktop) */
 .mobile-top-header {
-  @apply hidden fixed top-0 inset-x-0 z-40 items-center justify-between px-3.5 py-2.5 bg-card/95 backdrop-blur-md border-b border-border;
+  @apply hidden fixed top-0 inset-x-0 z-40 items-center justify-between gap-2 px-3.5 bg-card/95 backdrop-blur-md border-b border-border;
+  height: var(--mobile-header-h);
+  padding-top: env(safe-area-inset-top);
 }
 
 /* Mobile Bottom Navigation (hidden on desktop) */
 .mobile-bottom-bar {
-  @apply hidden fixed bottom-0 inset-x-0 z-40 items-center justify-around bg-card/95 backdrop-blur-md border-t border-border px-1 py-1 pb-[max(0.375rem,env(safe-area-inset-bottom))];
+  @apply hidden fixed bottom-0 inset-x-0 z-40 items-stretch justify-around bg-card/95 backdrop-blur-md border-t border-border px-1;
+  height: var(--mobile-nav-h);
+  padding-bottom: env(safe-area-inset-bottom);
 }
 
 .mobile-nav-item {
-  @apply flex flex-col items-center justify-center gap-0.5 px-1 py-1 rounded-lg text-muted-foreground text-[0.65rem] font-medium border border-transparent transition-all duration-200 flex-1 min-w-0 text-center;
+  @apply flex flex-col items-center justify-center gap-0.5 px-0.5 my-1 rounded-lg text-muted-foreground text-[0.6875rem] leading-tight font-medium transition-colors duration-200 flex-1 min-w-0 text-center;
+}
+
+.mobile-nav-item span {
+  @apply block max-w-full truncate;
 }
 
 .mobile-nav-item.active {
-  @apply text-primary font-semibold;
+  @apply text-primary font-semibold bg-primary/10;
+}
+
+@media (min-width: 901px) {
+  .desktop-top-header {
+    @apply flex;
+  }
 }
 
 @media (max-width: 900px) {
@@ -193,37 +233,25 @@
     @apply hidden;
   }
 
+  /* Clear the fixed header and tab bar (safe areas included). */
   .content {
-    @apply !pt-[4.5rem] !pb-[4.75rem] !px-3.5 sm:!px-6;
+    padding: calc(var(--mobile-header-h) + 1rem) 0.875rem calc(var(--mobile-nav-h) + 1rem);
   }
 
-  /* Beats the base rule's !p-0 (both !important, later in source wins) so the
-     chat actually sits below the fixed mobile top navbar and above the fixed
-     bottom tab bar instead of running under either. 4rem clears the ~61px
-     rendered header height with a little headroom. */
-  .content:has(.conversations-page) {
-    @apply !pt-14 !pb-16 h-dvh max-h-dvh overflow-hidden flex flex-col box-border min-h-0;
+  .content.content-chat {
+    padding: var(--mobile-header-h) 0 var(--mobile-nav-h);
   }
 
-  .content:has(.conversations-page.mobile-thread-active) {
-    @apply !p-0 !pt-0 !pb-0 h-dvh max-h-dvh overflow-hidden flex flex-col box-border min-h-0;
+  /* An open thread is full-screen: the layout drops its header and tab bar. */
+  .content.content-chat.content-thread {
+    padding: 0;
   }
+}
 
-  body:has(.mobile-thread-active) .mobile-top-header,
-  body:has(.mobile-thread-active) .mobile-bottom-bar,
-  main:has(.mobile-thread-active) .mobile-top-header,
-  main:has(.mobile-thread-active) .mobile-bottom-bar,
-  .mobile-top-header.chat-open,
-  .mobile-bottom-bar.chat-open,
-  .mobile-top-header.\!hidden,
-  .mobile-bottom-bar.\!hidden {
-    display: none !important;
-  }
-
-  .content:has(.conversations-page) .split-view {
-    height: 100%;
-    max-height: 100%;
-    min-height: 0;
+@media (min-width: 640px) and (max-width: 900px) {
+  .content:not(.content-chat) {
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
   }
 }
 
@@ -291,7 +319,7 @@
 }
 
 .success {
-  @apply flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-600 dark:text-emerald-400;
+  @apply flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-700 dark:text-emerald-400;
 }
 
 .muted {
@@ -356,7 +384,7 @@
 
 /* Connected Pill */
 .connected-pill {
-  @apply inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400;
+  @apply inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400;
 }
 
 /* Product Cards & Grid */
@@ -457,26 +485,13 @@
   @apply inline-flex items-center rounded-full border font-semibold;
 }
 
-/* Messenger Split View */
-.split-view {
-  @apply grid grid-cols-[320px_1fr] md:grid-cols-[360px_1fr] w-full h-full max-h-full min-h-0 bg-card overflow-hidden;
-}
-
-.conversation-sidebar {
-  @apply flex flex-col border-r border-border bg-card h-full max-h-full min-h-0 overflow-hidden;
-}
-
-.thread-area {
-  @apply flex flex-col h-full max-h-full min-h-0 bg-background overflow-hidden relative;
-}
-
 .custom-scrollbar {
   scrollbar-width: thin;
-  scrollbar-color: rgba(155, 155, 155, 0.25) transparent;
+  scrollbar-color: rgba(155, 155, 155, 0.35) transparent;
 }
 
 .custom-scrollbar::-webkit-scrollbar {
-  width: 5px;
+  width: 6px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-track {
@@ -484,91 +499,251 @@
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(155, 155, 155, 0.25);
+  background: rgba(155, 155, 155, 0.35);
   border-radius: 9999px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(155, 155, 155, 0.45);
+  background: rgba(155, 155, 155, 0.55);
 }
 
-.conversation-item {
-  @apply flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-border/60 transition-all duration-200 border-l-2 border-l-transparent hover:bg-accent/50;
-}
-
-.conversation-item.active {
-  @apply bg-primary/5 border-l-primary;
-}
-
-.conversation-item-title {
-  @apply text-sm font-semibold text-foreground;
-}
-
-.avatar {
-  @apply flex items-center justify-center w-10 h-10 rounded-full bg-primary/10 text-primary font-bold text-sm shrink-0;
-}
-
-.bubble {
-  @apply rounded-xl px-4 py-3 shadow-sm border transition-all duration-200;
-  content-visibility: auto;
-  contain-intrinsic-size: 0 65px;
-}
-
-.bubble-customer {
-  @apply self-start bg-muted text-foreground border-border rounded-tl-sm;
-}
-
-.bubble-ai {
-  @apply self-end bg-primary/10 text-foreground border-primary/20 rounded-tr-sm;
-}
-
-.bubble-human {
-  @apply self-end bg-blue-500/10 text-foreground border-blue-500/25 rounded-tr-sm;
-}
-
-.ai-feedback-bar {
-  @apply flex items-center gap-1.5 mt-2 pt-2 border-t border-border/60;
-}
-
-.feedback-action-btn {
-  @apply inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground border border-transparent transition-all duration-200 hover:bg-accent hover:text-foreground;
-}
-
-.feedback-toast {
-  @apply fixed bottom-6 right-6 z-[60] flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-3 text-sm font-medium text-foreground shadow-xl animate-in fade-in-0 slide-in-from-bottom-2;
-}
-
-.mobile-back-btn {
-  display: none !important;
-}
-
-@media (max-width: 900px) {
+/* ---------------------------------------------------------------------------
+   Messenger (chat page + sandbox). In the components layer so utilities on
+   the element can still override them.
+   --------------------------------------------------------------------------- */
+@layer components {
   .split-view {
-    @apply grid-cols-1;
+    @apply grid grid-cols-1 w-full h-full min-h-0 bg-card overflow-hidden;
   }
 
-  .conversation-sidebar.mobile-hidden {
-    @apply hidden;
+  .conversation-sidebar {
+    @apply flex flex-col h-full min-h-0 overflow-hidden border-r border-border bg-card;
   }
 
   .thread-area {
-    @apply hidden;
+    @apply relative flex flex-col h-full min-h-0 min-w-0 overflow-hidden bg-background;
   }
 
-  .thread-area.mobile-visible {
-    @apply flex;
+  @media (min-width: 901px) {
+    .split-view {
+      grid-template-columns: 300px minmax(0, 1fr);
+    }
+  }
+
+  @media (min-width: 1280px) {
+    .split-view {
+      grid-template-columns: 360px minmax(0, 1fr);
+    }
+  }
+
+  .conversation-item {
+    @apply flex w-full min-h-16 items-center gap-3 px-4 py-3 text-left cursor-pointer border-b border-border/60 border-l-2 border-l-transparent transition-colors hover:bg-accent/60;
+  }
+
+  .conversation-item:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .conversation-item.active {
+    @apply bg-primary/10 border-l-primary;
+  }
+
+  .avatar {
+    @apply flex items-center justify-center w-10 h-10 rounded-full bg-primary/10 text-primary font-bold text-sm shrink-0;
+  }
+
+  .icon-btn {
+    @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 cursor-pointer;
   }
 
   .mobile-back-btn {
-    display: inline-flex !important;
+    display: none;
+  }
+
+  .thread-header {
+    @apply flex items-center gap-2 border-b border-border bg-card px-2 shrink-0 sm:px-4;
+    min-height: calc(3.5rem + env(safe-area-inset-top));
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .thread-header-mobile {
+    display: none;
+  }
+
+  @media (max-width: 900px) {
+    .conversation-sidebar {
+      border-right-width: 0;
+    }
+
+    .conversation-sidebar.mobile-hidden {
+      display: none;
+    }
+
+    .thread-area {
+      display: none;
+    }
+
+    .thread-area.mobile-visible {
+      display: flex;
+    }
+
+    .mobile-back-btn {
+      display: inline-flex;
+    }
+
+    .thread-header-mobile {
+      display: flex;
+    }
+  }
+
+  /* AI / Operator segmented switch */
+  .mode-toggle {
+    @apply inline-flex shrink-0 items-center rounded-xl border border-border bg-muted p-0.5;
+  }
+
+  .mode-option {
+    @apply inline-flex h-9 items-center gap-1 rounded-[10px] px-2.5 text-xs font-semibold text-muted-foreground transition-colors cursor-pointer hover:text-foreground disabled:cursor-wait;
+  }
+
+  .mode-option[aria-checked="true"] {
+    @apply bg-card text-foreground shadow-sm;
+  }
+
+  .mode-option[aria-checked="true"]:first-child {
+    @apply text-primary;
+  }
+
+  /* Overflow menu */
+  .menu-content {
+    @apply z-50 min-w-[200px] rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-lg;
+  }
+
+  .menu-item {
+    @apply flex min-h-10 cursor-pointer select-none items-center gap-2.5 rounded-lg px-3 text-sm outline-none data-[highlighted]:bg-muted data-[disabled]:pointer-events-none data-[disabled]:opacity-50;
+  }
+
+  .day-divider {
+    @apply flex items-center gap-3 py-1 text-xs font-medium text-muted-foreground;
+  }
+
+  .day-divider::before,
+  .day-divider::after {
+    content: "";
+    @apply h-px flex-1 bg-border;
+  }
+
+  .bubble {
+    @apply rounded-2xl border text-foreground;
+  }
+
+  .bubble-customer {
+    @apply bg-muted border-border;
+  }
+
+  .bubble-ai {
+    @apply bg-primary/10 border-primary/20;
+  }
+
+  .bubble-human {
+    @apply bg-blue-500/10 border-blue-500/25;
+  }
+
+  .bubble-customer.bubble-tail {
+    @apply rounded-bl-md;
+  }
+
+  .bubble-ai.bubble-tail,
+  .bubble-human.bubble-tail {
+    @apply rounded-br-md;
+  }
+
+  .bubble-failed {
+    @apply border-destructive/60 bg-destructive/5;
+  }
+
+  /* Photos/videos get their box before they load: no layout shift. */
+  .media-box {
+    @apply w-[220px] max-w-full aspect-[4/5] overflow-hidden rounded-xl bg-muted sm:w-[260px];
+  }
+
+  /* An emoji reaction pinned to the bottom corner of the message it answers. */
+  .reaction-chips {
+    @apply absolute -bottom-3 left-3 flex gap-1;
+  }
+
+  .reaction-chip {
+    @apply inline-flex h-6 min-w-6 items-center justify-center gap-0.5 rounded-full border border-border bg-card px-1.5 text-sm leading-none shadow-sm;
+  }
+
+  .reaction-chip-muted {
+    @apply opacity-60;
+  }
+
+  /* AI feedback: always there on touch screens; with a mouse, shown on the
+     last reply of a group and on hover/focus of the others. */
+  .feedback-bar {
+    @apply mt-0.5 flex items-center gap-0.5 transition-opacity;
+  }
+
+  @media (hover: hover) {
+    .bubble-row:not(.bubble-row-last) .feedback-bar:not(.feedback-bar-rated) {
+      opacity: 0;
+    }
+
+    .bubble-row:hover .feedback-bar,
+    .bubble-row:focus-within .feedback-bar {
+      opacity: 1;
+    }
+  }
+
+  .feedback-btn {
+    @apply relative inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground cursor-pointer;
+  }
+
+  /* 40px tall hit area around the compact button. */
+  .feedback-btn::after {
+    content: "";
+    position: absolute;
+    inset: -6px -2px;
+  }
+
+  .jump-latest {
+    @apply absolute bottom-3 right-3 z-10 inline-flex h-10 min-w-10 items-center justify-center gap-1.5 rounded-full border border-border bg-card px-2.5 text-sm font-medium text-foreground shadow-lg cursor-pointer hover:bg-muted;
+  }
+
+  .jump-latest-count {
+    @apply bg-primary text-primary-foreground border-primary px-3.5 hover:bg-primary/90;
+  }
+
+  .composer {
+    @apply shrink-0 border-t border-border bg-card px-2.5 pt-2.5 sm:px-4;
+    padding-bottom: max(0.625rem, env(safe-area-inset-bottom));
+  }
+
+  .composer-input {
+    @apply block min-h-11 w-full min-w-0 flex-1 resize-none rounded-xl border border-input bg-background px-3.5 py-2.5 text-base leading-6 text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:border-ring sm:text-sm sm:leading-5;
+    overflow-y: hidden;
+  }
+
+  .fade-up-enter-active,
+  .fade-up-leave-active {
+    transition: opacity 0.15s ease, transform 0.15s ease;
+  }
+
+  .fade-up-enter-from,
+  .fade-up-leave-to {
+    opacity: 0;
+    transform: translateY(6px);
   }
 }
 
-@layer base {
-  * {
-    @apply border-border outline-ring/50;
-  }
-  body {
-    @apply bg-background text-foreground;
-  }
+/* Extends a compact control's touch target to 40px without growing it. */
+.hit-area {
+  position: relative;
+}
+
+.hit-area::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
 }

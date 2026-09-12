@@ -1,17 +1,5 @@
-"""The outbox: how anything we say to a customer on Instagram goes out.
-
-Every outbound message is persisted as `pending` *before* it's sent, then
-marked `sent` (with Instagram's message id) or `failed`. That gives the
-guarantees the old send-then-hope code didn't have:
-
-- the owner sees every message the customer received (persist before send);
-- a retried webhook event resends exactly the AI reply it had already written,
-  instead of running a fresh LLM turn and giving the customer a second,
-  different answer;
-- an echo of one of our own messages is recognised — by its id when the send
-  response already recorded it, or by matching it to the recent outbound row
-  it belongs to when the echo got here first (`reconcile_echo`).
-"""
+"""The outbox: every outbound message is stored as pending, then sent and marked
+sent/failed; retries resend, echoes are matched."""
 import asyncio
 import datetime as dt
 import logging
@@ -27,17 +15,16 @@ from app.conversations.models import (
     Conversation,
     Message,
 )
+from app.core.config import get_settings
 from app.instagram.client import MetaAPIError, MetaClient
 
 logger = logging.getLogger("app.conversations.delivery")
 
-# A beat between the parts of a split reply — the pause a person spends typing
-# the next line. Tests set it to 0.
-PART_DELAY_SECONDS = 0.9
-
-# An undelivered reply is resent while its webhook event is being retried;
-# this is longer than the whole retry schedule (app/instagram/pipeline.py).
-RESEND_WINDOW = dt.timedelta(minutes=20)
+_settings = get_settings()
+# Pause between the parts of a split reply.
+PART_DELAY_SECONDS = _settings.reply_part_delay_seconds
+# How long an undelivered reply is still resent / an echo still matched.
+RESEND_WINDOW = dt.timedelta(minutes=_settings.resend_window_minutes)
 
 
 class DeliveryError(Exception):
@@ -103,13 +90,8 @@ async def send_outbound(
 
 
 async def undelivered_reply(db: AsyncSession, conversation: Conversation, answering: Message) -> list[Message]:
-    """The AI text reply to `answering` that hasn't gone out yet, oldest part
-    first. Only that: an operator's failed dashboard reply is theirs to retype,
-    a product photo or follow-up that didn't go through isn't worth resending
-    ahead of a real answer.
-
-    A message whose echo already came back (it has an Instagram id) reached
-    the customer, whatever its send call reported."""
+    """The unsent AI text reply to `answering`, oldest part first (a message whose
+    echo arrived counts as delivered)."""
     since = max(answering.created_at, dt.datetime.now(dt.timezone.utc) - RESEND_WINDOW)
     result = await db.execute(
         select(Message)
@@ -134,10 +116,8 @@ async def reconcile_echo(
     text: str,
     attachment_type: str | None,
 ) -> bool:
-    """Matches an echo to our own recent outbound message that has no
-    Instagram id yet — sent but its response not recorded, a send that timed
-    out after Meta delivered it, or a 2xx without an id. Records the id (and
-    marks it sent). Returns whether it was ours."""
+    """Matches an echo to our recent outbound message still missing its Instagram id.
+    Returns whether it was ours."""
     since = dt.datetime.now(dt.timezone.utc) - RESEND_WINDOW
     candidates = (
         await db.execute(

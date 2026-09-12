@@ -309,11 +309,12 @@ function exportCsv() {
             size="sm"
             class="h-9 px-3 text-xs gap-1.5 whitespace-nowrap cursor-pointer shadow-none"
             :disabled="filteredLeads.length === 0"
+            :title="t('leads.exportCsvTitle')"
+            :aria-label="t('leads.exportCsvTitle')"
             @click="exportCsv"
           >
             <Download :size="14" />
-            <span class="hidden sm:inline">CSV Export</span>
-            <span class="sm:hidden">Export</span>
+            <span class="hidden sm:inline">{{ t("leads.exportCsv") }}</span>
           </Button>
         </div>
       </div>
@@ -339,7 +340,7 @@ function exportCsv() {
           v-if="sortBy !== 'score_desc'"
           class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-foreground border border-border"
         >
-          <span>{{ sortBy === 'score_asc' ? 'Score ↑' : sortBy === 'date_desc' ? t('leads.sortDateDesc') : t('leads.sortDateAsc') }}</span>
+          <span>{{ sortBy === 'score_asc' ? t('leads.sortScoreAsc') : sortBy === 'date_desc' ? t('leads.sortDateDesc') : t('leads.sortDateAsc') }}</span>
           <button type="button" class="cursor-pointer" @click="sortBy = 'score_desc'"><X :size="11" /></button>
         </span>
         <button
@@ -356,9 +357,13 @@ function exportCsv() {
     <div class="hidden md:grid md:grid-cols-4 gap-3">
       <!-- Hot Leads -->
       <Card
-        class="p-4 cursor-pointer hover:border-rose-500/40 transition-all active:scale-[0.99] border-border shadow-xs"
+        class="p-4 cursor-pointer hover:border-rose-500/40 transition-colors border-border shadow-xs gap-0"
+        role="button"
+        tabindex="0"
         :class="{ 'ring-2 ring-rose-500/30 border-rose-500/50 bg-rose-500/5': selectedStatus === 'hot' }"
+        :aria-pressed="selectedStatus === 'hot'"
         @click="selectedStatus = selectedStatus === 'hot' ? 'all' : 'hot'"
+        @keydown.enter.space.prevent="selectedStatus = selectedStatus === 'hot' ? 'all' : 'hot'"
       >
         <div class="flex items-center justify-between mb-1.5">
           <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{{ t("leads.hot") }}</span>
@@ -371,9 +376,13 @@ function exportCsv() {
 
       <!-- Warm Leads -->
       <Card
-        class="p-4 cursor-pointer hover:border-amber-500/40 transition-all active:scale-[0.99] border-border shadow-xs"
+        class="p-4 cursor-pointer hover:border-amber-500/40 transition-colors border-border shadow-xs gap-0"
+        role="button"
+        tabindex="0"
         :class="{ 'ring-2 ring-amber-500/30 border-amber-500/50 bg-amber-500/5': selectedStatus === 'warm' }"
+        :aria-pressed="selectedStatus === 'warm'"
         @click="selectedStatus = selectedStatus === 'warm' ? 'all' : 'warm'"
+        @keydown.enter.space.prevent="selectedStatus = selectedStatus === 'warm' ? 'all' : 'warm'"
       >
         <div class="flex items-center justify-between mb-1.5">
           <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{{ t("leads.warm") }}</span>
@@ -386,9 +395,13 @@ function exportCsv() {
 
       <!-- Cold Leads -->
       <Card
-        class="p-4 cursor-pointer hover:border-sky-500/40 transition-all active:scale-[0.99] border-border shadow-xs"
+        class="p-4 cursor-pointer hover:border-sky-500/40 transition-colors border-border shadow-xs gap-0"
+        role="button"
+        tabindex="0"
         :class="{ 'ring-2 ring-sky-500/30 border-sky-500/50 bg-sky-500/5': selectedStatus === 'cold' }"
+        :aria-pressed="selectedStatus === 'cold'"
         @click="selectedStatus = selectedStatus === 'cold' ? 'all' : 'cold'"
+        @keydown.enter.space.prevent="selectedStatus = selectedStatus === 'cold' ? 'all' : 'cold'"
       >
         <div class="flex items-center justify-between mb-1.5">
           <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{{ t("leads.cold") }}</span>
@@ -401,9 +414,13 @@ function exportCsv() {
 
       <!-- Phone Numbers -->
       <Card
-        class="p-4 cursor-pointer hover:border-emerald-500/40 transition-all active:scale-[0.99] border-border shadow-xs"
+        class="p-4 cursor-pointer hover:border-emerald-500/40 transition-colors border-border shadow-xs gap-0"
+        role="button"
+        tabindex="0"
         :class="{ 'ring-2 ring-emerald-500/30 border-emerald-500/50 bg-emerald-500/5': onlyWithPhone }"
+        :aria-pressed="onlyWithPhone"
         @click="onlyWithPhone = !onlyWithPhone"
+        @keydown.enter.space.prevent="onlyWithPhone = !onlyWithPhone"
       >
         <div class="flex items-center justify-between mb-1.5">
           <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{{ t("leads.phoneNumbers") }}</span>
@@ -503,22 +520,20 @@ function exportCsv() {
         <div class="space-y-1.5">
           <button
             v-for="opt in [
-              { value: 'score_desc', label: t('leads.sortScoreDesc'), badge: 'Score ↓' },
-              { value: 'score_asc', label: t('leads.sortScoreAsc'), badge: 'Score ↑' },
-              { value: 'date_desc', label: t('leads.sortDateDesc'), badge: 'Date ↓' },
-              { value: 'date_asc', label: t('leads.sortDateAsc'), badge: 'Date ↑' }
+              { value: 'score_desc', label: t('leads.sortScoreDesc') },
+              { value: 'score_asc', label: t('leads.sortScoreAsc') },
+              { value: 'date_desc', label: t('leads.sortDateDesc') },
+              { value: 'date_asc', label: t('leads.sortDateAsc') }
             ]"
             :key="opt.value"
             type="button"
-            class="w-full p-3 rounded-xl border text-xs font-semibold flex items-center justify-between transition-all cursor-pointer"
+            class="w-full min-h-11 p-3 rounded-xl border text-sm font-medium flex items-center justify-between transition-colors cursor-pointer"
             :class="sortBy === opt.value ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-card text-foreground hover:border-border/80'"
+            :aria-pressed="sortBy === opt.value"
             @click="sortBy = opt.value as any"
           >
             <span>{{ opt.label }}</span>
-            <div class="flex items-center gap-2">
-              <span class="text-[11px] px-2 py-0.5 rounded bg-muted text-muted-foreground font-mono">{{ opt.badge }}</span>
-              <Check v-if="sortBy === opt.value" :size="14" class="text-primary" />
-            </div>
+            <Check v-if="sortBy === opt.value" :size="16" class="text-primary" />
           </button>
         </div>
       </div>
@@ -562,17 +577,13 @@ function exportCsv() {
       v-else-if="filteredLeads.length === 0"
       class="text-center py-12 px-4 border-border shadow-xs"
     >
-      <Users :size="36" class="mx-auto text-muted-foreground/40 mb-2" />
+      <Users :size="36" class="mx-auto text-muted-foreground/60 mb-2" />
       <h3 class="text-sm font-semibold text-foreground">
-        {{ searchQuery || selectedStatus !== 'all' || onlyWithPhone ? t("leads.notFound") : t("leads.noLeadsTitle") }}
+        {{ leads.length > 0 ? t("leads.notFound") : t("leads.noLeadsTitle") }}
       </h3>
-      <div v-if="searchQuery || selectedStatus !== 'all' || onlyWithPhone" class="mt-3">
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 text-xs cursor-pointer shadow-none"
-          @click="searchQuery = ''; selectedStatus = 'all'; onlyWithPhone = false"
-        >
+      <p v-if="leads.length === 0" class="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">{{ t("leads.noLeadsDesc") }}</p>
+      <div v-if="leads.length > 0" class="mt-3">
+        <Button variant="outline" class="h-10 cursor-pointer" @click="resetFilters">
           {{ t("leads.clearFilters") }}
         </Button>
       </div>
@@ -580,12 +591,12 @@ function exportCsv() {
 
     <!-- LEADS DATA DISPLAY -->
     <template v-else>
-      <!-- MOBILE LEADS CARDS LIST (Mobile view only) -->
-      <div class="block md:hidden space-y-3">
+      <!-- Cards: phones, tablets and narrow desktops — the 7-column table needs a wide screen -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 xl:hidden">
         <Card
           v-for="lead in filteredLeads"
           :key="'mobile-' + lead.id"
-          class="p-4 cursor-pointer hover:border-primary/40 transition-all space-y-3 border-border shadow-xs"
+          class="p-4 cursor-pointer hover:border-primary/40 transition-colors gap-3 border-border shadow-xs"
           @click="selectedLead = lead"
         >
           <!-- Header: Customer + Status Badge + Score -->
@@ -621,40 +632,37 @@ function exportCsv() {
             </div>
           </div>
 
-          <!-- Score progress line -->
+          <!-- Score progress line (same colour as the lead's status) -->
           <div class="h-1 bg-muted/60 rounded-full overflow-hidden w-full">
             <div
               class="h-full rounded-full transition-all duration-300"
-              :class="lead.score >= 75 ? 'bg-rose-500' : lead.score >= 40 ? 'bg-amber-500' : 'bg-sky-500'"
+              :class="lead.status === 'hot' ? 'bg-rose-500' : lead.status === 'warm' ? 'bg-amber-500' : 'bg-sky-500'"
               :style="{ width: `${Math.max(lead.score, 6)}%` }"
             />
           </div>
 
           <!-- Phone Section if present -->
-          <div v-if="lead.phone" class="flex items-center justify-between bg-muted/40 p-2.5 rounded-lg text-xs" @click.stop>
-            <div class="flex items-center gap-2">
-              <div class="w-6 h-6 rounded-md bg-emerald-500/10 text-emerald-500 flex items-center justify-center">
-                <Phone :size="12" />
-              </div>
-              <a :href="`tel:${lead.phone}`" class="font-bold text-foreground font-mono hover:text-primary">
-                {{ lead.phone }}
-              </a>
-            </div>
-            <div class="flex items-center gap-1">
+          <div v-if="lead.phone" class="flex items-center justify-between gap-2 bg-muted/40 p-2 rounded-lg text-sm" @click.stop>
+            <a :href="`tel:${lead.phone}`" class="flex min-w-0 items-center gap-2 font-semibold text-foreground font-mono hover:text-primary">
+              <Phone :size="14" class="shrink-0 text-emerald-600 dark:text-emerald-400" />
+              <span class="truncate">{{ lead.phone }}</span>
+            </a>
+            <div class="flex items-center gap-1 shrink-0">
               <button
                 type="button"
-                class="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer"
+                class="icon-btn"
                 :title="copiedPhone === lead.phone ? t('common.copied') : t('common.copy')"
+                :aria-label="copiedPhone === lead.phone ? t('common.copied') : t('common.copy')"
                 @click="copyPhone(lead.phone)"
               >
-                <Check v-if="copiedPhone === lead.phone" :size="13" class="text-emerald-500" />
-                <Copy v-else :size="13" />
+                <Check v-if="copiedPhone === lead.phone" :size="16" class="text-emerald-600" />
+                <Copy v-else :size="16" />
               </button>
               <a
                 :href="`tel:${lead.phone}`"
-                class="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded bg-emerald-500 text-white hover:bg-emerald-600 transition cursor-pointer"
+                class="inline-flex h-10 items-center gap-1.5 px-3 text-sm font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
               >
-                <PhoneCall :size="11" />
+                <PhoneCall :size="14" />
                 <span>{{ t("leads.call") }}</span>
               </a>
             </div>
@@ -681,32 +689,30 @@ function exportCsv() {
           </div>
 
           <!-- Card Footer Actions -->
-          <div class="flex items-center justify-end gap-2 pt-1 border-t border-border/40" @click.stop>
+          <div class="flex items-center justify-end gap-2 pt-2 mt-auto border-t border-border/40" @click.stop>
             <Button
               v-if="lead.conversation_id"
               variant="outline"
-              size="sm"
-              class="h-8 text-xs gap-1.5 font-medium flex-1 cursor-pointer shadow-none"
+              class="h-10 text-sm gap-1.5 font-medium flex-1 cursor-pointer shadow-none"
               @click="openLeadChat(lead)"
             >
-              <MessageSquare :size="13" />
+              <MessageSquare :size="15" />
               <span>{{ t("leads.openChat") }}</span>
             </Button>
             <Button
               variant="ghost"
-              size="sm"
-              class="h-8 text-xs gap-1 text-muted-foreground hover:text-foreground cursor-pointer"
+              class="h-10 text-sm gap-1.5 text-muted-foreground hover:text-foreground cursor-pointer"
               @click="selectedLead = lead"
             >
-              <Eye :size="14" />
+              <Eye :size="15" />
               <span>{{ t("leads.details") }}</span>
             </Button>
           </div>
         </Card>
       </div>
 
-      <!-- DESKTOP LEADS DATA TABLE (Desktop view only) -->
-      <Card class="hidden md:block overflow-hidden border-border shadow-xs">
+      <!-- Table: wide screens only -->
+      <Card class="hidden xl:block overflow-hidden border-border shadow-xs py-0 gap-0">
         <Table>
           <TableHeader class="bg-muted/40">
             <TableRow>
@@ -755,7 +761,7 @@ function exportCsv() {
                   <div class="h-1 bg-muted/60 rounded-full overflow-hidden w-full">
                     <div
                       class="h-full rounded-full transition-all duration-300"
-                      :class="lead.score >= 75 ? 'bg-rose-500' : lead.score >= 40 ? 'bg-amber-500' : 'bg-sky-500'"
+                      :class="lead.status === 'hot' ? 'bg-rose-500' : lead.status === 'warm' ? 'bg-amber-500' : 'bg-sky-500'"
                       :style="{ width: `${Math.max(lead.score, 6)}%` }"
                     />
                   </div>

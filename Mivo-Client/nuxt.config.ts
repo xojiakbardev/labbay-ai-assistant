@@ -54,7 +54,12 @@ export default defineNuxtConfig({
       title: "Mivo AI — Smart Instagram AI Assistant",
       meta: [
         { charset: "utf-8" },
-        { name: "viewport", content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" },
+        // interactive-widget: Android shrinks the layout (and 100dvh) when the
+        // keyboard opens, so the chat composer stays visible above it.
+        {
+          name: "viewport",
+          content: "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content",
+        },
         { name: "description", content: "Mivo AI — Instagram Direct sales automation and AI lead qualification platform." },
         { property: "og:title", content: "Mivo AI — Smart Instagram AI Assistant" },
         { property: "og:description", content: "Automation platform for Instagram Direct sales, customer support, and AI lead qualification." },

@@ -1,20 +1,28 @@
 <script setup lang="ts">
 import { toast } from "vue-sonner";
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuRoot,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "reka-ui";
 import { ApiError } from "~/composables/useApi";
+import { daysAgo, formatClock, formatDayMonth, formatShortDate } from "~/composables/useDateFormat";
 import { safeHttpsUrl } from "~/lib/utils";
-import type { ConversationDetail, ConversationSummary, Message } from "~/types/api";
+import type { ConversationDetail, ConversationStatus, ConversationSummary, Message } from "~/types/api";
 import {
   Bot,
   ArrowLeft,
-  User,
   ThumbsUp,
   ThumbsDown,
   CheckCircle2,
+  Check,
   Sparkles,
   Trash2,
   RefreshCw,
   Send,
-  UserCheck,
   Loader2,
   Clock,
   AlertCircle,
@@ -22,12 +30,16 @@ import {
   ExternalLink,
   ChevronUp,
   ArrowDown,
+  MoreVertical,
+  MessageSquare,
+  Info,
+  Plug,
 } from "@lucide/vue";
 
 definePageMeta({ layout: "dashboard" });
 
 const api = useMivoApi();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const { onConversationUpdated } = useNotifications();
@@ -37,6 +49,10 @@ const MAX_CONVERSATION_PAGE = 200;
 const MESSAGE_PAGE = 100;
 const MAX_MESSAGE_LIMIT = 500;
 const REPLY_MAX_LENGTH = 1000;
+// The character counter appears once a reply gets this close to the limit.
+const REPLY_COUNTER_FROM = 850;
+// Consecutive messages from one sender closer together than this form one group.
+const GROUP_GAP_MS = 5 * 60 * 1000;
 
 const conversations = ref<ConversationSummary[]>([]);
 const hasMoreConversations = ref(false);
@@ -49,7 +65,8 @@ const listError = ref<string | null>(null);
 // A background refresh failed; cleared by the next successful one.
 const syncError = ref(false);
 const threadLoading = ref(false);
-const messagesContainerRef = ref<HTMLElement | null>(null);
+// Opening a thread failed for a reason other than "it's gone".
+const threadError = ref<string | null>(null);
 
 // Replies the server hasn't acknowledged, per conversation — pending, or
 // failed before reaching it. Kept apart from server messages so no merge or
@@ -61,8 +78,31 @@ const threadMessages = computed<Message[]>(() => {
   return [...selected.value.messages, ...(localMessages[selected.value.id] ?? [])];
 });
 
-// Mobile specific active view state
+// Mobile: list and thread are separate screens (the layout hides its own
+// header and tab bar while a thread is open).
 const isMobileThreadActive = useState<boolean>("isMobileThreadActive", () => false);
+
+function isMobileViewport(): boolean {
+  return window.matchMedia("(max-width: 900px)").matches;
+}
+
+function isCoarsePointer(): boolean {
+  return window.matchMedia("(pointer: coarse)").matches;
+}
+
+// Context the page needs besides conversations: whether replies can reach
+// Instagram at all, and whether the AI is switched off for the whole business.
+// null = unknown (not loaded, or the request failed) — then nothing is claimed.
+const igConnected = ref<boolean | null>(null);
+const aiGloballyOff = ref<boolean | null>(null);
+
+async function loadContext() {
+  const [ig, biz] = await Promise.allSettled([api.getInstagramStatus(), api.getBusiness()]);
+  if (ig.status === "fulfilled") igConnected.value = ig.value.connected;
+  else console.error("Failed to load Instagram status", ig.reason);
+  if (biz.status === "fulfilled") aiGloballyOff.value = !biz.value.ai_enabled || biz.value.ai_suspended;
+  else console.error("Failed to load business settings", biz.reason);
+}
 
 // AI Feedback Modal state
 const isFeedbackModalOpen = ref(false);
@@ -70,6 +110,8 @@ const feedbackTargetMessage = ref<Message | null>(null);
 const feedbackCustomerQuery = ref("");
 const feedbackCorrectionText = ref("");
 const feedbackSubmitting = ref(false);
+// Messages rated in this session, so a rating shows as given.
+const ratedMessages = reactive<Record<string, "up" | "down">>({});
 
 // Conversation Delete Confirm Modal
 const isDeleteConfirmModalOpen = ref(false);
@@ -100,22 +142,43 @@ function isAiStatus(status: string | undefined) {
   return status === "ai_active" || status === "active";
 }
 
-// Infinite Scroll / Message Windowing State
-const PAGE_SIZE = 35;
-const displayedCount = ref(PAGE_SIZE);
-const isLoadingOlder = ref(false);
-const shouldStickToBottom = ref(true);
-const showScrollDownBtn = ref(false);
-let messagesResizeObserver: ResizeObserver | null = null;
-let messagesMutationObserver: MutationObserver | null = null;
+function isReaction(m: Pick<Message, "message_type">) {
+  return m.message_type === "reaction";
+}
 
-const visibleMessages = computed(() => {
-  const msgs = threadMessages.value;
-  if (msgs.length <= displayedCount.value) return msgs;
-  return msgs.slice(-displayedCount.value);
+// --- Scrolling ---------------------------------------------------------------
+
+const chat = useChatScroll();
+const messagesContainerRef = chat.container;
+const messagesContentRef = chat.content;
+// New messages that arrived while the owner was reading further up.
+const unseenCount = ref(0);
+
+watch(chat.pinned, (pinned) => {
+  if (pinned) unseenCount.value = 0;
 });
 
-const hiddenLoadedCount = computed(() => Math.max(0, threadMessages.value.length - displayedCount.value));
+// Message window: everything from `firstVisibleId` to the newest message is
+// rendered. Anchoring the window at its oldest message (not "the last N")
+// means a new message extends it instead of pushing one out of the top —
+// which would shift what the owner is reading.
+const PAGE_SIZE = 35;
+const firstVisibleId = ref<string | null>(null);
+const isLoadingOlder = ref(false);
+
+const firstVisibleIndex = computed(() => {
+  const msgs = threadMessages.value;
+  const idx = firstVisibleId.value ? msgs.findIndex((m) => m.id === firstVisibleId.value) : -1;
+  return idx === -1 ? Math.max(0, msgs.length - PAGE_SIZE) : idx;
+});
+
+const visibleMessages = computed(() => threadMessages.value.slice(firstVisibleIndex.value));
+const hiddenLoadedCount = computed(() => firstVisibleIndex.value);
+
+function resetWindow() {
+  const msgs = threadMessages.value;
+  firstVisibleId.value = msgs[Math.max(0, msgs.length - PAGE_SIZE)]?.id ?? null;
+}
 
 // Older messages exist either in the local window or on the server (the
 // detail endpoint returns only the most recent ones).
@@ -126,56 +189,55 @@ const hasOlderMessages = computed(() => {
 });
 
 async function loadOlderMessages() {
-  if (!messagesContainerRef.value || !hasOlderMessages.value || isLoadingOlder.value || !selected.value) return;
+  const el = messagesContainerRef.value;
+  const conv = selected.value;
+  if (!el || !conv || !hasOlderMessages.value || isLoadingOlder.value) return;
   isLoadingOlder.value = true;
-  const container = messagesContainerRef.value;
-  const prevScrollHeight = container.scrollHeight;
-  const prevScrollTop = container.scrollTop;
-
-  if (hiddenLoadedCount.value === 0) {
-    // Everything loaded is already shown — fetch a longer tail from the server.
-    const convId = selected.value.id;
-    const limit = Math.min(selected.value.messages.length + MESSAGE_PAGE, MAX_MESSAGE_LIMIT);
-    try {
-      const detail = await api.getConversation(convId, { limit });
-      replaceThread(convId, detail);
-    } catch (err) {
-      toast.error(errorText(err));
-      isLoadingOlder.value = false;
-      return;
+  chat.unpin();
+  try {
+    if (hiddenLoadedCount.value === 0) {
+      // Everything loaded is already shown — fetch a longer tail from the server.
+      const limit = Math.min(conv.messages.length + MESSAGE_PAGE, MAX_MESSAGE_LIMIT);
+      const detail = await api.getConversation(conv.id, { limit });
+      if (selected.value?.id !== conv.id) return;
+      replaceThread(conv.id, detail);
     }
-  }
-
-  displayedCount.value = Math.min(displayedCount.value + PAGE_SIZE, threadMessages.value.length);
-
-  nextTick(() => {
-    const newScrollHeight = container.scrollHeight;
-    container.scrollTop = newScrollHeight - prevScrollHeight + prevScrollTop;
+    // Measured right before the DOM grows, so the reader's position is kept
+    // exactly: the new height goes above what they were looking at.
+    const prevHeight = el.scrollHeight;
+    const prevTop = el.scrollTop;
+    const msgs = threadMessages.value;
+    const nextIndex = Math.max(0, firstVisibleIndex.value - PAGE_SIZE);
+    firstVisibleId.value = msgs[nextIndex]?.id ?? null;
+    await nextTick();
+    el.scrollTop = el.scrollHeight - prevHeight + prevTop;
+  } catch (err) {
+    toast.error(errorText(err));
+  } finally {
     isLoadingOlder.value = false;
-  });
+    chat.onScroll();
+  }
 }
 
+let lastScrollTop = 0;
 function handleMessagesScroll() {
+  chat.onScroll();
   const el = messagesContainerRef.value;
   if (!el) return;
-
-  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-
-  // If user is within 90px from bottom, keep locked to bottom
-  if (distanceFromBottom <= 90) {
-    shouldStickToBottom.value = true;
-    showScrollDownBtn.value = false;
-  } else {
-    // User intentionally scrolled up to read past history
-    shouldStickToBottom.value = false;
-    showScrollDownBtn.value = true;
-  }
-
-  // Infinite scroll check: if near top (scrollTop <= 60px) and has older messages
-  if (el.scrollTop <= 60 && hasOlderMessages.value && !isLoadingOlder.value) {
+  // Older messages load when the reader scrolls *up* to near the top — never
+  // from a programmatic jump, and never twice at once (same guard as the button).
+  const goingUp = el.scrollTop < lastScrollTop;
+  lastScrollTop = el.scrollTop;
+  if (goingUp && el.scrollTop <= 120 && hasOlderMessages.value && !isLoadingOlder.value) {
     loadOlderMessages();
   }
 }
+
+function jumpToLatest() {
+  chat.scrollToBottom(true);
+}
+
+// --- Media -------------------------------------------------------------------
 
 // Media comes only from attachment_url/attachment_type, and only https URLs
 // are rendered or linked — message text is never parsed for links.
@@ -194,8 +256,12 @@ function mediaOf(m: Message): MessageMedia | null {
   return { kind: "link", url };
 }
 
+const REEL_TYPES = ["ig_reel", "reel"];
+const POST_TYPES = ["share", "ig_post"];
+const STORY_TYPES = ["story_mention", "story"];
+
 function isSharedPost(m: Message) {
-  return ["share", "ig_post", "ig_reel", "reel", "story_mention"].includes((m.attachment_type || "").toLowerCase());
+  return [...REEL_TYPES, ...POST_TYPES, ...STORY_TYPES].includes((m.attachment_type || "").toLowerCase());
 }
 
 // Media messages carry no text of their own; one Instagram gives no viewable
@@ -204,11 +270,161 @@ function hasUnviewableMedia(m: Message) {
   return !!m.attachment_type && !mediaOf(m) && !m.content;
 }
 
-function formatTime(isoStr?: string) {
-  if (!isoStr) return "";
-  const d = new Date(isoStr);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function mediaLabel(type: string | null | undefined): string {
+  const kind = (type || "").toLowerCase();
+  if (kind === "image") return t("conversations.media.image");
+  if (kind === "video") return t("conversations.media.video");
+  if (kind === "audio") return t("conversations.media.audio");
+  if (REEL_TYPES.includes(kind)) return t("conversations.media.reel");
+  if (POST_TYPES.includes(kind)) return t("conversations.media.post");
+  if (STORY_TYPES.includes(kind)) return t("conversations.media.story");
+  return t("conversations.media.file");
+}
+
+// --- List helpers ------------------------------------------------------------
+
+// Re-evaluates relative times ("now", "14:05", "yesterday") once a minute.
+const now = ref(Date.now());
+let clockTimer: ReturnType<typeof setInterval> | null = null;
+
+function previewText(c: ConversationSummary): string {
+  const lm = c.last_message;
+  if (!lm) return "";
+  let body: string;
+  if (isReaction(lm)) {
+    body = t("conversations.media.reaction", { emoji: lm.content });
+  } else {
+    const text = lm.content.trim();
+    // An untranscribed voice note still carries its bracketed placeholder.
+    const placeholder = lm.attachment_type === "audio" && /^\[.*\]$/.test(text);
+    const kind = (lm.attachment_type || "").toLowerCase();
+    if (!lm.attachment_type) body = text;
+    else if (!text || placeholder) body = mediaLabel(kind);
+    else if (kind === "image" || kind === "video") body = text;
+    else body = `${mediaLabel(kind)}: ${text}`;
+  }
+  if (lm.sender_type === "human") return `${t("conversations.you")}: ${body}`;
+  if (lm.sender_type === "ai") return `${t("conversations.modeAi")}: ${body}`;
+  return body;
+}
+
+function listTime(c: ConversationSummary): string {
+  const iso = c.last_message?.created_at ?? c.last_message_at;
+  if (!iso) return "";
+  const nowDate = new Date(now.value);
+  if (nowDate.getTime() - new Date(iso).getTime() < 60_000) return t("conversations.now");
+  const days = daysAgo(iso, nowDate);
+  if (days <= 0) return formatClock(iso);
+  if (days === 1) return t("conversations.yesterday");
+  return formatShortDate(iso, locale.value, nowDate);
+}
+
+// The owner owes this customer an answer: operator mode and the customer
+// spoke last.
+function awaitingReply(c: ConversationSummary): boolean {
+  return !isAiStatus(c.status) && c.status !== "closed" && c.last_message?.sender_type === "customer";
+}
+
+function cleanCustomerName(username?: string | null) {
+  if (!username) return t("conversations.customer");
+  const str = username.trim();
+  const lower = str.toLowerCase();
+  // Instagram's placeholder handles and the server's own "unknown user" label.
+  if (lower.startsWith("@user_") || lower.startsWith("user_") || str === "Instagram foydalanuvchisi") {
+    return t("conversations.customer");
+  }
+  return str;
+}
+
+function getAvatarLetter(username?: string | null) {
+  return cleanCustomerName(username).replace("@", "").trim().charAt(0).toUpperCase() || "M";
+}
+
+const threadSubtitle = computed(() => {
+  const c = selected.value;
+  if (!c) return "";
+  const parts: string[] = [];
+  const name = c.customer_name?.trim();
+  if (name && name.toLowerCase() !== (c.customer_username || "").replace("@", "").toLowerCase()) parts.push(name);
+  if (c.customer_phone) parts.push(c.customer_phone);
+  return parts.length ? parts.join(" · ") : "Instagram";
+});
+
+// --- Thread rows: day dividers, sender groups, reactions ----------------------
+
+interface BubbleItem {
+  msg: Message;
+  // AI reactions left on this (customer) message instead of a reply.
+  reactions: Message[];
+}
+interface GroupRow {
+  kind: "group";
+  key: string;
+  sender: Message["sender_type"];
+  items: BubbleItem[];
+}
+interface DayRow {
+  kind: "day";
+  key: string;
+  label: string;
+}
+interface ReactionRow {
+  kind: "reaction";
+  key: string;
+  msg: Message;
+}
+type ThreadRow = GroupRow | DayRow | ReactionRow;
+
+function dayLabel(iso: string): string {
+  const days = daysAgo(iso, new Date(now.value));
+  if (days === 0) return t("conversations.today");
+  if (days === 1) return t("conversations.yesterday");
+  return formatDayMonth(iso, locale.value, new Date(now.value));
+}
+
+const threadRows = computed<ThreadRow[]>(() => {
+  const rows: ThreadRow[] = [];
+  let group: GroupRow | null = null;
+  let lastDay = "";
+  let prev: Message | null = null;
+  let lastCustomerBubble: BubbleItem | null = null;
+  for (const m of visibleMessages.value) {
+    if (isReaction(m)) {
+      // A reaction answers the customer's previous message — it's drawn on it.
+      if (lastCustomerBubble) lastCustomerBubble.reactions.push(m);
+      else rows.push({ kind: "reaction", key: m.id, msg: m });
+      continue;
+    }
+    const d = new Date(m.created_at);
+    const day = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    if (day !== lastDay) {
+      rows.push({ kind: "day", key: `day-${m.id}`, label: dayLabel(m.created_at) });
+      lastDay = day;
+      group = null;
+    }
+    const gap = prev ? d.getTime() - new Date(prev.created_at).getTime() > GROUP_GAP_MS : true;
+    if (!group || group.sender !== m.sender_type || gap) {
+      group = { kind: "group", key: `group-${m.id}`, sender: m.sender_type, items: [] };
+      rows.push(group);
+    }
+    const item: BubbleItem = { msg: m, reactions: [] };
+    group.items.push(item);
+    if (m.sender_type === "customer") lastCustomerBubble = item;
+    prev = m;
+  }
+  return rows;
+});
+
+function groupSenderLabel(sender: Message["sender_type"]): string {
+  if (sender === "human") return t("conversations.you");
+  if (sender === "system") return t("conversations.system");
+  return t("conversations.aiAssistant");
+}
+
+function reactionLabel(r: Message): string {
+  if (r.delivery_status === "failed") return `${t("conversations.aiReacted", { emoji: r.content })} — ${t("conversations.notDelivered")}`;
+  if (r.delivery_status === "pending") return `${t("conversations.aiReacted", { emoji: r.content })} — ${t("conversations.sending")}`;
+  return t("conversations.aiReacted", { emoji: r.content });
 }
 
 // --- Thread state helpers ----------------------------------------------------
@@ -280,6 +496,7 @@ function handleConversationGone(id: string) {
   if (requestedId === id) requestedId = null;
   if (route.query.id === id) {
     isMobileThreadActive.value = false;
+    pushedThreadEntry = false;
     const nextQuery = { ...route.query };
     delete nextQuery.id;
     router.replace({ query: nextQuery });
@@ -290,9 +507,27 @@ function handleConversationGone(id: string) {
 // --- Operator replies --------------------------------------------------------
 
 const replyText = ref("");
+const replyInputRef = ref<HTMLTextAreaElement | null>(null);
 // Per-conversation drafts, so switching chats never sends a half-typed
 // reply to the wrong customer.
 const drafts: Record<string, string> = {};
+
+// Replies can't reach the customer without a connected Instagram account.
+const canReply = computed(() => igConnected.value !== false);
+
+// Grows with the text up to five lines, then scrolls inside.
+function autoGrowComposer() {
+  const el = replyInputRef.value;
+  if (!el) return;
+  const style = window.getComputedStyle(el);
+  const lineHeight = parseFloat(style.lineHeight) || 20;
+  const max = lineHeight * 5 + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+  el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+}
+
+watch(replyText, () => nextTick(autoGrowComposer));
 
 function setLocal(convId: string, localId: string, patch: Partial<Message>) {
   const msg = localMessages[convId]?.find((m) => m.id === localId);
@@ -333,11 +568,18 @@ function applyOperatorTakeover(convId: string) {
   if (item) apply(item);
 }
 
-function bumpConversation(convId: string, at: string) {
+function bumpConversation(convId: string, msg: Message) {
   const idx = conversations.value.findIndex((c) => c.id === convId);
   if (idx === -1) return;
   const [item] = conversations.value.splice(idx, 1);
-  item!.last_message_at = at;
+  item!.last_message_at = msg.created_at;
+  item!.last_message = {
+    content: msg.content.slice(0, 120),
+    sender_type: msg.sender_type,
+    message_type: msg.message_type,
+    attachment_type: msg.attachment_type,
+    created_at: msg.created_at,
+  };
   conversations.value.unshift(item!);
 }
 
@@ -384,23 +626,26 @@ async function deliver(convId: string, localId: string, content: string) {
 async function handleSendReply() {
   const conv = selected.value;
   const content = replyText.value.trim();
-  if (!conv || !content) return;
+  if (!conv || !content || !canReply.value) return;
   if (content.length > REPLY_MAX_LENGTH) {
     toast.error(t("conversations.replyTooLong", { max: REPLY_MAX_LENGTH }));
     return;
   }
 
-  // Clear input immediately so operator can type next message without waiting
+  // Clear the input at once so the next message can be typed while this
+  // one is on its way; focus stays in the composer.
   replyText.value = "";
   drafts[conv.id] = "";
+  replyInputRef.value?.focus();
 
   const local = addLocal(conv.id, content);
-  scrollToBottom(true);
-  bumpConversation(conv.id, local.created_at);
+  await nextTick();
+  chat.scrollToBottom();
+  bumpConversation(conv.id, local);
   await deliver(conv.id, local.id, content);
 }
 
-function retrySendMessage(msg: Message) {
+async function retrySendMessage(msg: Message) {
   const conv = selected.value;
   if (!conv || msg.sender_type !== "human" || msg.delivery_status !== "failed") return;
   if (msg.local) {
@@ -408,68 +653,18 @@ function retrySendMessage(msg: Message) {
   } else {
     // Stored server-side as failed: send its text again as a new reply.
     const local = addLocal(conv.id, msg.content);
-    scrollToBottom(true);
+    await nextTick();
+    chat.scrollToBottom();
     deliver(conv.id, local.id, msg.content);
   }
 }
 
 function handleReplyKeydown(e: KeyboardEvent) {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    handleSendReply();
-  }
-}
-
-// --- Scrolling ---------------------------------------------------------------
-
-function scrollToBottomDirect() {
-  const el = messagesContainerRef.value;
-  if (!el) return;
-  el.scrollTop = el.scrollHeight;
-}
-
-function scrollToBottom(smooth = false) {
-  shouldStickToBottom.value = true;
-  nextTick(() => {
-    const el = messagesContainerRef.value;
-    if (!el) return;
-    el.scrollTo({
-      top: el.scrollHeight,
-      behavior: smooth ? "smooth" : "auto",
-    });
-
-    setTimeout(scrollToBottomDirect, 50);
-    setTimeout(scrollToBottomDirect, 150);
-    setTimeout(scrollToBottomDirect, 300);
-  });
-}
-
-function scrollToBottomSmooth() {
-  shouldStickToBottom.value = true;
-  showScrollDownBtn.value = false;
-  scrollToBottom(true);
-}
-
-function attachObservers() {
-  const el = messagesContainerRef.value;
-  if (!el) return;
-
-  if (messagesResizeObserver) messagesResizeObserver.disconnect();
-  if (messagesMutationObserver) messagesMutationObserver.disconnect();
-
-  messagesResizeObserver = new ResizeObserver(() => {
-    if (shouldStickToBottom.value) {
-      scrollToBottomDirect();
-    }
-  });
-  messagesResizeObserver.observe(el);
-
-  messagesMutationObserver = new MutationObserver(() => {
-    if (shouldStickToBottom.value) {
-      scrollToBottomDirect();
-    }
-  });
-  messagesMutationObserver.observe(el, { childList: true, subtree: true });
+  if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+  // On phones Enter is a new line; the send button sends.
+  if (isCoarsePointer()) return;
+  e.preventDefault();
+  handleSendReply();
 }
 
 // --- Opening a conversation --------------------------------------------------
@@ -480,10 +675,19 @@ function attachObservers() {
 let openSeq = 0;
 let openAbort: AbortController | null = null;
 let requestedId: string | null = null;
+// On a phone, opening a thread from the list adds a history entry, so the
+// system back button/gesture returns to the list instead of leaving the page.
+let pushedThreadEntry = false;
 
 async function openConversation(id: string, updateQuery = true) {
   if (updateQuery && route.query.id !== id) {
-    router.replace({ query: { ...route.query, id } });
+    const query = { ...route.query, id };
+    if (isMobileViewport() && !route.query.id) {
+      pushedThreadEntry = true;
+      router.push({ query });
+    } else {
+      router.replace({ query });
+    }
   }
   isMobileThreadActive.value = true;
   if (requestedId === id && (threadLoading.value || selected.value?.id === id)) return;
@@ -498,19 +702,18 @@ async function openConversation(id: string, updateQuery = true) {
   const ctrl = new AbortController();
   openAbort = ctrl;
   selected.value = null;
+  threadError.value = null;
   threadLoading.value = true;
 
   try {
     const detail = await api.getConversation(id, { limit: MESSAGE_PAGE, signal: ctrl.signal });
     if (seq !== openSeq) return;
     selected.value = detail;
-    displayedCount.value = PAGE_SIZE;
-    shouldStickToBottom.value = true;
-    showScrollDownBtn.value = false;
-    scrollToBottom(false);
-    nextTick(() => {
-      attachObservers();
-    });
+    unseenCount.value = 0;
+    lastScrollTop = 0;
+    resetWindow();
+    await nextTick();
+    chat.scrollToBottom();
   } catch (err) {
     if (seq !== openSeq || isAbortError(err)) return;
     requestedId = null;
@@ -518,7 +721,7 @@ async function openConversation(id: string, updateQuery = true) {
       handleConversationGone(id);
     } else {
       console.error("Failed to load conversation", err);
-      toast.error(errorText(err));
+      threadError.value = errorText(err);
     }
   } finally {
     if (seq === openSeq) {
@@ -528,30 +731,60 @@ async function openConversation(id: string, updateQuery = true) {
   }
 }
 
-function closeMobileThread() {
-  isMobileThreadActive.value = false;
-  if (route.query.id) {
-    const nextQuery = { ...route.query };
-    delete nextQuery.id;
-    router.replace({ query: nextQuery });
-  }
+function retryOpen() {
+  const id = typeof route.query.id === "string" ? route.query.id : null;
+  if (id) openConversation(id, false);
 }
 
-async function toggleConversationStatus() {
+function closeMobileThread() {
+  isMobileThreadActive.value = false;
+  if (!route.query.id) return;
+  if (pushedThreadEntry) {
+    pushedThreadEntry = false;
+    router.back();
+    return;
+  }
+  const nextQuery = { ...route.query };
+  delete nextQuery.id;
+  router.replace({ query: nextQuery });
+}
+
+// AI mode: the AI answers. Operator mode: the AI stays quiet and the owner
+// answers (human_active — a person has taken the conversation over).
+const statusSaving = ref(false);
+
+async function setMode(mode: "ai" | "operator") {
   const conv = selected.value;
-  if (!conv) return;
-  const newStatus = isAiStatus(conv.status) ? "human_needed" : "ai_active";
+  if (!conv || statusSaving.value) return;
+  if ((mode === "ai") === isAiStatus(conv.status)) return;
+  const newStatus: ConversationStatus = mode === "ai" ? "ai_active" : "human_active";
+  statusSaving.value = true;
   try {
     const updated = await api.updateConversationStatus(conv.id, newStatus);
     if (selected.value?.id === conv.id) selected.value.status = updated.status;
     const item = conversations.value.find((c) => c.id === conv.id);
     if (item) item.status = updated.status;
-    toast.success(newStatus === "ai_active" ? t("conversations.switchedToAi") : t("conversations.switchedToOperator"));
+    toast.success(mode === "ai" ? t("conversations.switchedToAi") : t("conversations.switchedToOperator"));
   } catch (err) {
     console.error("Failed to update status", err);
     toast.error(errorText(err));
+  } finally {
+    statusSaving.value = false;
   }
 }
+
+// One line above the composer saying who answers this customer right now.
+const threadNote = computed<{ tone: "muted" | "warn"; text: string; link?: string } | null>(() => {
+  const c = selected.value;
+  if (!c) return null;
+  if (c.status === "closed") return { tone: "muted", text: t("conversations.noteClosed") };
+  if (c.status === "human_needed") return { tone: "warn", text: t("conversations.noteHandoff") };
+  if (isAiStatus(c.status)) {
+    if (aiGloballyOff.value) return { tone: "warn", text: t("conversations.noteAiOff"), link: "/ai-settings" };
+    return { tone: "muted", text: t("conversations.noteAi") };
+  }
+  return { tone: "muted", text: t("conversations.noteOperator") };
+});
 
 // --- Background sync ---------------------------------------------------------
 
@@ -593,12 +826,9 @@ async function syncNow(opts: { force?: boolean; userInitiated?: boolean } = {}) 
     await refreshList();
     if (convId && selected.value?.id === convId) {
       const added = await syncThread(convId, ctrl.signal);
-      if (added.length > 0) {
-        // Only move the view on an actual new message, and not while the
-        // owner is reading back through older ones.
-        if (shouldStickToBottom.value) scrollToBottom();
-        else showScrollDownBtn.value = true;
-      }
+      // While pinned, the scroll follows on its own (useChatScroll); while
+      // the owner reads further up, nothing moves — they get a counter.
+      if (added.length > 0 && !chat.pinned.value) unseenCount.value += added.length;
     }
     syncError.value = false;
   } catch (err) {
@@ -662,6 +892,7 @@ async function confirmDeleteConversation() {
     replyText.value = "";
     isDeleteConfirmModalOpen.value = false;
     isMobileThreadActive.value = false;
+    pushedThreadEntry = false;
     toast.success(t("conversations.deleted"));
     router.replace({ query: {} });
   } catch (err) {
@@ -672,7 +903,10 @@ async function confirmDeleteConversation() {
   }
 }
 
+// --- AI feedback -------------------------------------------------------------
+
 async function handlePositiveFeedback(msg: Message) {
+  if (ratedMessages[msg.id] === "up") return;
   try {
     await api.submitAiFeedback({
       conversation_id: selected.value?.id,
@@ -680,6 +914,7 @@ async function handlePositiveFeedback(msg: Message) {
       rating: "thumb_up",
       ai_response: msg.content,
     });
+    ratedMessages[msg.id] = "up";
     toast.success(t("conversations.feedbackThanks"));
   } catch (err) {
     console.error("Failed to submit feedback", err);
@@ -689,10 +924,19 @@ async function handlePositiveFeedback(msg: Message) {
 
 function openCorrectionModal(msg: Message) {
   feedbackTargetMessage.value = msg;
+  // The customer message this reply answered: the nearest one before it.
   const msgs = threadMessages.value;
   const msgIndex = msgs.findIndex((m) => m.id === msg.id);
-  const previous = msgIndex > 0 ? msgs[msgIndex - 1] : undefined;
-  feedbackCustomerQuery.value = previous && previous.sender_type === "customer" ? previous.content : "";
+  let query = "";
+  for (let i = msgIndex - 1; i >= 0; i--) {
+    const m = msgs[i]!;
+    if (m.sender_type === "customer") {
+      query = m.content;
+      break;
+    }
+    if (!isReaction(m)) break;
+  }
+  feedbackCustomerQuery.value = query;
   feedbackCorrectionText.value = "";
   isFeedbackModalOpen.value = true;
 }
@@ -705,15 +949,17 @@ function closeCorrectionModal() {
 async function submitCorrection() {
   if (!feedbackTargetMessage.value || !feedbackCorrectionText.value.trim()) return;
   feedbackSubmitting.value = true;
+  const target = feedbackTargetMessage.value;
   try {
     await api.submitAiFeedback({
       conversation_id: selected.value?.id,
-      message_id: feedbackTargetMessage.value.id,
+      message_id: target.id,
       rating: "thumb_down",
       customer_query: feedbackCustomerQuery.value,
-      ai_response: feedbackTargetMessage.value.content,
+      ai_response: target.content,
       correction: feedbackCorrectionText.value.trim(),
     });
+    ratedMessages[target.id] = "down";
     closeCorrectionModal();
     toast.success(t("conversations.correctionLearned"));
   } catch (err) {
@@ -723,6 +969,8 @@ async function submitCorrection() {
     feedbackSubmitting.value = false;
   }
 }
+
+// --- Lifecycle ---------------------------------------------------------------
 
 async function loadInitial() {
   loading.value = true;
@@ -742,7 +990,7 @@ async function loadInitial() {
   if (queryId) {
     // Links from notifications may point past the first page — open it anyway.
     await openConversation(queryId, false);
-  } else if (conversations.value.length > 0 && window.innerWidth > 768) {
+  } else if (conversations.value.length > 0 && !isMobileViewport()) {
     await openConversation(conversations.value[0]!.id, false);
   }
 }
@@ -759,443 +1007,628 @@ onMounted(async () => {
   });
   document.addEventListener("visibilitychange", onVisibilityChange);
   pollTimer = setInterval(() => syncNow(), POLL_INTERVAL_MS);
+  clockTimer = setInterval(() => (now.value = Date.now()), 60_000);
+  loadContext();
   await loadInitial();
 });
 
 onUnmounted(() => {
   isMobileThreadActive.value = false;
   if (pollTimer) clearInterval(pollTimer);
+  if (clockTimer) clearInterval(clockTimer);
   openAbort?.abort();
   pollAbort?.abort();
   stopConversationEvents?.();
   document.removeEventListener("visibilitychange", onVisibilityChange);
-  if (messagesResizeObserver) messagesResizeObserver.disconnect();
-  if (messagesMutationObserver) messagesMutationObserver.disconnect();
 });
 
 watch(
   () => route.query.id,
   async (newId) => {
-    if (newId && typeof newId === "string" && requestedId !== newId) {
-      await openConversation(newId, false);
+    if (newId && typeof newId === "string") {
+      if (requestedId !== newId) await openConversation(newId, false);
+      else isMobileThreadActive.value = true;
     } else if (!newId) {
+      // Back from a thread (button, gesture, or browser history).
+      pushedThreadEntry = false;
       isMobileThreadActive.value = false;
     }
   }
 );
-
-function cleanCustomerName(username?: string | null) {
-  if (!username) return t("conversations.customer");
-  const str = username.trim();
-  if (str.toLowerCase().startsWith("@user_") || str.toLowerCase().startsWith("user_")) {
-    return t("conversations.customer");
-  }
-  return str;
-}
-
-function getAvatarLetter(username?: string | null) {
-  if (!username) return "M";
-  const clean = cleanCustomerName(username).replace("@", "").trim();
-  return clean.charAt(0).toUpperCase();
-}
 </script>
 
 <template>
   <div class="conversations-page" :class="{ 'mobile-thread-active': isMobileThreadActive }">
-    <!-- Loading State with Smooth Animated Messenger Skeleton -->
-    <div v-if="loading" class="split-view">
+    <!-- Initial load -->
+    <div v-if="loading" class="split-view" aria-busy="true">
       <div class="conversation-sidebar p-4 space-y-3">
         <Skeleton class="h-5 w-32 mb-4" />
         <div v-for="i in 5" :key="i" class="flex items-center gap-3 p-2 rounded-lg">
           <Skeleton class="w-10 h-10 rounded-full shrink-0" />
           <div class="space-y-2 flex-1">
             <Skeleton class="h-4 w-28" />
-            <Skeleton class="h-3 w-16" />
+            <Skeleton class="h-3 w-40" />
           </div>
         </div>
       </div>
-      <div class="thread-area p-6 space-y-6 flex flex-col justify-between">
-        <div class="flex items-center justify-between pb-4 border-b border-border">
-          <div class="flex items-center gap-3">
-            <Skeleton class="w-10 h-10 rounded-full" />
-            <Skeleton class="h-5 w-32" />
-          </div>
-          <Skeleton class="h-6 w-20 rounded-full" />
-        </div>
-        <div class="space-y-4 flex-1">
-          <Skeleton class="h-16 w-2/3 rounded-xl ml-auto" />
-          <Skeleton class="h-14 w-1/2 rounded-xl" />
-          <Skeleton class="h-16 w-3/4 rounded-xl ml-auto" />
-        </div>
+      <div class="thread-area p-6 space-y-4">
+        <Skeleton class="h-10 w-48" />
+        <Skeleton class="h-14 w-1/2 rounded-2xl" />
+        <Skeleton class="h-14 w-2/3 rounded-2xl ml-auto" />
+        <Skeleton class="h-14 w-1/3 rounded-2xl" />
       </div>
     </div>
 
     <!-- Initial load failed -->
     <div v-else-if="listError" class="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
       <AlertCircle :size="28" class="text-destructive" />
-      <p class="text-sm text-foreground">{{ t("conversations.loadError") }}</p>
+      <p class="text-sm font-medium text-foreground">{{ t("conversations.loadError") }}</p>
       <p class="text-xs text-muted-foreground">{{ listError }}</p>
-      <Button variant="outline" size="sm" class="gap-2" @click="loadInitial">
+      <Button variant="outline" class="h-10 gap-2" @click="loadInitial">
         <RefreshCw :size="14" />
         <span>{{ t("common.retry") }}</span>
       </Button>
     </div>
 
-    <!-- Split View Messenger Container -->
-    <div v-else class="split-view" :class="{ 'mobile-thread-open': isMobileThreadActive }">
-      <!-- Conversation List Sidebar -->
-      <div class="conversation-sidebar" :class="{ 'mobile-hidden': isMobileThreadActive }">
-        <div class="px-4 py-3.5 border-b border-border text-xs font-bold text-muted-foreground uppercase tracking-wide shrink-0">
-          {{ t("conversations.activeChats") }} ({{ conversations.length }}{{ hasMoreConversations ? "+" : "" }})
+    <div v-else class="split-view">
+      <!-- Conversation list -->
+      <section
+        class="conversation-sidebar"
+        :class="{ 'mobile-hidden': isMobileThreadActive }"
+        :aria-label="t('conversations.listTitle')"
+      >
+        <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-2 shrink-0 min-h-14">
+          <h2 class="text-sm font-semibold text-foreground">
+            {{ t("conversations.listTitle") }}
+            <span class="font-normal text-muted-foreground">{{ conversations.length }}{{ hasMoreConversations ? "+" : "" }}</span>
+          </h2>
+          <button
+            type="button"
+            class="icon-btn"
+            :title="t('common.refresh')"
+            :aria-label="t('common.refresh')"
+            :disabled="refreshing"
+            @click="manualRefresh"
+          >
+            <RefreshCw :size="16" :class="{ 'animate-spin': refreshing }" />
+          </button>
         </div>
 
-        <div v-if="syncError" class="px-4 py-2 text-[11px] text-destructive bg-destructive/5 border-b border-destructive/20 flex items-center gap-1.5 shrink-0">
+        <div
+          v-if="syncError"
+          class="px-4 py-2 text-xs text-destructive bg-destructive/5 border-b border-destructive/20 flex items-center gap-1.5 shrink-0"
+          role="status"
+        >
           <AlertCircle :size="12" class="shrink-0" />
           <span>{{ t("conversations.syncError") }}</span>
         </div>
 
         <ul v-if="conversations.length > 0" class="flex-1 min-h-0 overflow-y-auto overscroll-contain m-0 p-0 list-none custom-scrollbar">
-          <li
-            v-for="c in conversations"
-            :key="c.id"
-            class="conversation-item"
-            :class="{ active: (selected?.id ?? requestedId) === c.id }"
-            @click="openConversation(c.id)"
-          >
-            <div class="avatar">
-              {{ getAvatarLetter(c.customer_username) }}
-            </div>
-            <div class="overflow-hidden flex-1">
-              <div class="flex items-center justify-between gap-2">
-                <span class="conversation-item-title truncate">
-                  {{ cleanCustomerName(c.customer_username) }}
+          <li v-for="c in conversations" :key="c.id">
+            <button
+              type="button"
+              class="conversation-item"
+              :class="{ active: (selected?.id ?? requestedId) === c.id }"
+              :aria-current="(selected?.id ?? requestedId) === c.id ? 'true' : undefined"
+              @click="openConversation(c.id)"
+            >
+              <span class="avatar" aria-hidden="true">{{ getAvatarLetter(c.customer_username) }}</span>
+              <span class="min-w-0 flex-1">
+                <span class="flex items-baseline justify-between gap-2">
+                  <span class="truncate text-sm text-foreground" :class="awaitingReply(c) ? 'font-bold' : 'font-semibold'">
+                    {{ cleanCustomerName(c.customer_username) }}
+                  </span>
+                  <span class="shrink-0 text-xs" :class="awaitingReply(c) ? 'text-primary font-semibold' : 'text-muted-foreground'">
+                    {{ listTime(c) }}
+                  </span>
                 </span>
-              </div>
-              <div class="flex items-center justify-between mt-1">
-                <span
-                  class="inline-flex items-center justify-center h-5 w-5 rounded-md"
-                  :class="isAiStatus(c.status) ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'"
-                  :title="isAiStatus(c.status) ? t('conversations.modeAi') : t('conversations.modeOperator')"
-                >
-                  <Bot v-if="isAiStatus(c.status)" :size="12" />
-                  <User v-else :size="12" />
+                <span class="mt-0.5 flex items-center justify-between gap-2">
+                  <span
+                    class="truncate text-[13px]"
+                    :class="awaitingReply(c) ? 'text-foreground font-medium' : 'text-muted-foreground'"
+                  >
+                    {{ previewText(c) || " " }}
+                  </span>
+                  <span
+                    v-if="c.status === 'human_needed'"
+                    class="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300"
+                  >
+                    {{ t("conversations.statusHandoff") }}
+                  </span>
+                  <span
+                    v-else-if="isAiStatus(c.status)"
+                    class="shrink-0 inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[11px] font-semibold text-primary"
+                    :title="t('conversations.modeAiHint')"
+                  >
+                    <Bot :size="12" aria-hidden="true" />
+                    <span>{{ t("conversations.modeAi") }}</span>
+                  </span>
+                  <span
+                    v-else
+                    class="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground"
+                    :title="t('conversations.modeOperatorHint')"
+                  >
+                    {{ c.status === "closed" ? t("conversations.statusClosed") : t("conversations.modeOperator") }}
+                  </span>
                 </span>
-                <span class="text-xs text-muted-foreground">Instagram</span>
-              </div>
-            </div>
+              </span>
+            </button>
           </li>
           <li v-if="hasMoreConversations" class="p-3 flex justify-center">
             <Button
               variant="outline"
-              size="sm"
-              class="h-8 text-xs gap-1.5"
+              class="h-10 gap-1.5"
               :disabled="loadingMoreConversations"
               @click="loadMoreConversations"
             >
-              <Loader2 v-if="loadingMoreConversations" :size="12" class="animate-spin" />
+              <Loader2 v-if="loadingMoreConversations" :size="14" class="animate-spin" />
               <span>{{ t("common.loadMore") }}</span>
             </Button>
           </li>
         </ul>
-        <div v-else class="muted p-8 text-center text-sm">
-          {{ t("conversations.noActiveChats") }}
-        </div>
-      </div>
 
-      <!-- Thread Details Area (Chat Messages or Empty State) -->
-      <div class="thread-area" :class="{ 'mobile-visible': isMobileThreadActive }">
-        <template v-if="selected">
-          <!-- Thread Header with DM Management Actions -->
-          <div class="px-3 py-2.5 sm:px-5 sm:py-3.5 border-b border-border flex items-center justify-between shrink-0 bg-card gap-2 pt-[max(0.625rem,env(safe-area-inset-top))]">
-            <div class="flex items-center gap-1.5 sm:gap-2.5 min-w-0 flex-1">
-              <!-- Mobile Back Button -->
-              <button
-                type="button"
-                class="mobile-back-btn inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border border-border/80 bg-muted/50 hover:bg-muted text-foreground transition-all shadow-2xs active:scale-95 shrink-0 cursor-pointer mr-0.5"
-                :title="t('conversations.backToList')"
-                :aria-label="t('common.back')"
-                @click="closeMobileThread"
-              >
-                <ArrowLeft :size="18" class="shrink-0" />
-              </button>
-
-              <div class="overflow-hidden flex items-center min-w-0">
-                <div class="font-bold text-sm sm:text-base text-foreground truncate">
-                  {{ cleanCustomerName(selected.customer_username) }}
-                </div>
-              </div>
-            </div>
-
-            <!-- DM Management Controls -->
-            <div class="flex items-center gap-1 sm:gap-2 shrink-0">
-              <!-- Mode Toggle Button (Robot / Odam icon) -->
-              <button
-                type="button"
-                class="inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border transition-all shadow-2xs active:scale-95 cursor-pointer"
-                :class="isAiStatus(selected.status)
-                  ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
-                  : 'border-border/80 bg-card text-muted-foreground hover:bg-muted hover:text-foreground'"
-                :title="isAiStatus(selected.status)
-                  ? t('conversations.aiModeActiveTooltip')
-                  : t('conversations.operatorModeActiveTooltip')"
-                @click="toggleConversationStatus"
-              >
-                <Bot v-if="isAiStatus(selected.status)" :size="16" class="shrink-0" />
-                <User v-else :size="16" class="shrink-0" />
-              </button>
-
-              <!-- Manual Refresh -->
-              <button
-                type="button"
-                class="inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border border-border/80 bg-card hover:bg-muted text-foreground transition-all shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
-                :title="t('common.refresh')"
-                :disabled="refreshing"
-                @click="manualRefresh"
-              >
-                <RefreshCw :size="14" :class="{ 'animate-spin': refreshing }" />
-              </button>
-
-              <!-- Delete Conversation Button -->
-              <button
-                type="button"
-                class="inline-flex items-center justify-center h-8 w-8 sm:h-9 sm:w-9 rounded-xl border border-destructive/30 bg-card hover:bg-destructive/10 text-destructive transition-all shadow-2xs active:scale-95 cursor-pointer"
-                :title="t('conversations.deleteChatTitle')"
-                @click="openDeleteConfirmModal"
-              >
-                <Trash2 :size="14" />
-              </button>
-            </div>
+        <!-- No conversations yet: say what to do about it -->
+        <div v-else class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+          <div class="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary">
+            <MessageSquare :size="22" />
           </div>
+          <h2 class="text-sm font-semibold text-foreground">{{ t("conversations.noConversationsTitle") }}</h2>
+          <p class="max-w-xs text-sm text-muted-foreground">
+            {{ igConnected === true ? t("conversations.emptyConnectedHint") : t("conversations.noConversationsDesc") }}
+          </p>
+          <Button v-if="igConnected === false" as-child class="h-10 gap-2">
+            <NuxtLink to="/integrations">
+              <Plug :size="16" />
+              <span>{{ t("conversations.connectInstagram") }}</span>
+            </NuxtLink>
+          </Button>
+          <Button v-else-if="igConnected === true" variant="outline" as-child class="h-10 gap-2">
+            <NuxtLink to="/sandbox">
+              <Sparkles :size="16" />
+              <span>{{ t("conversations.tryInSandbox") }}</span>
+            </NuxtLink>
+          </Button>
+          <Button v-else variant="outline" as-child class="h-10">
+            <NuxtLink to="/integrations">{{ t("conversations.openIntegrations") }}</NuxtLink>
+          </Button>
+        </div>
+      </section>
 
-          <!-- Thread Message Bubbles Container -->
-          <div
-            ref="messagesContainerRef"
-            class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 sm:p-5 flex flex-col gap-3.5 custom-scrollbar"
-            @scroll="handleMessagesScroll"
-          >
-            <!-- Load Older Messages Trigger -->
-            <div v-if="hasOlderMessages" class="flex justify-center py-1 shrink-0">
+      <!-- Thread -->
+      <section class="thread-area" :class="{ 'mobile-visible': isMobileThreadActive }">
+        <template v-if="selected">
+          <!-- Thread header -->
+          <header class="thread-header">
+            <button
+              type="button"
+              class="mobile-back-btn icon-btn -ml-1"
+              :aria-label="t('conversations.backToList')"
+              @click="closeMobileThread"
+            >
+              <ArrowLeft :size="20" />
+            </button>
+
+            <span class="avatar hidden sm:flex" aria-hidden="true">{{ getAvatarLetter(selected.customer_username) }}</span>
+            <div class="min-w-0 flex-1">
+              <h2 class="truncate text-[15px] font-semibold leading-tight text-foreground">
+                {{ cleanCustomerName(selected.customer_username) }}
+              </h2>
+              <p class="truncate text-xs text-muted-foreground">{{ threadSubtitle }}</p>
+            </div>
+
+            <!-- Who replies: AI or the owner -->
+            <div
+              class="mode-toggle"
+              role="radiogroup"
+              :aria-label="t('conversations.modeGroupLabel')"
+              :aria-busy="statusSaving"
+            >
               <button
                 type="button"
-                class="text-xs px-3.5 py-1.5 rounded-full bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground transition-all flex items-center gap-1.5 shadow-2xs border border-border/60 cursor-pointer"
-                :disabled="isLoadingOlder"
-                @click="loadOlderMessages"
+                role="radio"
+                class="mode-option"
+                :aria-checked="isAiStatus(selected.status)"
+                :title="t('conversations.modeAiHint')"
+                :disabled="statusSaving"
+                @click="setMode('ai')"
               >
-                <Loader2 v-if="isLoadingOlder" :size="12" class="animate-spin" />
-                <ChevronUp v-else :size="12" />
-                <span>{{ hiddenLoadedCount > 0 ? t("conversations.loadOlder", { count: hiddenLoadedCount }) : t("conversations.loadOlderServer") }}</span>
+                <Bot :size="14" aria-hidden="true" />
+                <span>{{ t("conversations.modeAi") }}</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                class="mode-option"
+                :aria-checked="!isAiStatus(selected.status)"
+                :title="t('conversations.modeOperatorHint')"
+                :disabled="statusSaving"
+                @click="setMode('operator')"
+              >
+                <span>{{ t("conversations.modeOperator") }}</span>
               </button>
             </div>
 
-            <!-- Message Bubbles -->
+            <!-- Everything else, destructive last, behind one menu -->
+            <DropdownMenuRoot :modal="false">
+              <DropdownMenuTrigger as-child>
+                <button type="button" class="icon-btn" :aria-label="t('conversations.moreActions')" :title="t('conversations.moreActions')">
+                  <MoreVertical :size="18" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuContent align="end" :side-offset="6" class="menu-content">
+                  <DropdownMenuItem class="menu-item" :disabled="refreshing" @select="manualRefresh">
+                    <RefreshCw :size="16" />
+                    <span>{{ t("common.refresh") }}</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator class="my-1 h-px bg-border" />
+                  <DropdownMenuItem class="menu-item text-destructive" @select="openDeleteConfirmModal">
+                    <Trash2 :size="16" />
+                    <span>{{ t("conversations.deleteChatTitle") }}</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenuPortal>
+            </DropdownMenuRoot>
+          </header>
+
+          <!-- Messages -->
+          <div class="relative flex min-h-0 flex-1 flex-col">
             <div
-              v-for="m in visibleMessages"
-              :key="m.id"
-              class="bubble max-w-[85%] sm:max-w-[80%] break-words relative transition-all duration-150"
-              :class="[
-                m.sender_type === 'customer' ? 'bubble-customer' : m.sender_type === 'human' ? 'bubble-human' : 'bubble-ai',
-                m.delivery_status === 'pending' ? 'opacity-70' : '',
-                m.delivery_status === 'failed' ? 'border-destructive/60 bg-destructive/5' : ''
-              ]"
+              ref="messagesContainerRef"
+              class="flex-1 min-h-0 overflow-y-auto overscroll-contain custom-scrollbar"
+              role="log"
+              :aria-label="t('conversations.messagesLabel')"
+              @scroll.passive="handleMessagesScroll"
+              @wheel.passive="chat.onUserIntent"
+              @touchstart.passive="chat.onUserIntent"
             >
-              <!-- Bubble Header -->
-              <div class="flex items-center justify-between text-xs mb-1.5 gap-2 opacity-75">
-                <div class="flex items-center gap-1.5">
-                  <User v-if="m.sender_type === 'customer'" :size="12" />
-                  <UserCheck v-else-if="m.sender_type === 'human'" :size="12" class="text-blue-500" />
-                  <Bot v-else :size="12" class="text-primary" />
-                  <span class="font-semibold text-xs text-foreground/90">
-                    {{ m.sender_type === 'customer' ? cleanCustomerName(selected.customer_username) : m.sender_type === 'human' ? t('conversations.youOperator') : t('conversations.aiAssistant') }}
-                  </span>
-                </div>
-
-                <!-- Status & Time Badge -->
-                <div class="flex items-center gap-1 text-[11px]">
-                  <span v-if="m.delivery_status === 'pending'" class="text-muted-foreground flex items-center gap-1">
-                    <Clock :size="11" class="animate-pulse" />
-                    <span class="hidden sm:inline">{{ t("conversations.sending") }}</span>
-                  </span>
+              <div ref="messagesContentRef" class="flex flex-col gap-3 px-3 py-4 sm:px-5">
+                <div v-if="hasOlderMessages" class="flex justify-center">
                   <button
-                    v-else-if="m.delivery_status === 'failed' && m.sender_type === 'human'"
                     type="button"
-                    class="text-destructive flex items-center gap-1 cursor-pointer font-medium hover:underline"
-                    :title="t('conversations.retryTitle')"
-                    @click="retrySendMessage(m)"
+                    class="inline-flex min-h-9 items-center gap-1.5 rounded-full border border-border bg-card px-3.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted"
+                    :disabled="isLoadingOlder"
+                    @click="loadOlderMessages"
                   >
-                    <AlertCircle :size="11" />
-                    <span>{{ t("conversations.retry") }}</span>
+                    <Loader2 v-if="isLoadingOlder" :size="12" class="animate-spin" />
+                    <ChevronUp v-else :size="12" />
+                    <span>{{ hiddenLoadedCount > 0 ? t("conversations.loadOlder", { count: hiddenLoadedCount }) : t("conversations.loadOlderServer") }}</span>
                   </button>
-                  <span v-else-if="m.delivery_status === 'failed'" class="text-destructive flex items-center gap-1 font-medium">
-                    <AlertCircle :size="11" />
-                    <span>{{ t("conversations.notDelivered") }}</span>
-                  </span>
-                  <span v-else class="opacity-70">{{ formatTime(m.created_at) }}</span>
                 </div>
-              </div>
 
-              <!-- Message Content & Media Rendering -->
-              <div class="text-sm leading-relaxed">
-                <template v-if="mediaOf(m)">
-                  <!-- Image Attachment -->
-                  <div
-                    v-if="mediaOf(m)!.kind === 'image'"
-                    class="mt-1.5 mb-1 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black/5 dark:bg-white/5 cursor-pointer hover:opacity-95 transition-opacity shadow-2xs group relative"
-                    @click="openMediaPreview(mediaOf(m)!.url, 'image')"
-                  >
-                    <img
-                      :src="mediaOf(m)!.url"
-                      :alt="t('conversations.imageAlt')"
-                      class="w-full h-auto max-h-[340px] object-cover rounded-xl group-hover:scale-[1.01] transition-transform duration-200"
-                      loading="lazy"
-                      referrerpolicy="no-referrer"
-                    />
-                    <div class="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-xs font-medium">
-                      {{ t("common.zoom") }}
-                    </div>
+                <template v-for="row in threadRows" :key="row.key">
+                  <!-- Day divider -->
+                  <div v-if="row.kind === 'day'" class="day-divider" role="separator">
+                    <span>{{ row.label }}</span>
                   </div>
 
-                  <!-- Video Attachment -->
-                  <div
-                    v-else-if="mediaOf(m)!.kind === 'video'"
-                    class="mt-1.5 mb-1 rounded-xl overflow-hidden border border-border/50 max-w-[280px] sm:max-w-[340px] bg-black shadow-2xs"
-                  >
-                    <video :src="mediaOf(m)!.url" controls preload="metadata" class="w-full max-h-[280px] rounded-xl"></video>
+                  <!-- A reaction whose customer message is outside the loaded window -->
+                  <div v-else-if="row.kind === 'reaction'" class="flex justify-center">
+                    <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground" :class="{ 'opacity-60': row.msg.delivery_status === 'failed' }">
+                      <span aria-hidden="true">{{ row.msg.content }}</span>
+                      <span>{{ reactionLabel(row.msg) }}</span>
+                    </span>
                   </div>
 
-                  <!-- Voice note -->
-                  <audio
-                    v-else-if="mediaOf(m)!.kind === 'audio'"
-                    :src="mediaOf(m)!.url"
-                    controls
-                    preload="none"
-                    class="mt-1.5 mb-1 w-full max-w-[280px]"
-                  ></audio>
-
-                  <!-- Shared post / other attachment: an explicit, https-only link -->
+                  <!-- Messages from one sender, close together -->
                   <div
                     v-else
-                    class="mt-1.5 mb-1 p-3 rounded-xl border border-pink-500/20 bg-gradient-to-r from-pink-500/10 via-purple-500/10 to-indigo-500/10 flex items-center justify-between gap-3 shadow-2xs"
+                    class="flex flex-col gap-1"
+                    :class="row.sender === 'customer' ? 'items-start' : 'items-end'"
                   >
-                    <div class="flex items-center gap-2.5 min-w-0">
-                      <div class="h-9 w-9 rounded-lg bg-pink-500/20 text-pink-500 flex items-center justify-center shrink-0">
-                        <Film :size="18" />
-                      </div>
-                      <div class="min-w-0">
-                        <div class="text-xs font-semibold text-foreground truncate">
-                          {{ isSharedPost(m) ? t("conversations.reelShared") : t("conversations.attachment") }}
+                    <div
+                      v-if="row.sender !== 'customer'"
+                      class="flex items-center gap-1 px-1 text-xs font-medium text-muted-foreground"
+                    >
+                      <Bot v-if="row.sender === 'ai'" :size="12" class="text-primary" aria-hidden="true" />
+                      <span>{{ groupSenderLabel(row.sender) }}</span>
+                    </div>
+
+                    <div
+                      v-for="(item, idx) in row.items"
+                      :key="item.msg.id"
+                      class="bubble-row flex max-w-[88%] flex-col sm:max-w-[75%]"
+                      :class="[
+                        row.sender === 'customer' ? 'items-start' : 'items-end',
+                        item.reactions.length ? 'mb-3' : '',
+                        idx === row.items.length - 1 ? 'bubble-row-last' : '',
+                      ]"
+                    >
+                      <div
+                        class="bubble relative"
+                        :class="[
+                          item.msg.sender_type === 'customer' ? 'bubble-customer' : item.msg.sender_type === 'human' ? 'bubble-human' : 'bubble-ai',
+                          idx === row.items.length - 1 ? 'bubble-tail' : '',
+                          item.msg.content ? 'px-3.5 py-2' : 'p-1',
+                          item.msg.delivery_status === 'pending' ? 'opacity-70' : '',
+                          item.msg.delivery_status === 'failed' ? 'bubble-failed' : '',
+                        ]"
+                        :title="formatClock(item.msg.created_at)"
+                      >
+                        <template v-if="mediaOf(item.msg)">
+                          <!-- Photo: its box is sized up front, so loading it never shifts the thread -->
+                          <button
+                            v-if="mediaOf(item.msg)!.kind === 'image'"
+                            type="button"
+                            class="media-box block cursor-zoom-in"
+                            :class="{ 'mb-1.5': item.msg.content }"
+                            :aria-label="t('common.zoom')"
+                            @click="openMediaPreview(mediaOf(item.msg)!.url, 'image')"
+                          >
+                            <img
+                              :src="mediaOf(item.msg)!.url"
+                              :alt="t('conversations.imageAlt')"
+                              class="h-full w-full object-contain"
+                              loading="lazy"
+                              decoding="async"
+                              referrerpolicy="no-referrer"
+                            />
+                          </button>
+
+                          <video
+                            v-else-if="mediaOf(item.msg)!.kind === 'video'"
+                            :src="mediaOf(item.msg)!.url"
+                            controls
+                            playsinline
+                            preload="metadata"
+                            class="media-box block bg-black object-contain"
+                            :class="{ 'mb-1.5': item.msg.content }"
+                          ></video>
+
+                          <!-- Voice note; its transcript is the text below -->
+                          <audio
+                            v-else-if="mediaOf(item.msg)!.kind === 'audio'"
+                            :src="mediaOf(item.msg)!.url"
+                            controls
+                            preload="none"
+                            class="block h-10 w-[240px] max-w-full"
+                            :class="{ 'mb-1.5': item.msg.content }"
+                          ></audio>
+
+                          <!-- Shared post / other attachment: an explicit, https-only link -->
+                          <div
+                            v-else
+                            class="flex items-center justify-between gap-3 rounded-xl border border-border bg-card p-2.5"
+                            :class="{ 'mb-1.5': item.msg.content }"
+                          >
+                            <div class="flex min-w-0 items-center gap-2.5">
+                              <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-pink-500/15 text-pink-600 dark:text-pink-400">
+                                <Film :size="18" />
+                              </div>
+                              <span class="truncate text-xs font-semibold text-foreground">
+                                {{ isSharedPost(item.msg) ? t("conversations.reelShared") : t("conversations.attachment") }}
+                              </span>
+                            </div>
+                            <a
+                              :href="mediaOf(item.msg)!.url"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="inline-flex min-h-9 shrink-0 items-center gap-1 rounded-lg border border-border bg-background px-2.5 text-xs font-medium text-primary hover:bg-muted"
+                            >
+                              <span>{{ t("common.open") }}</span>
+                              <ExternalLink :size="12" />
+                            </a>
+                          </div>
+                        </template>
+
+                        <div v-if="hasUnviewableMedia(item.msg)" class="px-2.5 py-1.5 text-xs italic text-muted-foreground">
+                          {{ isSharedPost(item.msg) ? t("conversations.reelShared") : t("conversations.unviewableMessage") }}
                         </div>
+
+                        <!-- Text is always plain text, exactly as sent -->
+                        <div
+                          v-if="item.msg.content"
+                          class="whitespace-pre-wrap break-words text-sm leading-relaxed"
+                        >{{ item.msg.content }}</div>
+
+                        <!-- The AI answered this message with a reaction instead of words -->
+                        <span v-if="item.reactions.length" class="reaction-chips">
+                          <span
+                            v-for="r in item.reactions"
+                            :key="r.id"
+                            class="reaction-chip"
+                            :class="{ 'reaction-chip-muted': r.delivery_status === 'failed' || r.delivery_status === 'pending' }"
+                            role="img"
+                            :aria-label="reactionLabel(r)"
+                            :title="reactionLabel(r)"
+                          >
+                            <span aria-hidden="true">{{ r.content }}</span>
+                            <AlertCircle v-if="r.delivery_status === 'failed'" :size="11" class="text-destructive" aria-hidden="true" />
+                          </span>
+                        </span>
+                      </div>
+
+                      <p
+                        v-if="item.reactions.some((r) => r.delivery_status === 'failed')"
+                        class="mt-4 px-1 text-xs text-destructive"
+                      >
+                        {{ t("conversations.reactionNotDelivered") }}
+                      </p>
+
+                      <!-- Outbound delivery problems, per message -->
+                      <div
+                        v-if="item.msg.delivery_status === 'pending'"
+                        class="mt-0.5 flex items-center gap-1 px-1 text-xs text-muted-foreground"
+                        role="status"
+                      >
+                        <Clock :size="11" aria-hidden="true" />
+                        <span>{{ t("conversations.sending") }}</span>
+                      </div>
+                      <div
+                        v-else-if="item.msg.delivery_status === 'failed' && item.msg.sender_type !== 'customer'"
+                        class="mt-0.5 flex flex-wrap items-center justify-end gap-x-2 px-1 text-xs text-destructive"
+                        role="alert"
+                      >
+                        <span class="inline-flex items-center gap-1">
+                          <AlertCircle :size="12" aria-hidden="true" />
+                          {{ item.msg.delivery_error || t("conversations.notDelivered") }}
+                        </span>
+                        <button
+                          v-if="item.msg.sender_type === 'human'"
+                          type="button"
+                          class="min-h-8 font-semibold underline underline-offset-2"
+                          @click="retrySendMessage(item.msg)"
+                        >
+                          {{ t("conversations.retry") }}
+                        </button>
+                      </div>
+
+                      <!-- Teach the AI: quiet until the reply is hovered/focused (always shown on touch) -->
+                      <div
+                        v-if="item.msg.sender_type === 'ai' && item.msg.content && !mediaOf(item.msg)"
+                        class="feedback-bar"
+                        :class="{ 'feedback-bar-rated': ratedMessages[item.msg.id] }"
+                      >
+                        <button
+                          type="button"
+                          class="feedback-btn"
+                          :class="{ 'text-primary': ratedMessages[item.msg.id] === 'up' }"
+                          :aria-label="t('conversations.goodResponse')"
+                          :aria-pressed="ratedMessages[item.msg.id] === 'up'"
+                          :title="t('conversations.goodResponse')"
+                          @click="handlePositiveFeedback(item.msg)"
+                        >
+                          <ThumbsUp :size="14" />
+                        </button>
+                        <button
+                          type="button"
+                          class="feedback-btn"
+                          :class="{ 'text-primary': ratedMessages[item.msg.id] === 'down' }"
+                          :title="t('conversations.correctResponseTitle')"
+                          @click="openCorrectionModal(item.msg)"
+                        >
+                          <ThumbsDown :size="14" />
+                          <span>{{ t("conversations.correct") }}</span>
+                        </button>
                       </div>
                     </div>
-                    <a
-                      :href="mediaOf(m)!.url"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      class="text-xs text-primary hover:underline flex items-center gap-1 shrink-0 px-2.5 py-1 rounded-lg bg-card border border-border"
-                    >
-                      <span>{{ t("common.open") }}</span>
-                      <ExternalLink :size="11" />
-                    </a>
+
+                    <!-- Group time (and delivery tick for what we sent) -->
+                    <div class="flex items-center gap-1 px-1 text-[11px] text-muted-foreground">
+                      <span>{{ formatClock(row.items[row.items.length - 1]!.msg.created_at) }}</span>
+                      <template v-if="row.sender !== 'customer' && row.items[row.items.length - 1]!.msg.delivery_status === 'sent'">
+                        <Check :size="12" aria-hidden="true" />
+                        <span class="sr-only">{{ t("conversations.delivered") }}</span>
+                      </template>
+                    </div>
                   </div>
                 </template>
-
-                <div v-if="hasUnviewableMedia(m)" class="text-xs italic text-muted-foreground">
-                  {{ isSharedPost(m) ? t("conversations.reelShared") : t("conversations.unviewableMessage") }}
-                </div>
-
-                <!-- Text is always plain text, exactly as sent -->
-                <div v-if="m.content" class="whitespace-pre-wrap">{{ m.content }}</div>
-
-                <p v-if="m.delivery_status === 'failed'" class="mt-1.5 text-[11px] text-destructive">
-                  {{ m.delivery_error || t("conversations.notDelivered") }}
-                </p>
-              </div>
-
-              <!-- AI Feedback & Learning Action Bar -->
-              <div v-if="m.sender_type === 'ai'" class="ai-feedback-bar">
-                <button
-                  type="button"
-                  class="feedback-action-btn"
-                  :title="t('conversations.goodResponse')"
-                  @click="handlePositiveFeedback(m)"
-                >
-                  <ThumbsUp :size="12" />
-                </button>
-                <button
-                  type="button"
-                  class="feedback-action-btn"
-                  :title="t('conversations.correctResponseTitle')"
-                  @click="openCorrectionModal(m)"
-                >
-                  <ThumbsDown :size="12" />
-                  <span>{{ t("conversations.correct") }}</span>
-                </button>
               </div>
             </div>
 
-            <!-- Bottom spacer div -->
-            <div class="h-2 w-full shrink-0" />
+            <!-- Back to the newest message -->
+            <Transition name="fade-up">
+              <button
+                v-if="!chat.pinned.value"
+                type="button"
+                class="jump-latest"
+                :class="{ 'jump-latest-count': unseenCount > 0 }"
+                :aria-label="unseenCount > 0 ? t('conversations.newMessages', { count: unseenCount }) : t('conversations.scrollToBottom')"
+                @click="jumpToLatest"
+              >
+                <ArrowDown :size="16" aria-hidden="true" />
+                <span v-if="unseenCount > 0">{{ t("conversations.newMessages", { count: unseenCount }) }}</span>
+              </button>
+            </Transition>
           </div>
 
-          <!-- Telegram-style Floating Scroll to Bottom Button -->
-          <transition
-            enter-active-class="transition duration-200 ease-out"
-            enter-from-class="opacity-0 scale-75 translate-y-3"
-            enter-to-class="opacity-100 scale-100 translate-y-0"
-            leave-active-class="transition duration-150 ease-in"
-            leave-from-class="opacity-100 scale-100 translate-y-0"
-            leave-to-class="opacity-0 scale-75 translate-y-3"
-          >
-            <button
-              v-if="showScrollDownBtn"
-              type="button"
-              class="absolute bottom-20 right-6 h-10 w-10 rounded-full bg-card/95 hover:bg-card text-foreground border border-border/80 shadow-lg flex items-center justify-center transition-all active:scale-95 z-20 cursor-pointer backdrop-blur-md hover:shadow-xl group"
-              :title="t('conversations.scrollToBottom')"
-              @click="scrollToBottomSmooth"
+          <!-- Composer -->
+          <footer class="composer">
+            <p
+              v-if="threadNote"
+              class="mb-2 flex items-start gap-1.5 text-xs leading-snug"
+              :class="threadNote.tone === 'warn' ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground'"
             >
-              <ArrowDown :size="18" class="text-primary group-hover:scale-110 transition-transform" />
-            </button>
-          </transition>
+              <Info :size="13" class="mt-px shrink-0" aria-hidden="true" />
+              <span>
+                {{ threadNote.text }}
+                <NuxtLink v-if="threadNote.link" :to="threadNote.link" class="font-semibold underline underline-offset-2">
+                  {{ t("nav.aiSettings") }}
+                </NuxtLink>
+              </span>
+            </p>
 
-          <!-- Operator Live Reply Input Bar (Optimistic Instant Response) -->
-          <div class="p-2.5 sm:p-3.5 border-t border-border bg-card/95 backdrop-blur-sm shrink-0 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
-            <form class="flex items-center gap-2" @submit.prevent="handleSendReply">
-              <Input
+            <div v-if="!canReply" class="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-muted/50 px-3 py-2.5">
+              <span class="text-sm text-foreground">{{ t("conversations.connectToReply") }}</span>
+              <Button as-child class="h-10 gap-2">
+                <NuxtLink to="/integrations">
+                  <Plug :size="16" />
+                  <span>{{ t("conversations.connectInstagram") }}</span>
+                </NuxtLink>
+              </Button>
+            </div>
+
+            <form v-else class="flex items-end gap-2" @submit.prevent="handleSendReply">
+              <label for="reply-input" class="sr-only">{{ t("conversations.typeMessage") }}</label>
+              <textarea
+                id="reply-input"
+                ref="replyInputRef"
                 v-model="replyText"
-                type="text"
-                maxlength="1000"
+                rows="1"
+                :maxlength="REPLY_MAX_LENGTH"
                 :placeholder="t('conversations.typeMessage')"
-                class="flex-1 h-10 px-4 rounded-xl border border-border bg-background text-sm text-foreground focus-visible:ring-2 focus-visible:ring-primary/30 transition-all placeholder:text-muted-foreground/60"
+                aria-describedby="reply-hint"
+                enterkeyhint="enter"
+                class="composer-input"
                 @keydown="handleReplyKeydown"
-              />
+              ></textarea>
+              <span id="reply-hint" class="sr-only">{{ t("conversations.composerHint") }}</span>
               <Button
                 type="submit"
-                class="h-10 px-4 rounded-xl gap-2 font-medium shrink-0 shadow-2xs inline-flex flex-row items-center justify-center whitespace-nowrap cursor-pointer"
+                class="h-11 min-w-11 shrink-0 gap-2 rounded-xl px-3 sm:px-4"
                 :disabled="!replyText.trim()"
+                :aria-label="t('conversations.send')"
+                @mousedown.prevent
               >
-                <Send :size="15" class="shrink-0" />
-                <span class="whitespace-nowrap">{{ t("conversations.send") }}</span>
+                <Send :size="18" />
+                <span class="hidden sm:inline">{{ t("conversations.send") }}</span>
               </Button>
             </form>
-          </div>
+            <p
+              v-if="canReply && replyText.length >= REPLY_COUNTER_FROM"
+              class="mt-1 text-right text-xs"
+              :class="replyText.length >= REPLY_MAX_LENGTH ? 'text-destructive' : 'text-muted-foreground'"
+              aria-live="polite"
+            >
+              {{ t("conversations.charsLeft", { count: REPLY_MAX_LENGTH - replyText.length }) }}
+            </p>
+          </footer>
         </template>
 
-        <div v-else-if="threadLoading" class="flex h-full items-center justify-center p-8 text-muted-foreground">
-          <Loader2 :size="22" class="animate-spin" />
-        </div>
-
-        <div v-else class="flex h-full items-center justify-center text-muted-foreground p-8 text-center">
-          {{ t("conversations.selectChat") }}
-        </div>
-      </div>
+        <!-- Loading / failed / nothing selected: keep a way back on phones -->
+        <template v-else>
+          <header v-if="isMobileThreadActive" class="thread-header thread-header-mobile">
+            <button type="button" class="mobile-back-btn icon-btn -ml-1" :aria-label="t('conversations.backToList')" @click="closeMobileThread">
+              <ArrowLeft :size="20" />
+            </button>
+          </header>
+          <div v-if="threadLoading" class="flex flex-1 items-center justify-center p-8 text-muted-foreground" aria-busy="true">
+            <Loader2 :size="22" class="animate-spin" />
+            <span class="sr-only">{{ t("common.loading") }}</span>
+          </div>
+          <div v-else-if="threadError" class="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+            <AlertCircle :size="24" class="text-destructive" />
+            <p class="text-sm text-foreground">{{ t("conversations.threadLoadError") }}</p>
+            <p class="text-xs text-muted-foreground">{{ threadError }}</p>
+            <Button variant="outline" class="h-10 gap-2" @click="retryOpen">
+              <RefreshCw :size="14" />
+              <span>{{ t("common.retry") }}</span>
+            </Button>
+          </div>
+          <div v-else class="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-muted-foreground">
+            <MessageSquare :size="28" class="opacity-60" />
+            <p class="text-sm">{{ t("conversations.selectChat") }}</p>
+          </div>
+        </template>
+      </section>
     </div>
 
-
-    <!-- AI Learning & Correction Modal -->
+    <!-- Teach the AI a better reply -->
     <Dialog :open="isFeedbackModalOpen" @update:open="(v) => { if (!v) closeCorrectionModal() }">
       <DialogContent class="sm:max-w-[520px]">
         <DialogHeader>
           <DialogTitle class="flex items-center gap-2">
-            <Sparkles :size="20" class="text-primary" />
+            <Sparkles :size="18" class="text-primary" />
             {{ t("conversations.trainAiTitle") }}
           </DialogTitle>
         </DialogHeader>
@@ -1203,12 +1636,12 @@ function getAvatarLetter(username?: string | null) {
         <div class="flex flex-col gap-4">
           <div v-if="feedbackCustomerQuery" class="bg-muted/50 px-4 py-3 rounded-lg border-l-2 border-primary">
             <div class="text-xs text-muted-foreground font-semibold mb-1">{{ t("conversations.customerQuery") }}</div>
-            <div class="text-sm text-foreground">"{{ feedbackCustomerQuery }}"</div>
+            <div class="text-sm text-foreground whitespace-pre-wrap">{{ feedbackCustomerQuery }}</div>
           </div>
 
           <div v-if="feedbackTargetMessage" class="bg-destructive/10 px-4 py-3 rounded-lg border-l-2 border-destructive">
             <div class="text-xs text-destructive font-semibold mb-1">{{ t("conversations.aiWrongResponse") }}</div>
-            <div class="text-sm text-foreground">{{ feedbackTargetMessage.content }}</div>
+            <div class="text-sm text-foreground whitespace-pre-wrap">{{ feedbackTargetMessage.content }}</div>
           </div>
 
           <div class="space-y-1.5">
@@ -1224,9 +1657,9 @@ function getAvatarLetter(username?: string | null) {
             />
           </div>
 
-          <div class="flex items-center justify-end gap-3 mt-2">
-            <Button variant="outline" @click="closeCorrectionModal">{{ t("common.cancel") }}</Button>
-            <Button :disabled="feedbackSubmitting || !feedbackCorrectionText.trim()" class="gap-2" @click="submitCorrection">
+          <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button variant="outline" class="h-10" @click="closeCorrectionModal">{{ t("common.cancel") }}</Button>
+            <Button :disabled="feedbackSubmitting || !feedbackCorrectionText.trim()" class="h-10 gap-2" @click="submitCorrection">
               <CheckCircle2 :size="16" />
               {{ feedbackSubmitting ? t("common.saving") : t("conversations.trainAndSave") }}
             </Button>
@@ -1235,19 +1668,19 @@ function getAvatarLetter(username?: string | null) {
       </DialogContent>
     </Dialog>
 
-    <!-- Delete Conversation Confirm Modal -->
+    <!-- Delete conversation -->
     <Dialog v-model:open="isDeleteConfirmModalOpen">
       <DialogContent class="sm:max-w-[440px]">
         <DialogHeader>
-          <DialogTitle class="text-destructive">{{ t("conversations.deleteModalTitle") }}</DialogTitle>
+          <DialogTitle>{{ t("conversations.deleteModalTitle") }}</DialogTitle>
+          <DialogDescription>
+            {{ t("conversations.deleteModalConfirm", { name: cleanCustomerName(selected?.customer_username) }) }}
+          </DialogDescription>
         </DialogHeader>
-        <p class="text-sm text-foreground">
-          {{ t("conversations.deleteModalConfirm", { name: selected?.customer_username || t("conversations.customer") }) }}
-        </p>
-        <p class="text-xs text-muted-foreground mb-5">{{ t("conversations.deleteKeepsLead") }}</p>
-        <div class="flex items-center justify-end gap-3">
-          <Button variant="outline" @click="isDeleteConfirmModalOpen = false">{{ t("common.cancel") }}</Button>
-          <Button variant="destructive" class="gap-2" :disabled="deletingConversation" @click="confirmDeleteConversation">
+        <p class="text-xs text-muted-foreground">{{ t("conversations.deleteKeepsLead") }}</p>
+        <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button variant="outline" class="h-10" @click="isDeleteConfirmModalOpen = false">{{ t("common.cancel") }}</Button>
+          <Button variant="destructive" class="h-10 gap-2" :disabled="deletingConversation" @click="confirmDeleteConversation">
             <Trash2 :size="16" />
             {{ deletingConversation ? t("common.deleting") : t("common.delete") }}
           </Button>
@@ -1255,27 +1688,28 @@ function getAvatarLetter(username?: string | null) {
       </DialogContent>
     </Dialog>
 
-    <!-- Media Preview Lightbox Modal -->
+    <!-- Media preview -->
     <Dialog :open="!!previewMediaUrl" @update:open="(v) => { if (!v) closeMediaPreview() }">
-      <DialogContent class="sm:max-w-[720px] p-2 bg-background/95 backdrop-blur-md border border-border/80">
+      <DialogContent class="sm:max-w-[720px] p-2">
+        <DialogTitle class="sr-only">{{ t("conversations.imageAlt") }}</DialogTitle>
         <div class="flex flex-col items-center justify-center p-1">
           <img
             v-if="previewMediaType === 'image' && previewMediaUrl"
             :src="previewMediaUrl"
             :alt="t('conversations.imageAlt')"
             referrerpolicy="no-referrer"
-            class="max-h-[82vh] w-auto max-w-full rounded-lg object-contain shadow-md"
+            class="max-h-[82dvh] w-auto max-w-full rounded-lg object-contain"
           />
           <video
             v-else-if="previewMediaType === 'video' && previewMediaUrl"
             :src="previewMediaUrl"
             controls
             autoplay
-            class="max-h-[82vh] w-auto max-w-full rounded-lg shadow-md"
+            playsinline
+            class="max-h-[82dvh] w-auto max-w-full rounded-lg"
           ></video>
         </div>
       </DialogContent>
     </Dialog>
-
   </div>
 </template>

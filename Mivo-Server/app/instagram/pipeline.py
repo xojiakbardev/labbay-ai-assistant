@@ -1,25 +1,5 @@
-"""Inbound Instagram events, from webhook to delivered reply.
-
-The webhook request does only the fast, local part — verify, persist the event
-and the customer's message, return 200 — and the slow part runs off the
-persisted `webhook_events` row:
-
-    ingest_event()   in the request: dedupe, route to the business, store the
-                     message. A failure here is a 5xx and Meta retries.
-    process_event()  in the background: profile, debounce, then — under the
-                     conversation lock — voice transcription, the AI turn and
-                     its delivery through the outbox, then lead bookkeeping.
-    sweep_events()   on a schedule: re-drives events that failed, or whose
-                     worker died mid-turn (the lease expired).
-
-Running the turn inside the request (as before) meant Meta timed out, retried,
-the retry saw "processing" and got a 200, and if the original then failed the
-message was lost for good.
-
-Routing is exact. An event whose recipient isn't a connected account is
-recorded and dropped — never handed to "some other connected account", which
-used to deliver one business's customers into another business's inbox.
-"""
+"""Instagram webhook events: ingest in the request (dedupe, route exactly, store),
+process in the background (debounce, lock, AI turn, outbox), sweep what failed."""
 import asyncio
 import datetime as dt
 import logging
@@ -34,13 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai import limits
 from app.ai.audio import TranscriptionError, transcribe_audio_url
 from app.ai.closing import decide_closing, may_be_closing, unanswered_burst, valid_reaction
-from app.ai.orchestrator import (
-    _ESCALATION_CLOSING,
-    _PHONE_CAPTURED_CONFIRMATION,
-    detect_preferred_language,
-    run_turn,
-)
+from app.ai.orchestrator import detect_preferred_language, run_turn
 from app.ai.provider.base import LLMProvider, LLMProviderError
+from app.ai.replies import reply_text
 from app.businesses.models import Business
 from app.businesses.service import ai_may_reply
 from app.conversations.delivery import DeliveryError, reconcile_echo, send_outbound, undelivered_reply
@@ -55,6 +31,7 @@ from app.conversations.models import (
     Message,
 )
 from app.conversations.service import add_message, get_or_create_conversation, get_recent_messages
+from app.core.config import get_settings
 from app.core.db import async_session_factory
 from app.core.security import decrypt_secret
 from app.customers.models import Customer
@@ -77,27 +54,16 @@ from app.webhooks.models import (
 
 logger = logging.getLogger("app.instagram.pipeline")
 
-# How long to wait, after a customer's message, before replying — people
-# split one thought across several quick messages, and one reply should cover
-# the burst. After the wait, a turn only runs if no newer customer message
-# arrived (that one's event replies instead). Tests set this to 0.
-DEBOUNCE_SECONDS = 1.5
-
-# A worker that claimed an event and then died (crash, redeploy) holds it for
-# at most this long before the sweeper takes it over. Longer than any live
-# attempt: up to 120 s waiting on the conversation lock, voice transcription,
-# the turn deadline and delivery.
-LEASE = dt.timedelta(minutes=10)
-MAX_ATTEMPTS = 5
-_RETRY_BACKOFF = (30, 60, 120, 300)  # seconds, by attempt number
-# A "received" event older than this was never picked up by its request's
-# background task (process restarted in between) — the sweeper takes it.
-_ORPHAN_AFTER = dt.timedelta(seconds=60)
-
-# Events processed at once per process. Each holds up to two pooled DB
-# connections (its session and, while waiting, a conversation lock), so this
-# keeps a burst of webhooks from exhausting the pool.
-_PROCESS_SLOTS = asyncio.Semaphore(8)
+_settings = get_settings()
+# Wait this long after a customer message so one reply covers a burst.
+DEBOUNCE_SECONDS = _settings.reply_debounce_seconds
+# A claimed event whose worker died is taken over after the lease.
+LEASE = dt.timedelta(minutes=_settings.webhook_lease_minutes)
+MAX_ATTEMPTS = _settings.webhook_max_attempts
+_RETRY_BACKOFF = tuple(_settings.webhook_retry_backoff_seconds)
+_ORPHAN_AFTER = dt.timedelta(seconds=_settings.webhook_orphan_after_seconds)
+# Each event holds up to two pooled connections; this bounds the burst.
+_PROCESS_SLOTS = asyncio.Semaphore(_settings.webhook_concurrency)
 
 # Conversation statuses under which the AI answers. Everything else is a human
 # handoff state: messages are recorded for the owner, the AI stays silent.
@@ -105,7 +71,7 @@ AI_ACTIVE_STATUSES = ("ai_active", "active")
 _HANDOFF_STATUSES = ("human_needed", "human_active")
 
 _AUDIO_PLACEHOLDER = AUDIO_PLACEHOLDER
-_VOICE_NOTE_MAX_AGE = dt.timedelta(hours=1)
+_VOICE_NOTE_MAX_AGE = dt.timedelta(minutes=_settings.voice_note_max_age_minutes)
 _AUDIO_UNREADABLE = "[Ovozli xabar — matnga o'girib bo'lmadi]"
 # A message with media but no text is stored with no text: the dashboard shows
 # the media itself (or, for a type it can't show, its own localized chip), and
@@ -122,11 +88,8 @@ _MAX_CAPTION = 500
 
 
 def parse_webhook_body(body: dict) -> list[dict[str, Any]]:
-    """Meta's webhook body -> one normalized dict per message event.
-
-    Reactions, read receipts and deleted/unsupported messages are skipped:
-    none of them is something to reply to.
-    """
+    """Meta's webhook body -> one normalized dict per message (reactions, reads and
+    deleted messages skipped)."""
     events: list[dict[str, Any]] = []
     for entry in body.get("entry") or []:
         for messaging in entry.get("messaging") or []:
@@ -310,10 +273,8 @@ async def process_event(
     provider: LLMProvider | Callable[[], LLMProvider],
     meta_client: MetaClient,
 ) -> None:
-    """Runs one event to completion in its own session. Never raises: a
-    failure is recorded on the event (retried with backoff, abandoned after
-    MAX_ATTEMPTS — or at once when retrying can't help — with the owner
-    alerted)."""
+    """Runs one event in its own session. Never raises: failures are retried with
+    backoff, then abandoned with an owner alert."""
     async with _PROCESS_SLOTS, async_session_factory() as db:
         event = await _claim(db, event_id)
         if event is None:
@@ -612,10 +573,8 @@ async def _closes_the_conversation(db: AsyncSession, ctx: _Context, provider: LL
 
 
 async def _resend_undelivered(db: AsyncSession, ctx: _Context) -> None:
-    """Resends this message's recorded-but-undelivered AI reply (or handoff
-    line). Only while automated messages may still go out, and not once a
-    person has taken the conversation over — an AI line arriving after the
-    operator's own reply would only confuse the customer."""
+    """Resends this message's unsent AI reply, unless AI replies aren't allowed or a
+    person has taken over."""
     if not ai_may_reply(ctx.business) or ctx.conversation.status not in (*AI_ACTIVE_STATUSES, "human_needed"):
         return
     pending = await undelivered_reply(db, ctx.conversation, ctx.message)
@@ -624,13 +583,7 @@ async def _resend_undelivered(db: AsyncSession, ctx: _Context) -> None:
 
 
 async def _transcribe_pending_voice_notes(db: AsyncSession, conversation: Conversation) -> bool:
-    """Voice notes in this conversation that nobody has transcribed yet —
-    this event's own, or an earlier one in the same burst — turned into text
-    before the turn reads the history. Returns True if any couldn't be.
-
-    Only the unanswered ones, and only recent ones: an old note's media URL
-    has long expired, and failing on it would hand every such conversation to
-    a human forever."""
+    """Transcribes this burst's recent untranscribed voice notes. True if any failed."""
     since = dt.datetime.now(dt.timezone.utc) - _VOICE_NOTE_MAX_AGE
     if conversation.last_answered_customer_message_at is not None:
         since = max(since, conversation.last_answered_customer_message_at)
@@ -659,14 +612,8 @@ async def _transcribe_pending_voice_notes(db: AsyncSession, conversation: Conver
 
 
 async def _without_ai(db: AsyncSession, ctx: _Context) -> None:
-    """The AI isn't answering this one. A phone number is still worth
-    capturing — often it's the customer answering "leave your number" just
-    before the handoff — and while a handoff is pending the customer gets a
-    one-line acknowledgement so their number isn't met with silence. With AI
-    off, suspended or unpaid, nothing automated is sent at all.
-
-    The owner is alerted before the acknowledgement is sent: if the send
-    fails, a retry finds the number already on file and wouldn't alert again."""
+    """No AI turn: still capture a phone number, alert the owner, and during a
+    handoff acknowledge the number."""
     await db.refresh(ctx.conversation)
     lead, notify = await capture_phone_without_ai_turn(
         db, ctx.business_id, ctx.customer_id, ctx.conversation_id, ctx.message.content
@@ -678,7 +625,7 @@ async def _without_ai(db: AsyncSession, ctx: _Context) -> None:
     if ai_may_reply(ctx.business) and ctx.conversation.status in _HANDOFF_STATUSES:
         recent = await get_recent_messages(db, ctx.conversation_id, limit=4)
         lang = _language(ctx.business, [m.content for m in recent if m.content])
-        await ctx.send_new(db, _PHONE_CAPTURED_CONFIRMATION.get(lang, _PHONE_CAPTURED_CONFIRMATION["uz"]))
+        await ctx.send_new(db, reply_text(ctx.business, "phone_received", lang))
 
 
 async def _hand_off(db: AsyncSession, ctx: _Context, *, alert_type: str, title: str, reason: str) -> None:
@@ -694,7 +641,7 @@ async def _hand_off(db: AsyncSession, ctx: _Context, *, alert_type: str, title: 
     await ctx.reload(db)
     recent = await get_recent_messages(db, ctx.conversation_id, limit=4)
     lang = _language(ctx.business, [m.content for m in recent if m.content])
-    await ctx.send_new(db, _ESCALATION_CLOSING.get(lang, _ESCALATION_CLOSING["uz"]))
+    await ctx.send_new(db, reply_text(ctx.business, "handoff", lang))
 
 
 async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider) -> None:
@@ -786,16 +733,8 @@ async def _send_product_photos(db: AsyncSession, ctx: _Context, result) -> None:
 
 
 async def _process_echo(db: AsyncSession, event: WebhookEvent) -> None:
-    """Something was sent from the business's Instagram account.
-
-    Ours if its id is already recorded, or if it matches one of our recent
-    outbound messages still waiting for its id (the echo can arrive before the
-    send response is recorded; it then supplies the id). Otherwise a person
-    replied from the Instagram app: record it, step the AI back so it doesn't
-    talk over them, and tell the owner the AI paused.
-
-    No conversation lock: an echo never waits on a running turn.
-    """
+    """A message sent from the business account: ours (known id, or matched to an
+    unsent outbound row), or a person replying from the app (AI steps back)."""
     payload = event.payload
     business = await db.get(Business, uuid.UUID(payload["business_id"]))
     if business is None:

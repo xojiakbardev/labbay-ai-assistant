@@ -1,15 +1,5 @@
-"""Knowing when a conversation is over.
-
-"Hop", "ok", "rahmat", 👍 after the AI's last word used to get a fresh reply
-every time — four "if you have questions, I'm here" in a row to a customer who
-had already said goodbye. A person would stop there, or just react to the
-message.
-
-Whether the conversation has ended, and which reaction fits, is the model's
-call (what "ok" means depends on what came before it). A cheap deterministic
-filter decides only whether to ask: a burst with a question, a number, or more
-than a few words is always answered normally, without spending a call.
-"""
+"""When a conversation is over. Short plain-text bursts after our reply go to a
+small model call; if finished, no reply, at most a reaction."""
 import logging
 import re
 import unicodedata
@@ -20,11 +10,12 @@ from pydantic import BaseModel, Field
 from app.ai.context.builder import build_message_history
 from app.ai.provider.base import LLMProvider
 from app.conversations.models import MESSAGE_TYPE_REACTION, Message
+from app.core.config import get_settings
 
 logger = logging.getLogger("app.ai.closing")
 
-_MAX_WORDS = 6
-_MAX_CHARS = 60
+_MAX_WORDS = get_settings().closing_max_words
+_MAX_CHARS = get_settings().closing_max_chars
 _TRANSCRIPT_MESSAGES = 6
 
 

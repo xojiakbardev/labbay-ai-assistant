@@ -4,7 +4,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.businesses.models import Business
-from app.businesses.schemas import BusinessOut, BusinessUpdate
+from app.ai.replies import DEFAULT_REPLIES, LANGUAGES, MAX_REPLY_CHARS
+from app.businesses.schemas import BusinessOut, BusinessUpdate, ReplyDefaultsOut
 from app.common.tenancy import get_current_business
 from app.core.db import get_db
 
@@ -14,6 +15,12 @@ router = APIRouter(prefix="/business", tags=["business"])
 @router.get("", response_model=BusinessOut)
 async def get_business(business: Business = Depends(get_current_business)) -> Business:
     return business
+
+
+@router.get("/reply-defaults", response_model=ReplyDefaultsOut)
+async def get_reply_defaults(business: Business = Depends(get_current_business)) -> ReplyDefaultsOut:
+    """The default ready-made replies, shown as placeholders on the AI settings page."""
+    return ReplyDefaultsOut(replies=DEFAULT_REPLIES, languages=list(LANGUAGES), max_chars=MAX_REPLY_CHARS)
 
 
 @router.patch("", response_model=BusinessOut)

@@ -6,10 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.customers.models import Customer
 
 # A profile Meta couldn't (or wouldn't) return isn't asked for again before this.
-PROFILE_RETRY_AFTER = dt.timedelta(hours=24)
+PROFILE_RETRY_AFTER = dt.timedelta(hours=get_settings().profile_retry_hours)
 
 
 async def get_or_create_customer(

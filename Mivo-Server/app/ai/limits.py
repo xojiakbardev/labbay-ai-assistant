@@ -1,10 +1,5 @@
-"""Spend guards checked before every AI turn.
-
-Every customer message costs at least three LLM calls. Without a ceiling, a
-reply loop, a bot on the other end, or one customer typing all night runs up
-the bill unnoticed. Past a limit the AI stops for that business/conversation
-and the owner is told — the conversation goes to a human rather than silence.
-"""
+"""Spend guards checked before every AI turn; past a limit the conversation goes
+to a person."""
 import datetime as dt
 import uuid
 

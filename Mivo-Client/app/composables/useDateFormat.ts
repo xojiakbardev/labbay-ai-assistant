@@ -36,6 +36,45 @@ export function formatShortDay(iso: string, locale: Locale): string {
   return locale === "en" ? `${month} ${day}` : `${day}-${month}`;
 }
 
+/** "14:05" — 24-hour clock, the way time is written in Uzbekistan. */
+export function formatClock(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function startOfDay(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+/** Whole calendar days between `iso` and `now` (0 = same day, 1 = yesterday). */
+export function daysAgo(iso: string, now: Date = new Date()): number {
+  return Math.round((startOfDay(now) - startOfDay(new Date(iso))) / 86_400_000);
+}
+
+/** "12-sen" / "12 сен" / "Sep 12", with the year when it isn't this year. */
+export function formatShortDate(iso: string, locale: Locale, now: Date = new Date()): string {
+  const d = new Date(iso);
+  const day = d.getDate();
+  const month = MONTHS_SHORT[locale][d.getMonth()];
+  const year = d.getFullYear() === now.getFullYear() ? "" : ` ${d.getFullYear()}`;
+  if (locale === "uz") return `${day}-${month}${year}`;
+  if (locale === "ru") return `${day} ${month}${year}`;
+  return `${month} ${day}${year ? `,${year}` : ""}`;
+}
+
+/** Day divider in a chat: "12-sentyabr" / "12 сентября" / "September 12" (+ year if not this year). */
+export function formatDayMonth(iso: string, locale: Locale, now: Date = new Date()): string {
+  const d = new Date(iso);
+  const day = d.getDate();
+  const month = MONTHS_FULL[locale][d.getMonth()];
+  const year = d.getFullYear() === now.getFullYear() ? "" : ` ${d.getFullYear()}`;
+  if (locale === "uz") return `${day}-${month}${year}`;
+  if (locale === "ru") return `${day} ${month}${year}`;
+  return `${month} ${day}${year ? `,${year}` : ""}`;
+}
+
 /** "YYYY-MM" period -> "Avgust '26" / "Август '26" / "Aug '26" */
 export function formatShortMonth(period: string, locale: Locale): string {
   const [y, m] = period.split("-").map(Number);

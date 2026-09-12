@@ -1,12 +1,4 @@
-"""Failed-login throttling.
-
-Keyed by the email being attempted, not by IP: behind the Cloudflare proxy
-every request shares a handful of upstream IPs, and a forwarded-for header is
-whatever the client says it is. Per-account is the limit that actually stops
-password spraying against a known owner email.
-
-Process-local, like the SSE broadcaster — the deployment runs one API process.
-"""
+"""Failed-login throttle, per email, in process memory."""
 import datetime as dt
 import threading
 from collections import deque

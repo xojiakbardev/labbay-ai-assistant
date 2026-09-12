@@ -28,7 +28,7 @@ from app.core.security import (
 # A rotated refresh token presented again within this window is treated as a
 # benign race (two tabs refreshing at once, a retried request whose response
 # was lost) — refused, but without revoking the user's other sessions.
-REUSE_GRACE = dt.timedelta(seconds=30)
+REUSE_GRACE = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
 
 DEFAULT_TRIAL_DAYS = 14
 

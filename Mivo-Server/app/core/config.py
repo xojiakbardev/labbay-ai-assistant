@@ -142,6 +142,31 @@ class Settings(BaseSettings):
     ai_daily_cost_limit_usd: float = 5.0
     ai_max_turns_per_conversation_per_hour: int = 20
 
+    # Conversation tuning.
+    reply_debounce_seconds: float = 1.5
+    reply_part_delay_seconds: float = 0.9
+    history_limit: int = 20
+    max_multimodal_images: int = 2
+    max_image_age_hours: int = 6
+    max_images_per_reply: int = 3
+    voice_note_max_age_minutes: int = 60
+    closing_max_words: int = 6
+    closing_max_chars: int = 60
+    follow_up_after_minutes: int = 30
+    follow_up_window_hours: int = 23
+    follow_up_batch: int = 50
+    profile_retry_hours: int = 24
+
+    # Webhook processing.
+    webhook_concurrency: int = 8
+    webhook_max_attempts: int = 5
+    webhook_retry_backoff_seconds: list[int] = [30, 60, 120, 300]
+    webhook_lease_minutes: int = 10
+    webhook_orphan_after_seconds: int = 60
+    resend_window_minutes: int = 20
+    conversation_lock_wait_seconds: int = 120
+    refresh_reuse_grace_seconds: int = 30
+
     # Voice messages. One provider, chosen explicitly: "openrouter" (uses
     # OPENROUTER_API_KEY and STT_MODEL), "groq" or "openai" (use STT_API_KEY),
     # or "" to not transcribe at all — a voice note then goes to the owner.

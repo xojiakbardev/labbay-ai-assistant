@@ -40,6 +40,9 @@ class Business(Base, UUIDPk, TimestampMixin):
     ui_preferences: Mapped[dict | None] = mapped_column(
         JSONB, default=dict, server_default="{}", nullable=True
     )
+    # The owner's own wording for the ready-made replies (app/ai/replies.py):
+    # {key: {lang: text}}; anything missing uses the default.
+    reply_texts: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}", nullable=False)
 
     # Subscription is superadmin-managed, not self-serve: when someone pays
     # (outside the app), the superadmin pushes this date out via the

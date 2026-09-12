@@ -1,10 +1,4 @@
-"""Which business the current work is billed to.
-
-Some paid calls (embeddings) happen deep inside code that has no business in
-its signature — a search tool, a product write. Callers that know the business
-set it here for the duration of the work, and the provider logs usage against
-it, so the superadmin cost figures include every paid call, not just chat.
-"""
+"""Which business an AI call is billed to, for calls made deep inside tools."""
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar

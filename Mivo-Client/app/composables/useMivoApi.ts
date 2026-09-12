@@ -16,6 +16,7 @@ import type {
   ProductImage,
   ProductInput,
   ProductPatch,
+  ReplyDefaults,
   SandboxState,
   SandboxTurnResponse,
   TelegramStatus,
@@ -29,6 +30,8 @@ export function useMivoApi() {
     getBusiness: () => apiRequest<Business>("/business"),
     updateBusiness: (patch: BusinessUpdate) =>
       apiRequest<Business>("/business", { method: "PATCH", body: patch }),
+    // Built-in wording of the fixed replies (reply_texts overrides these).
+    getReplyDefaults: () => apiRequest<ReplyDefaults>("/business/reply-defaults"),
 
     listProducts: () => apiRequest<Product[]>("/products"),
     getProduct: (id: string) => apiRequest<Product>(`/products/${id}`),

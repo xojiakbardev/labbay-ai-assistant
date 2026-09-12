@@ -17,6 +17,18 @@ export interface Business {
   // owner's own ai_enabled switch can't override it.
   ai_suspended: boolean;
   ui_preferences?: Record<string, any> | null;
+  // The owner's own wording for the fixed replies, key -> language -> text.
+  // Only overrides; a missing entry means the default is used.
+  reply_texts?: ReplyTexts;
+}
+
+export type ReplyTexts = Record<string, Record<string, string>>;
+
+// GET /business/reply-defaults — the built-in wording of the fixed replies.
+export interface ReplyDefaults {
+  replies: ReplyTexts;
+  languages: string[];
+  max_chars: number;
 }
 
 // PATCH /business rejects unknown fields (extra=forbid) and an explicit null
@@ -35,6 +47,8 @@ export interface BusinessUpdate {
   handoff_instructions?: string | null;
   ai_enabled?: boolean;
   ui_preferences?: Record<string, any>;
+  // Replaces all overrides at once; empty texts are dropped server-side.
+  reply_texts?: ReplyTexts;
 }
 
 export interface Variant {
@@ -139,6 +153,16 @@ export interface Lead {
 
 export type ConversationStatus = "ai_active" | "active" | "human_needed" | "human_active" | "closed";
 
+// The newest message of a conversation, for the list's preview line.
+export interface LastMessagePreview {
+  // First 120 characters; "" for media with no caption.
+  content: string;
+  sender_type: "customer" | "ai" | "human" | "system";
+  message_type: string;
+  attachment_type: string | null;
+  created_at: string;
+}
+
 export interface ConversationSummary {
   id: string;
   customer_id: string;
@@ -149,6 +173,8 @@ export interface ConversationSummary {
   status: ConversationStatus | string;
   last_message_at: string | null;
   created_at: string;
+  // Only on GET /conversations (list); null for a conversation with no messages.
+  last_message?: LastMessagePreview | null;
 }
 
 export type DeliveryStatus = "pending" | "sent" | "failed" | "unknown";
@@ -157,6 +183,8 @@ export interface Message {
   id: string;
   sender_type: "customer" | "ai" | "human" | "system";
   content: string;
+  // "reaction": the AI reacted (content = one emoji) to the customer's
+  // previous message instead of replying.
   message_type: string;
   // Media lives only here — never parse it out of `content`, which is
   // whatever the customer typed.
@@ -295,6 +323,9 @@ export interface SandboxMessage {
   id: string;
   sender_type: "customer" | "ai" | "human" | string;
   content: string;
+  // "reaction" = the AI reacted with an emoji (content) instead of replying.
+  message_type: string;
+  delivery_status?: DeliveryStatus | null;
   attachment_url?: string | null;
   created_at: string;
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { toast } from "vue-sonner";
+import { useMediaQuery } from "@vueuse/core";
 import type { Product, ProductInput } from "~/types/api";
 import {
   Plus,
@@ -31,6 +32,14 @@ import {
   SelectTrigger,
   SelectValue
 } from "~/components/ui/select";
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuRoot,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "reka-ui";
 import MobileDrawer from "~/components/MobileDrawer.vue";
 
 definePageMeta({ layout: "dashboard" });
@@ -43,6 +52,8 @@ const router = useRouter();
 const products = ref<Product[]>([]);
 const loading = ref(true);
 const searchQuery = ref("");
+// Below md the catalogue is always the card grid.
+const isMdUp = useMediaQuery("(min-width: 768px)");
 
 const { productsViewMode, setProductsViewMode } = useUserPreferences();
 
@@ -56,8 +67,7 @@ const viewMode = computed<"grid" | "table">({
   },
 });
 
-// Dropdown & AI Import Modal state
-const showAddDropdown = ref(false);
+// AI Import Modal state
 const showAiImportModal = ref(false);
 const importTab = ref<"text" | "file" | "json">("text");
 
@@ -110,7 +120,7 @@ onMounted(async () => {
 });
 
 function getProductCategory(p: Product): string {
-  return (p.attributes?.category as string) || "Boshqa";
+  return (p.attributes?.category as string) || t("products.uncategorized");
 }
 
 // Category & Availability filters
@@ -228,20 +238,33 @@ async function onToggleAvailability(p: Product) {
   }
 }
 
-async function onDelete(id: string) {
-  if (!confirm(t("products.deleteConfirm"))) return;
+// Deleting asks first, in the app's own dialog.
+const productToDelete = ref<Product | null>(null);
+const deletingProduct = ref(false);
+
+async function confirmDeleteProduct() {
+  const p = productToDelete.value;
+  if (!p || deletingProduct.value) return;
+  deletingProduct.value = true;
   try {
-    await api.deleteProduct(id);
+    await api.deleteProduct(p.id);
   } catch (err) {
     console.error("Failed to delete product", err);
     toast.error(t("products.deleteError"));
     return;
+  } finally {
+    deletingProduct.value = false;
   }
+  productToDelete.value = null;
+  toast.success(t("products.deleted"));
   await reload();
 }
 
+const hasActiveFilters = computed(
+  () => !!searchQuery.value.trim() || selectedCategory.value !== "all" || selectedAvailability.value !== "all"
+);
+
 function openAiImport() {
-  showAddDropdown.value = false;
   aiError.value = null;
   rawText.value = "";
   jsonText.value = "";
@@ -417,35 +440,28 @@ async function onConfirmImport() {
             </span>
           </Button>
 
-          <!-- Mobile View Switcher & Add Button -->
+          <!-- Mobile: add (manual or AI import) -->
           <div class="flex md:hidden items-center gap-1.5 shrink-0">
-            <div class="inline-flex rounded-lg bg-muted/60 p-0.5 border border-border">
-              <button
-                type="button"
-                class="p-1.5 rounded-md transition-all cursor-pointer"
-                :class="viewMode === 'grid' ? 'bg-card text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground'"
-                @click="viewMode = 'grid'"
-              >
-                <LayoutGrid :size="14" />
-              </button>
-              <button
-                type="button"
-                class="p-1.5 rounded-md transition-all cursor-pointer"
-                :class="viewMode === 'table' ? 'bg-card text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground'"
-                @click="viewMode = 'table'"
-              >
-                <List :size="14" />
-              </button>
-            </div>
-
-            <Button
-              variant="default"
-              size="sm"
-              class="h-9 w-9 p-0 cursor-pointer"
-              @click="router.push('/products/new')"
-            >
-              <Plus :size="15" />
-            </Button>
+            <DropdownMenuRoot :modal="false">
+              <DropdownMenuTrigger as-child>
+                <Button class="h-10 w-10 p-0 cursor-pointer" :aria-label="t('products.addProduct')">
+                  <Plus :size="18" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuContent align="end" :side-offset="6" class="menu-content">
+                  <DropdownMenuItem class="menu-item" @select="router.push('/products/new')">
+                    <Plus :size="16" class="text-primary" />
+                    <span>{{ t("products.manualAdd") }}</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator class="my-1 h-px bg-border" />
+                  <DropdownMenuItem class="menu-item" @select="openAiImport">
+                    <Sparkles :size="16" class="text-amber-500" />
+                    <span>{{ t("products.universalAiImport") }}</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenuPortal>
+            </DropdownMenuRoot>
           </div>
         </div>
 
@@ -479,82 +495,56 @@ async function onConfirmImport() {
           <div class="h-4 w-px bg-border my-auto mx-0.5" />
 
           <!-- View Mode Switcher -->
-          <div class="inline-flex rounded-lg bg-muted/60 p-0.5 border border-border shrink-0">
+          <div class="inline-flex rounded-lg bg-muted/60 p-0.5 border border-border shrink-0" role="radiogroup" :aria-label="t('products.viewLabel')">
             <button
               type="button"
-              class="p-1 rounded-md transition-all cursor-pointer"
+              role="radio"
+              class="h-8 w-8 inline-flex items-center justify-center rounded-md transition-colors cursor-pointer"
               :class="viewMode === 'grid' ? 'bg-card text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground'"
+              :aria-checked="viewMode === 'grid'"
               :title="t('products.gridTooltip')"
+              :aria-label="t('products.gridTooltip')"
               @click="viewMode = 'grid'"
             >
               <LayoutGrid :size="15" />
             </button>
             <button
               type="button"
-              class="p-1 rounded-md transition-all cursor-pointer"
+              role="radio"
+              class="h-8 w-8 inline-flex items-center justify-center rounded-md transition-colors cursor-pointer"
               :class="viewMode === 'table' ? 'bg-card text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground'"
+              :aria-checked="viewMode === 'table'"
               :title="t('products.tableTooltip')"
+              :aria-label="t('products.tableTooltip')"
               @click="viewMode = 'table'"
             >
               <List :size="15" />
             </button>
           </div>
 
-          <!-- Add Button + Dropdown -->
-          <div class="relative shrink-0">
-            <div class="inline-flex rounded-md shadow-xs">
-              <Button
-                variant="default"
-                size="sm"
-                class="h-8 gap-1.5 rounded-r-none text-xs cursor-pointer"
-                @click="router.push('/products/new')"
-              >
-                <Plus :size="14" />
+          <!-- Add: manual, or AI import -->
+          <DropdownMenuRoot :modal="false">
+            <DropdownMenuTrigger as-child>
+              <Button class="h-9 gap-1.5 px-3 cursor-pointer">
+                <Plus :size="15" />
                 <span>{{ t("products.add") }}</span>
+                <ChevronDown :size="14" class="opacity-80" />
               </Button>
-              <Button
-                variant="default"
-                size="sm"
-                class="h-8 px-2 rounded-l-none border-l border-primary-foreground/20 cursor-pointer"
-                @click="showAddDropdown = !showAddDropdown"
-              >
-                <ChevronDown :size="12" />
-              </Button>
-            </div>
-
-            <!-- Backdrop to close on click outside -->
-            <div
-              v-if="showAddDropdown"
-              class="fixed inset-0 z-30"
-              @click="showAddDropdown = false"
-            />
-
-            <!-- Dropdown Menu -->
-            <div
-              v-if="showAddDropdown"
-              class="absolute right-0 mt-1.5 w-52 p-1 z-40 rounded-xl border border-border bg-popover text-popover-foreground shadow-lg animate-in fade-in zoom-in-95 duration-100 flex flex-col"
-            >
-              <button
-                type="button"
-                class="w-full px-2.5 py-2 text-left text-xs text-foreground hover:bg-muted rounded-lg flex items-center gap-2.5 transition-colors cursor-pointer"
-                @click="showAddDropdown = false; router.push('/products/new')"
-              >
-                <Plus :size="14" class="text-primary" />
-                <span class="font-medium">{{ t("products.manualAdd") }}</span>
-              </button>
-
-              <div class="h-px bg-border my-0.5 -mx-1" />
-
-              <button
-                type="button"
-                class="w-full px-2.5 py-2 text-left text-xs text-foreground hover:bg-muted rounded-lg flex items-center gap-2.5 transition-colors cursor-pointer"
-                @click="openAiImport"
-              >
-                <Sparkles :size="14" class="text-amber-500" />
-                <span class="font-medium">{{ t("products.universalAiImport") }}</span>
-              </button>
-            </div>
-          </div>
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent align="end" :side-offset="6" class="menu-content">
+                <DropdownMenuItem class="menu-item" @select="router.push('/products/new')">
+                  <Plus :size="16" class="text-primary" />
+                  <span>{{ t("products.manualAdd") }}</span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator class="my-1 h-px bg-border" />
+                <DropdownMenuItem class="menu-item" @select="openAiImport">
+                  <Sparkles :size="16" class="text-amber-500" />
+                  <span>{{ t("products.universalAiImport") }}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </DropdownMenuRoot>
         </div>
       </div>
 
@@ -687,85 +677,74 @@ async function onConfirmImport() {
       v-else-if="filteredProducts.length === 0"
       class="text-center py-12 px-4 border-border shadow-xs"
     >
-      <Package :size="40" class="mx-auto text-muted-foreground/40 mb-2" />
+      <Package :size="40" class="mx-auto text-muted-foreground/60 mb-2" />
       <h3 class="text-sm font-semibold text-foreground">
-        {{ searchQuery ? t("products.notFound") : t("products.noProductsTitle") }}
+        {{ products.length > 0 ? t("products.notFound") : t("products.noProductsTitle") }}
       </h3>
-      <div v-if="!searchQuery" class="flex items-center justify-center gap-2 mt-4">
-        <Button
-          variant="default"
-          size="sm"
-          class="h-8 text-xs gap-1.5 cursor-pointer shadow-xs"
-          @click="router.push('/products/new')"
-        >
-          <Plus :size="13" />
+      <p v-if="products.length === 0" class="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">{{ t("products.noProductsDesc") }}</p>
+      <div v-if="products.length === 0" class="flex flex-wrap items-center justify-center gap-2 mt-4">
+        <Button class="h-10 gap-1.5 cursor-pointer" @click="router.push('/products/new')">
+          <Plus :size="15" />
           <span>{{ t("products.manualAdd") }}</span>
         </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          class="h-8 text-xs gap-1.5 cursor-pointer shadow-none"
-          @click="openAiImport"
-        >
-          <Sparkles :size="13" class="text-amber-500" />
+        <Button variant="outline" class="h-10 gap-1.5 cursor-pointer" @click="openAiImport">
+          <Sparkles :size="15" class="text-amber-500" />
           <span>{{ t("products.universalAiImport") }}</span>
         </Button>
       </div>
+      <Button v-else-if="hasActiveFilters" variant="outline" class="h-10 mt-4" @click="resetFilters">
+        {{ t("leads.clearFilters") }}
+      </Button>
     </Card>
 
-    <!-- GRID VIEW -->
+    <!-- GRID VIEW (always on phones, where a 7-column table can't fit) -->
     <div
-      v-else-if="viewMode === 'grid'"
+      v-else-if="viewMode === 'grid' || !isMdUp"
       class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2.5 sm:gap-3"
     >
       <Card
         v-for="p in paginatedProducts"
         :key="p.id"
-        class="group overflow-hidden flex flex-col justify-between hover:border-primary/40 transition-all shadow-2xs p-0 pt-0 gap-0"
+        class="overflow-hidden flex flex-col justify-between hover:border-primary/40 transition-colors shadow-2xs p-0 pt-0 gap-0"
       >
         <!-- Product Image -->
-        <div class="relative w-full aspect-square bg-muted/30 overflow-hidden cursor-pointer" @click="router.push(`/products/${p.id}`)">
+        <NuxtLink
+          :to="`/products/${p.id}`"
+          class="relative block w-full aspect-square bg-muted/30 overflow-hidden"
+          :aria-label="p.name"
+          tabindex="-1"
+        >
           <img
             v-if="getProductImage(p)"
             :src="getProductImage(p)!"
             :alt="p.name"
-            class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+            class="w-full h-full object-cover"
             loading="lazy"
           />
-          <div v-else class="w-full h-full flex flex-col items-center justify-center text-muted-foreground/40">
+          <div v-else class="w-full h-full flex flex-col items-center justify-center text-muted-foreground/50">
             <ImageIcon :size="28" class="sm:w-8 sm:h-8" />
           </div>
 
           <!-- Category Badge -->
           <div class="absolute top-1.5 left-1.5 sm:top-2 sm:left-2 max-w-[55%] truncate">
-            <span class="text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded bg-black/60 backdrop-blur-md text-white font-medium truncate block">
+            <span class="text-[10px] sm:text-[11px] px-1.5 sm:px-2 py-0.5 rounded bg-black/65 text-white font-medium truncate block">
               {{ getProductCategory(p) }}
             </span>
           </div>
 
-          <!-- Availability Badge -->
-          <div class="absolute top-1.5 right-1.5 sm:top-2 sm:right-2">
-            <button
-              type="button"
-              class="text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded font-semibold backdrop-blur-md transition-all cursor-pointer"
-              :class="p.availability ? 'bg-emerald-500/80 text-white' : 'bg-rose-500/80 text-white'"
-              :disabled="togglingId === p.id"
-              @click.stop="onToggleAvailability(p)"
-            >
-              {{ t(p.availability ? "products.available" : "products.outOfStock") }}
-            </button>
+          <!-- Out of stock is what the owner needs to notice -->
+          <div v-if="!p.availability" class="absolute top-1.5 right-1.5 sm:top-2 sm:right-2">
+            <span class="text-[10px] sm:text-[11px] px-1.5 sm:px-2 py-0.5 rounded font-semibold bg-rose-600 text-white">
+              {{ t("products.outOfStock") }}
+            </span>
           </div>
-        </div>
+        </NuxtLink>
 
         <!-- Details -->
         <div class="p-2.5 sm:p-3.5 flex-1 flex flex-col justify-between space-y-2 sm:space-y-2.5">
           <div>
-            <h3
-              class="font-semibold text-xs sm:text-sm text-foreground line-clamp-1 group-hover:text-primary transition-colors cursor-pointer"
-              :title="p.name"
-              @click="router.push(`/products/${p.id}`)"
-            >
-              {{ p.name }}
+            <h3 class="font-semibold text-xs sm:text-sm text-foreground line-clamp-1" :title="p.name">
+              <NuxtLink :to="`/products/${p.id}`" class="hover:text-primary transition-colors">{{ p.name }}</NuxtLink>
             </h3>
             <p v-if="p.description" class="text-[11px] sm:text-xs text-muted-foreground line-clamp-1 sm:line-clamp-2 mt-0.5">
               {{ p.description }}
@@ -791,30 +770,42 @@ async function onConfirmImport() {
             </span>
           </div>
 
+          <!-- In stock: a labelled switch, not a badge that secretly toggles -->
+          <label class="flex min-h-8 items-center gap-2 cursor-pointer">
+            <Switch
+              :model-value="p.availability"
+              :disabled="togglingId === p.id"
+              @update:model-value="onToggleAvailability(p)"
+            />
+            <span class="text-xs font-medium text-foreground">{{ t("productForm.inStock") }}</span>
+          </label>
+
           <!-- Footer: Price & Actions -->
           <div class="pt-1.5 sm:pt-2 border-t border-border flex items-center justify-between gap-1">
             <div class="font-bold text-xs sm:text-sm text-foreground truncate">
               {{ formatPrice(p.price, p.currency) }}
             </div>
 
-            <div class="flex items-center gap-0.5 sm:gap-1 shrink-0">
+            <div class="flex items-center gap-1 shrink-0">
               <Button
                 variant="ghost"
                 size="icon"
-                class="h-6 w-6 sm:h-7 sm:w-7 text-muted-foreground hover:text-foreground"
+                class="h-9 w-9 text-muted-foreground hover:text-foreground"
                 :title="t('common.edit')"
+                :aria-label="t('common.edit')"
                 @click="router.push(`/products/${p.id}`)"
               >
-                <Pencil :size="13" />
+                <Pencil :size="15" />
               </Button>
               <Button
                 variant="ghost"
                 size="icon"
-                class="h-6 w-6 sm:h-7 sm:w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                class="h-9 w-9 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                 :title="t('common.delete')"
-                @click="onDelete(p.id)"
+                :aria-label="t('common.delete')"
+                @click="productToDelete = p"
               >
-                <Trash2 :size="13" />
+                <Trash2 :size="15" />
               </Button>
             </div>
           </div>
@@ -824,8 +815,8 @@ async function onConfirmImport() {
 
     <!-- TABLE VIEW -->
     <Card
-      v-else-if="viewMode === 'table'"
-      class="overflow-hidden border-border shadow-xs"
+      v-else
+      class="overflow-hidden border-border shadow-xs py-0 gap-0"
     >
       <Table>
         <TableHeader class="bg-muted/40">
@@ -898,17 +889,19 @@ async function onConfirmImport() {
               <span v-else class="text-muted-foreground/40">—</span>
             </TableCell>
 
-            <!-- Availability -->
+            <!-- Availability: a real switch, so it reads as something you can change -->
             <TableCell class="py-2.5 px-4">
-              <button
-                type="button"
-                class="text-[10px] px-2 py-0.5 rounded font-semibold border transition-all cursor-pointer"
-                :class="p.availability ? 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20' : 'bg-rose-500/10 text-rose-600 border-rose-500/20'"
-                :disabled="togglingId === p.id"
-                @click="onToggleAvailability(p)"
-              >
-                {{ t(p.availability ? "products.available" : "products.outOfStock") }}
-              </button>
+              <label class="inline-flex items-center gap-2 cursor-pointer whitespace-nowrap">
+                <Switch
+                  :model-value="p.availability"
+                  :disabled="togglingId === p.id"
+                  :aria-label="`${p.name}: ${t('products.available')}`"
+                  @update:model-value="onToggleAvailability(p)"
+                />
+                <span class="text-xs font-medium" :class="p.availability ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-700 dark:text-rose-400'">
+                  {{ t(p.availability ? "products.available" : "products.outOfStock") }}
+                </span>
+              </label>
             </TableCell>
 
             <!-- Actions -->
@@ -926,9 +919,10 @@ async function onConfirmImport() {
                 <Button
                   variant="ghost"
                   size="icon"
-                  class="h-7 w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+                  class="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
                   :title="t('common.delete')"
-                  @click="onDelete(p.id)"
+                  :aria-label="t('common.delete')"
+                  @click="productToDelete = p"
                 >
                   <Trash2 :size="14" />
                 </Button>
@@ -1205,5 +1199,25 @@ async function onConfirmImport() {
       </DialogContent>
     </Dialog>
 
+    <!-- Delete product -->
+    <Dialog :open="!!productToDelete" @update:open="(v) => { if (!v && !deletingProduct) productToDelete = null }">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{{ t("products.deleteTitle") }}</DialogTitle>
+          <DialogDescription>
+            {{ t("products.deleteConfirmNamed", { name: productToDelete?.name ?? "" }) }}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button variant="outline" class="h-10" :disabled="deletingProduct" @click="productToDelete = null">
+            {{ t("common.cancel") }}
+          </Button>
+          <Button variant="destructive" class="h-10 gap-1.5" :disabled="deletingProduct" @click="confirmDeleteProduct">
+            <Trash2 :size="15" />
+            <span>{{ deletingProduct ? t("common.deleting") : t("common.delete") }}</span>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>

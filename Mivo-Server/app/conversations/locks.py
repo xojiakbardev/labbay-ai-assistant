@@ -1,27 +1,16 @@
-"""One turn at a time per conversation.
-
-Debouncing only covers messages that arrive within DEBOUNCE_SECONDS of each
-other. A message that lands while the previous turn is still waiting on the
-LLM would otherwise start a second, parallel turn: two overlapping replies, and
-whichever finished last overwrote the other's working_state. Everything that
-writes a reply to a customer runs under this lock.
-
-A Postgres advisory lock rather than an in-process one, so it holds across
-worker processes. It lives on its own AUTOCOMMIT connection: holding a session
-lock needs no open transaction, and the turn's own session stays free to
-commit as often as it needs to. Callers should commit their session before
-waiting here, so a waiter holds exactly one pooled connection.
-"""
+"""One turn at a time per conversation: a Postgres advisory lock on its own
+AUTOCOMMIT connection. Commit your session before waiting on it."""
 import uuid
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 
+from app.core.config import get_settings
 from app.core.db import engine
 
 # Longer than a whole turn (LLM deadline + delivery); a waiter past this fails
 # its event, which the sweeper retries — never waits forever.
-LOCK_WAIT_TIMEOUT = "120s"
+LOCK_WAIT_TIMEOUT = f"{get_settings().conversation_lock_wait_seconds}s"
 
 
 def lock_key(conversation_id: uuid.UUID) -> int:

@@ -26,6 +26,7 @@ from app.ai.context.builder import (
 )
 from app.ai.conversation_state import update_state
 from app.ai.provider.base import LLMProvider, LLMProviderError
+from app.ai import replies
 from app.ai.reply_parts import split_reply
 from app.ai.tools.definitions import ALL_TOOLS
 from app.ai.tools.executor import build_tool_executor
@@ -33,8 +34,6 @@ from app.businesses.models import Business
 from app.conversations.models import DELIVERY_PENDING, Conversation, Message, is_untranscribed_voice_note
 from app.conversations.service import add_message, get_recent_messages
 from app.leads.models import Lead
-
-FALLBACK_REPLY = "Kechirasiz, hozircha javob bera olmadim — tez orada siz bilan bog'lanamiz."
 
 
 def detect_preferred_language(
@@ -69,13 +68,6 @@ def detect_preferred_language(
     if biz_lang.startswith("en") or "eng" in biz_lang:
         return "en"
     return "uz"
-
-
-_PHONE_CAPTURED_CONFIRMATION = {
-    "uz": "Rahmat! Telefon raqamingiz qabul qilindi, operatorimiz tez orada siz bilan bog'lanadi.",
-    "ru": "Спасибо! Ваш номер телефона принят, наш оператор скоро свяжется с вами.",
-    "en": "Thank you! Your phone number has been received, our team will contact you shortly.",
-}
 
 
 class TurnAnalysis(BaseModel):
@@ -449,17 +441,9 @@ async def run_turn(
             pref_lang = detect_preferred_language(business.language, recent_texts)
 
             if has_latest_image:
-                # Friendly fallback asking for a text description instead of an
-                # immediate escalation failure.
-                if pref_lang == "ru":
-                    fallback_text = "Извините, возникла ошибка при обработке фото. Опишите, пожалуйста, нужный товар (тип, цвет, модель) текстом — я сразу проверю наличие!"
-                elif pref_lang == "en":
-                    fallback_text = "Apologies, there was an issue viewing the photo. Could you please describe what product (type, color, model) you're looking for in text?"
-                else:
-                    fallback_text = "Kechirasiz, yuborgan rasmingizni ochishda texnik nosozlik bo'ldi. Iltimos, qidirayotgan mahsulotingizni (turi, rangi, modeli) matn ko'rinishida yozib yubora olasizmi?"
-
+                # Ask for a text description instead of escalating.
                 result = ConversationTurnResult(
-                    reply=fallback_text,
+                    reply=replies.reply_text(business, "photo_unreadable", pref_lang),
                     lead_status="warm",
                     lead_score=40,
                     qualification_reason="Image processing fallback — asked customer to describe product in text.",
@@ -468,7 +452,7 @@ async def run_turn(
                 escalation_state["escalated"] = True
                 escalation_state["reason"] = f"AI provider error: {exc}"
                 result = ConversationTurnResult(
-                    reply=_ESCALATION_CLOSING.get(pref_lang, _ESCALATION_CLOSING["uz"]),
+                    reply=replies.reply_text(business, "handoff", pref_lang),
                     lead_status="cold",
                     lead_score=0,
                     qualification_reason="AI provider failed; escalated to human operator.",
@@ -505,26 +489,6 @@ async def run_turn(
     return result
 
 
-_DISCOUNT_GUARD_REPLY = {
-    "ru": "Извините, точную информацию о скидках я сейчас подтвердить не могу, наш оператор проверит и обязательно свяжется с вами.",
-    "en": "Apologies, I cannot confirm a specific discount right now. Our team will verify and get back to you shortly.",
-    "uz": "Aniq chegirma haqida hozir tasdiqlab bera olmayman, operatorimiz tekshirib sizga ma'lumot beradi.",
-}
-_PRICE_GUARD_REPLY = {
-    "ru": "Извините, точную цену уточнит наш оператор — он скоро с вами свяжется.",
-    "en": "Apologies, our team will confirm the exact price and get back to you shortly.",
-    "uz": "Aniq narxni operatorimiz tekshirib, tez orada sizga yozadi.",
-}
-_UNSEEN_MEDIA_REPLY = {
-    "ru": "Не могу открыть это видео 🙂 Какой товар вас заинтересовал? Напишите название или пришлите фото — сразу проверю.",
-    "en": "I can't open that video 🙂 Which product caught your eye? Send me its name or a photo and I'll check right away.",
-    "uz": "Bu videoni ocha olmayapman 🙂 Undagi qaysi mahsulot qiziqtirdi? Nomini yozing yoki rasmini yuboring — darhol tekshirib beraman.",
-}
-_NEUTRAL_REPLY = {
-    "ru": "Понял! Чем могу помочь?",
-    "en": "Got it! How can I help?",
-    "uz": "Tushunarli! Sizga qanday yordam bera olaman?",
-}
 
 # The model's notes about media (app/ai/context/builder.py) and the labels
 # older messages were stored with must never reach a customer, however the
@@ -598,12 +562,12 @@ def _apply_reply_guards(
     if cleaned != reply:
         logger.warning("Reply carried an internal label/note for business %s. Original: %s", business.id, reply)
         flagged = True
-        reply = cleaned or _NEUTRAL_REPLY.get(lang, _NEUTRAL_REPLY["uz"])
+        reply = cleaned or replies.reply_text(business, "neutral", lang)
 
     if unseen_media and claims_to_see_media(reply):
         logger.warning("Reply described media the model never saw, business %s. Original: %s", business.id, reply)
         flagged = True
-        reply = _UNSEEN_MEDIA_REPLY.get(lang, _UNSEEN_MEDIA_REPLY["uz"])
+        reply = replies.reply_text(business, "media_unseen", lang)
 
     if escalation_state["escalated"]:
         fixed = _ensure_escalation_reply(
@@ -612,24 +576,24 @@ def _apply_reply_guards(
         if fixed != reply:
             reply = fixed
 
-    guard_reply: dict | None = None
+    guard_reply: str | None = None
     if _contains_unverified_discount_claim(
         reply,
         escalation_state.get("executed_tools", []),
         escalation_state.get("active_discounts", []),
         _catalog_prices(escalation_state, working_state),
     ):
-        guard_reply, reason = _DISCOUNT_GUARD_REPLY, "AI tasdiqlanmagan chegirma aytmoqchi bo'ldi — tekshirib javob bering."
+        guard_reply, reason = "discount_unconfirmed", "AI tasdiqlanmagan chegirma aytmoqchi bo'ldi — tekshirib javob bering."
     elif _contains_unverified_price(
         reply,
         _allowed_prices(escalation_state, working_state, business, customer_texts or []),
     ):
-        guard_reply, reason = _PRICE_GUARD_REPLY, "AI katalogda yo'q narx aytmoqchi bo'ldi — narxni tasdiqlab javob bering."
+        guard_reply, reason = "price_unconfirmed", "AI katalogda yo'q narx aytmoqchi bo'ldi — narxni tasdiqlab javob bering."
 
     if guard_reply is not None:
         logger.warning("Reply guard intercepted a reply for business %s. Original: %s", business.id, reply)
         flagged = True
-        reply = guard_reply.get(lang, guard_reply["uz"])
+        reply = replies.reply_text(business, guard_reply, lang)
         escalation_state["escalated"] = True
         escalation_state["reason"] = reason
 
@@ -918,13 +882,6 @@ def _contains_unverified_price(reply: str, allowed: set[float]) -> bool:
     return False
 
 
-_ESCALATION_CLOSING = {
-    "ru": "Хорошо, я передал(а) информацию нашему оператору — он скоро свяжется с вами.",
-    "en": "Got it — I've passed this to our team, they'll reach out to you shortly.",
-    "uz": "Tushunarli, ma'lumotingizni operatorimizga uzatdim — tez orada siz bilan bog'lanishadi.",
-}
-
-
 def _normalize_for_comparison(text: str) -> str:
     return text.strip().lower().rstrip(".!?… ")
 
@@ -959,7 +916,7 @@ def _ensure_escalation_reply(
         return reply
 
     lang = detect_preferred_language(business.language, text_samples)
-    return _ESCALATION_CLOSING.get(lang, _ESCALATION_CLOSING["uz"])
+    return replies.reply_text(business, "handoff", lang)
 
 
 async def handle_customer_message(

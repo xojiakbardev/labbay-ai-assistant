@@ -96,6 +96,8 @@ function formatTime(isoStr: string): string {
       size="icon"
       class="relative h-9 w-9 rounded-xl border-border bg-card hover:bg-muted text-foreground transition-all cursor-pointer shadow-2xs"
       :title="t('notifications.bellTitle', { count: unreadCount })"
+      :aria-label="t('notifications.bellTitle', { count: unreadCount })"
+      :aria-expanded="isOpen"
       @click="toggleDropdown"
     >
       <Bell :size="16" class="text-foreground" />
@@ -103,7 +105,8 @@ function formatTime(isoStr: string): string {
       <!-- Unread Badge Counter -->
       <span
         v-if="unreadCount > 0"
-        class="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white shadow-sm ring-2 ring-background animate-in zoom-in"
+        class="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white shadow-sm ring-2 ring-background"
+        aria-hidden="true"
       >
         {{ unreadCount > 99 ? "99+" : unreadCount }}
       </span>
@@ -120,7 +123,7 @@ function formatTime(isoStr: string): string {
     >
       <div
         v-if="isOpen"
-        class="absolute right-0 mt-2 w-[calc(100vw-2rem)] sm:w-96 max-w-sm rounded-2xl border border-border bg-card text-card-foreground shadow-2xl z-50 overflow-hidden"
+        class="fixed inset-x-3 top-[calc(var(--mobile-header-h)+0.5rem)] sm:absolute sm:inset-x-auto sm:top-auto sm:right-0 sm:mt-2 sm:w-96 rounded-2xl border border-border bg-card text-card-foreground shadow-2xl z-50 overflow-hidden"
       >
         <!-- Header -->
         <div class="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/40">
@@ -151,7 +154,10 @@ function formatTime(isoStr: string): string {
             v-for="item in unreadNotifications"
             :key="item.id"
             class="p-3.5 flex items-start gap-3 cursor-pointer transition-colors bg-primary/[0.08] dark:bg-primary/[0.16] hover:bg-primary/[0.12] dark:hover:bg-primary/[0.22] border-l-4 border-l-primary"
+            role="button"
+            tabindex="0"
             @click="handleNotificationClick(item)"
+            @keydown.enter.self="handleNotificationClick(item)"
           >
             <!-- Type Icon -->
             <NotificationTypeIcon :type="item.type" :size="16" class="w-8 h-8 rounded-lg mt-0.5" />
@@ -182,16 +188,13 @@ function formatTime(isoStr: string): string {
             <div class="flex items-center gap-1 shrink-0 pt-0.5">
               <button
                 type="button"
-                class="p-1 rounded-md text-muted-foreground hover:text-primary hover:bg-primary/15 transition-all cursor-pointer"
+                class="hit-area p-1.5 rounded-md text-muted-foreground hover:text-primary hover:bg-primary/15 transition-all cursor-pointer"
                 :title="t('notifications.markRead')"
+                :aria-label="t('notifications.markRead')"
                 @click.stop="markAsRead(item.id)"
               >
                 <Check :size="14" />
               </button>
-              <span class="relative flex h-2 w-2 shrink-0">
-                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
-                <span class="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
-              </span>
             </div>
           </div>
 

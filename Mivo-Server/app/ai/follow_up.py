@@ -1,16 +1,5 @@
-"""Smart follow-up: one gentle nudge to a warm/hot lead who went quiet after
-the AI's last reply.
-
-Rules, every one of them enforced here rather than hoped for:
-- only businesses whose AI may reply at all (owner switch on, not suspended,
-  not deleted, subscription active) — the same rule as live replies;
-- only inside Meta's 24-hour messaging window, measured from the customer's
-  last message (a promotional message outside it gets the app restricted);
-- at most one follow-up per silence: a new one only after the customer has
-  written again;
-- persisted before sent, under the conversation lock, through the outbox — so
-  two sweeps (or two processes) can't both send, and the echo is recognised.
-"""
+"""One follow-up to a quiet warm/hot lead: only when AI may reply, inside Meta's
+24h window, once per silence, through the outbox."""
 import datetime as dt
 import logging
 import uuid
@@ -19,12 +8,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.orchestrator import detect_preferred_language
+from app.ai.replies import reply_text
 from app.businesses.models import Business
 from app.businesses.service import ai_may_reply
 from app.conversations.delivery import DeliveryError, send_outbound
 from app.conversations.locks import conversation_lock
 from app.conversations.models import DELIVERY_PENDING, MESSAGE_TYPE_REACTION, Conversation, Message
 from app.conversations.service import add_message, get_recent_messages
+from app.core.config import get_settings
 from app.core.security import decrypt_secret
 from app.customers.models import Customer
 from app.instagram.client import MetaClient
@@ -33,28 +24,11 @@ from app.leads.models import Lead
 
 logger = logging.getLogger("app.ai.follow_up")
 
-_FOLLOW_UP_AFTER = dt.timedelta(minutes=30)
+_settings = get_settings()
+_FOLLOW_UP_AFTER = dt.timedelta(minutes=_settings.follow_up_after_minutes)
 # Meta allows 24h after the customer's last message; keep a margin.
-_MESSAGING_WINDOW = dt.timedelta(hours=23)
-_BATCH = 50
-
-_TEXT = {
-    "uz": (
-        "Assalomu alaykum! Siz so'ragan {product} bo'yicha savollaringiz qoldimi? "
-        "Razmer yoki rangini tanlashda yordam kerak bo'lsa, bemalol yozing 😊",
-        "Assalomu alaykum! Mahsulotlarimiz bo'yicha savollaringiz qoldimi? "
-        "Sizga mos model va o'lchamni tanlashda yordam beraman 😊",
-    ),
-    "ru": (
-        "Здравствуйте! Остались вопросы по {product}? Если нужно помочь с размером или цветом — пишите 😊",
-        "Здравствуйте! Остались вопросы по нашим товарам? Помогу подобрать модель и размер 😊",
-    ),
-    "en": (
-        "Hi! Any questions left about the {product}? Happy to help with the size or colour 😊",
-        "Hi! Any questions left about our products? Happy to help you pick the right one 😊",
-    ),
-}
-
+_MESSAGING_WINDOW = dt.timedelta(hours=_settings.follow_up_window_hours)
+_BATCH = _settings.follow_up_batch
 
 def _last_customer_message_at():
     return (
@@ -154,8 +128,10 @@ async def _follow_up_one(db: AsyncSession, conversation_id: uuid.UUID, client: M
             None,
         )
         lang = detect_preferred_language(business.language, [m.content for m in recent if m.content])
-        with_product, generic = _TEXT.get(lang, _TEXT["uz"])
-        text = with_product.format(product=product) if product else generic
+        text = (
+            reply_text(business, "follow_up", lang, product=product) if product
+            else reply_text(business, "follow_up_generic", lang)
+        )
 
         conversation.follow_up_sent_at = now
         message = await add_message(db, conversation, sender_type="ai", content=text, delivery_status=DELIVERY_PENDING)

@@ -130,7 +130,7 @@ function formatTime(isoStr: string): string {
       <div class="flex items-center gap-2 overflow-x-auto">
         <button
           type="button"
-          class="px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
+          class="min-h-10 px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
           :class="[
             currentTab === 'all'
               ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
@@ -140,7 +140,7 @@ function formatTime(isoStr: string): string {
         >
           <span>{{ t("notifications.allTab") }}</span>
           <span
-            class="px-1.5 py-0.2 rounded-full text-[10px]"
+            class="px-1.5 py-0.5 rounded-full text-[10px]"
             :class="currentTab === 'all' ? 'bg-primary-foreground/20 text-primary-foreground' : 'bg-muted text-muted-foreground'"
           >
             {{ notifications.length }}
@@ -149,7 +149,7 @@ function formatTime(isoStr: string): string {
 
         <button
           type="button"
-          class="px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
+          class="min-h-10 px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
           :class="[
             currentTab === 'unread'
               ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
@@ -160,14 +160,14 @@ function formatTime(isoStr: string): string {
           <span>{{ t("notifications.unreadTab") }}</span>
           <span
             v-if="unreadCount > 0"
-            class="px-1.5 py-0.2 rounded-full text-[10px] font-bold"
+            class="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
             :class="currentTab === 'unread' ? 'bg-primary-foreground/20 text-primary-foreground' : 'bg-red-500/20 text-red-600 dark:text-red-400'"
           >
             {{ unreadCount }}
           </span>
           <span
             v-else
-            class="px-1.5 py-0.2 rounded-full text-[10px]"
+            class="px-1.5 py-0.5 rounded-full text-[10px]"
             :class="currentTab === 'unread' ? 'bg-primary-foreground/20 text-primary-foreground' : 'bg-muted text-muted-foreground'"
           >
             0
@@ -176,7 +176,7 @@ function formatTime(isoStr: string): string {
 
         <button
           type="button"
-          class="px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
+          class="min-h-10 px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer shrink-0"
           :class="[
             currentTab === 'hot'
               ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
@@ -186,7 +186,7 @@ function formatTime(isoStr: string): string {
         >
           <span>{{ t("notifications.hotLeadsTab") }}</span>
           <span
-            class="px-1.5 py-0.2 rounded-full text-[10px]"
+            class="px-1.5 py-0.5 rounded-full text-[10px]"
             :class="currentTab === 'hot' ? 'bg-primary-foreground/20 text-primary-foreground' : 'bg-muted text-muted-foreground'"
           >
             {{ hotCount }}
@@ -288,7 +288,7 @@ function formatTime(isoStr: string): string {
                 v-if="item.extra_metadata.score"
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/10 text-[11px] text-amber-600 dark:text-amber-400 font-medium"
               >
-                Score: {{ item.extra_metadata.score }}
+                {{ t("leads.intentScore") }}: {{ item.extra_metadata.score }}
               </span>
             </div>
           </div>

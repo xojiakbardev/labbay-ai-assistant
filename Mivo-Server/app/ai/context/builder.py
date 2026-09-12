@@ -246,6 +246,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.conversation_state import render_state_block
+from app.core.config import get_settings
 from app.ai.models import AiFeedback
 
 
@@ -395,12 +396,12 @@ _SENDER_TO_ROLE = {"customer": "user", "ai": "assistant", "human": "assistant", 
 
 # Images are the expensive part of a multimodal context, so only the customer's
 # most recent ones are actually attached.
-MAX_MULTIMODAL_IMAGES = 2
+MAX_MULTIMODAL_IMAGES = get_settings().max_multimodal_images
 # Instagram attachment URLs are signed and expire. Re-sending an expired one
 # makes every model reject the request, and since the same image would be
 # re-sent on every later turn, one old photo used to break the conversation
 # for good. Past this age an image degrades to the text marker.
-MAX_IMAGE_AGE = dt.timedelta(hours=6)
+MAX_IMAGE_AGE = dt.timedelta(hours=get_settings().max_image_age_hours)
 
 
 def build_message_history(messages: list[Message]) -> list[dict[str, Any]]:

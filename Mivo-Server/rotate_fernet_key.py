@@ -1,15 +1,6 @@
-"""Re-encrypt every stored secret under the current primary FERNET_KEY.
+"""Re-encrypt stored secrets under the primary FERNET_KEY.
 
-Rotation, without breaking any stored Instagram token:
-  1. Generate a new key:
-       python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-  2. Set FERNET_KEY=<new>,<old>   (new first: it encrypts; both decrypt)
-  3. Restart the API, then run:   python rotate_fernet_key.py
-  4. Set FERNET_KEY=<new> and restart again.
-
-A value that no configured key can decrypt is reported and left as it is —
-the script never writes something it couldn't read.
-"""
+  1. FERNET_KEY=<new>,<old>  2. python rotate_fernet_key.py  3. FERNET_KEY=<new>"""
 import asyncio
 
 from cryptography.fernet import InvalidToken

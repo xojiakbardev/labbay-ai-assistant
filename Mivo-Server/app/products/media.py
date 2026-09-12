@@ -10,9 +10,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import get_settings
 from app.products.models import Product
 
-MAX_IMAGES_PER_REPLY = 3
+MAX_IMAGES_PER_REPLY = get_settings().max_images_per_reply
 
 
 def get_display_image_url(product: Product) -> str | None:

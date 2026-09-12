@@ -1,17 +1,5 @@
-"""Telling the business owner something needs them — one place for every
-channel (dashboard notification + SSE, web push, Telegram).
-
-Each channel is independent: Telegram being down must not stop the dashboard
-notification, and a push failure must not stop Telegram. A failed channel is
-logged and recorded, never raised into the customer pipeline that called it —
-by the time an alert fires, the customer-facing work is already done.
-
-A failed channel rolls the session back, which expires every loaded object;
-reading an attribute after that would be a lazy load, which async SQLAlchemy
-refuses. So everything an alert needs is read into plain values first, and the
-one channel that needs ORM objects (the hot-lead Telegram template) re-fetches
-them.
-"""
+"""Owner alerts over dashboard, push and Telegram. Each channel fails on its own;
+values are read before any rollback can expire them."""
 import html
 import logging
 import uuid

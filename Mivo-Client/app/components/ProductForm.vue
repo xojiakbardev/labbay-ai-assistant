@@ -673,36 +673,37 @@ onUnmounted(() => {
 
 <template>
   <div class="product-page-container w-full pb-16 space-y-6">
-    <!-- Top Action Bar -->
-    <div class="flex items-center justify-between gap-4 pb-4 border-b border-border">
-      <div class="flex items-center gap-2.5">
+    <!-- Top action bar: stays in view on a long form, so Save is always one tap away -->
+    <div
+      class="sticky top-[var(--mobile-header-h)] min-[901px]:top-14 z-20 py-3 flex items-center justify-between gap-3 border-b border-border bg-background/95 backdrop-blur"
+    >
+      <div class="flex items-center gap-2.5 min-w-0">
         <Button
           variant="outline"
           size="icon"
-          class="h-9 w-9"
+          class="h-10 w-10 shrink-0"
           :title="t('productForm.back')"
+          :aria-label="t('productForm.back')"
           @click="router.push('/products')"
         >
           <ArrowLeft :size="18" />
         </Button>
-        <h1 class="text-xl font-bold tracking-tight text-foreground">
+        <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground truncate">
           {{ mode === "create" ? t("productForm.newTitle") : t("productForm.editTitle") }}
         </h1>
       </div>
 
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 shrink-0">
         <Button
           variant="outline"
-          size="sm"
-          class="h-9 px-4"
+          class="hidden sm:inline-flex h-10 px-4"
           @click="router.push('/products')"
         >
           {{ t("productForm.cancel") }}
         </Button>
         <Button
           variant="default"
-          size="sm"
-          class="h-9 px-5 gap-2 font-semibold"
+          class="h-10 px-4 sm:px-5 gap-2 font-semibold"
           :disabled="saving || loading || uploadingVariantImages || !name.trim()"
           @click="onSubmit"
         >
@@ -1182,26 +1183,29 @@ onUnmounted(() => {
                     {{ t("productForm.primaryBadge") }}
                   </div>
 
-                  <!-- Boshqa rasmni 1-o'ringa o'tkazish tugmasi -->
+                  <!-- Make this the primary image. With a mouse it appears on hover;
+                       on touch screens (no hover) a star is always shown. -->
                   <button
                     v-else
                     type="button"
-                    class="absolute inset-0 bg-black/65 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center text-white text-[9px] font-semibold transition-opacity cursor-pointer text-center p-0.5"
+                    class="thumb-action thumb-primary absolute inset-0 bg-black/65 flex flex-col items-center justify-center text-white text-[10px] font-semibold transition-opacity cursor-pointer text-center p-0.5"
                     :title="t('productForm.makePrimaryTitle')"
+                    :aria-label="t('productForm.makePrimaryTitle')"
                     @click="setPrimarySkuImage(v, imgIdx)"
                   >
                     <Star :size="12" class="text-amber-400 fill-amber-400 mb-0.5" />
                     <span>{{ t("productForm.makePrimary") }}</span>
                   </button>
 
-                  <!-- Rasmni o'chirish -->
+                  <!-- Remove the image: always visible on touch screens -->
                   <button
                     type="button"
-                    class="absolute top-0.5 right-0.5 h-4 w-4 rounded-full bg-background/90 hover:bg-destructive hover:text-white text-muted-foreground flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shadow-xs"
+                    class="thumb-action absolute top-0.5 right-0.5 h-6 w-6 rounded-full bg-background/95 hover:bg-destructive hover:text-white text-foreground flex items-center justify-center transition-opacity cursor-pointer shadow-xs"
                     :title="t('common.delete')"
+                    :aria-label="t('common.delete')"
                     @click="removeSkuImage(v, imgIdx)"
                   >
-                    <X :size="10" />
+                    <X :size="12" />
                   </button>
                 </div>
               </div>
@@ -1360,3 +1364,24 @@ onUnmounted(() => {
 
   </div>
 </template>
+
+<style scoped>
+/* Variant thumbnails: with a mouse the actions appear on hover/focus; on
+   touch screens (no hover) they are always there, the "make primary" one as
+   a slim strip at the bottom instead of covering the photo. */
+@media (hover: hover) {
+  .group:not(:hover):not(:focus-within) .thumb-action {
+    opacity: 0;
+  }
+}
+
+@media (hover: none) {
+  .thumb-primary {
+    inset: auto 0 0 0;
+    height: 1.25rem;
+    flex-direction: row;
+    gap: 0.125rem;
+    background: rgb(0 0 0 / 0.6);
+  }
+}
+</style>
