@@ -78,7 +78,7 @@ def test_build_message_history_multimodal_latest_and_token_saving_history():
 
 def test_build_message_history_attaches_only_the_most_recent_images():
     """Images are the expensive part of a multimodal context, so the window is
-    capped: anything older than MAX_MULTIMODAL_IMAGES degrades to a text marker."""
+    capped: anything older than MAX_MULTIMODAL_IMAGES degrades to a note."""
     conv_id = uuid.uuid4()
 
     def _image(name: str) -> Message:
@@ -96,9 +96,11 @@ def test_build_message_history_attaches_only_the_most_recent_images():
     mapped = build_message_history([first, second, third])
 
     assert MAX_MULTIMODAL_IMAGES == 2
-    # Oldest falls out of the window: text marker only, no image payload.
+    # Oldest falls out of the window: a note, no image payload — and what
+    # the customer wrote with it survives.
     assert isinstance(mapped[0]["content"], str)
-    assert "[Mijoz rasm yubordi]" in mapped[0]["content"]
+    assert mapped[0]["content"].startswith("(Note: the customer sent a photo earlier")
+    assert "Shundan bormi? (p1)" in mapped[0]["content"]
     assert "p1.jpg" not in mapped[0]["content"]
     # The two most recent stay attached.
     for idx, name in ((1, "p2"), (2, "p3")):

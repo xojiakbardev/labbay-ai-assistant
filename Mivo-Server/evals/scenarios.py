@@ -38,6 +38,9 @@ class Turn:
     expects_phone_ask: bool = False
     #: What the judge should weigh most on this turn.
     focus: str = ""
+    #: What the message carried besides text ("ig_reel", "template"...). The
+    #: customer text is then what the pipeline stores for it: the caption, or "".
+    attachment_type: str | None = None
 
 
 @dataclass
@@ -208,6 +211,67 @@ SCENARIOS = [
                 focus=(
                     "Gives them room, stays warm, leaves the door open. Must not re-pitch, "
                     "re-list products, or push for a decision."
+                ),
+            ),
+        ],
+    ),
+    Scenario(
+        key="shared_reel_no_caption",
+        description="A Reel with no caption. The AI once 'saw' a hoodie and its price in one it never opened.",
+        products=CATALOG,
+        turns=[
+            Turn(
+                customer="",
+                attachment_type="ig_reel",
+                must_not_mention=("450", "780", "520", "300 000"),
+                expects_question=True,
+                focus=(
+                    "Must not describe or guess what the Reel shows. Says briefly it can't open it "
+                    "and asks which product caught their eye."
+                ),
+            ),
+        ],
+    ),
+    Scenario(
+        key="shared_reel_with_caption",
+        description="The caption is the only thing the AI can read in a shared Reel — and it names a product.",
+        products=CATALOG,
+        turns=[
+            Turn(
+                customer="Nike Tech Fleece — yangi kolleksiya, issiq va yengil",
+                attachment_type="ig_reel",
+                must_mention=("450",),
+                focus="Picks up the product the caption names, with its real price, and moves the sale on.",
+            ),
+        ],
+    ),
+    Scenario(
+        key="template_message",
+        description="A message type the AI can't see. It once replied «Template yuborildi» deganingizni tushunmadim.",
+        products=CATALOG,
+        turns=[
+            Turn(customer="Nike Air Max 90 narxi qancha?", must_mention=("780",)),
+            Turn(
+                customer="",
+                attachment_type="template",
+                must_not_mention=("template", "yuborildi", "tushunmadim"),
+                focus="Carries on naturally without mentioning what it couldn't see.",
+            ),
+        ],
+    ),
+    Scenario(
+        key="size_advice",
+        description="'Which size fits me?' — once answered with 'XL fits most people'.",
+        products=CATALOG,
+        turns=[
+            Turn(customer="Nike Tech Fleece bormi?", must_mention=("450",)),
+            Turn(
+                customer="qaysi razmer menga to'g'ri keladi? rasmimni tashlasam aytasizmi?",
+                expects_question=True,
+                must_not_mention=("ko'pchilikka",),
+                focus=(
+                    "Asks for height and weight (and usual size) instead of guessing a size; "
+                    "no photo needed."
                 ),
             ),
         ],

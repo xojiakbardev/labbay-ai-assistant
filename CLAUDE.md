@@ -262,6 +262,21 @@ follow from that:
   JSONB in place won't mark the attribute dirty. Anything that resets a
   conversation must clear it too (see `/ai/sandbox/reset`).
 - `follow_up.py` — scheduled re-engagement of inactive warm/hot leads.
+- `closing.py` — knowing when the conversation is over. A short, plain-text,
+  question-free burst after our last message ("hop", "ok", 👍) goes to a small
+  structured call (`ClosingDecision`): if the model says it's finished, nothing is
+  sent — the pipeline reacts to the customer's message with the emoji the model
+  picked (`MetaClient.send_reaction`) and marks the message answered. The sandbox
+  does the same. A failed decision means a normal reply.
+- **Media the model can't see.** Media messages are stored with no text of their
+  own (a shared post/Reel keeps its caption, from the payload's `title`); the
+  dashboard renders the media. `builder.build_message_history` turns them into
+  `(Note: …)` lines for the model — never the old bracketed labels, which it used
+  to quote back to customers. The reply guards cut any note/label that still
+  reaches a reply (`strip_internal_markers`) and replace a description of a shared
+  Reel/post it never saw (`claims_to_see_media`) with an honest "I can't open it —
+  which product was it?". Voice notes keep the `[Ovozli xabar]` placeholder: it's
+  the "not transcribed yet" state.
 
 **Lead writes are deterministic and backend-only.** `app/leads/service.py` is the
 single writer to `leads`; `app/leads/scoring.py` owns the cold/warm/hot bands

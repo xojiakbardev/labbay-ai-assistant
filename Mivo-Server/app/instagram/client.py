@@ -239,6 +239,19 @@ class MetaClient:
             "rasm yuborish",
         )
 
+    async def send_reaction(self, *, access_token: str, recipient_id: str, message_id: str, emoji: str) -> None:
+        """Reacts to one of the customer's messages with an emoji — no new
+        message in the thread."""
+        await self._post_message(
+            access_token,
+            {
+                "recipient": {"id": recipient_id},
+                "sender_action": "react",
+                "payload": {"message_id": message_id, "reaction": emoji},
+            },
+            "reaksiya qoldirish",
+        )
+
     async def get_user_profile(self, user_id: str, access_token: str) -> dict:
         """Profile (username, name) for a customer's IGSID. Raises
         MetaAPIError when Meta won't return it (privacy settings, deleted

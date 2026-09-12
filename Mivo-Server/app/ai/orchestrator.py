@@ -22,6 +22,7 @@ from app.ai.context.builder import (
     build_analyst_prompt,
     build_message_history,
     build_system_prompt_with_learnings,
+    unseen_shared_media,
 )
 from app.ai.conversation_state import update_state
 from app.ai.provider.base import LLMProvider, LLMProviderError
@@ -320,6 +321,13 @@ async def run_turn(
     recent_texts = [
         getattr(m, "content", "") for m in (history[-3:] if history else []) if getattr(m, "content", None)
     ]
+    # Did the customer, since our last message, share something the model
+    # can't see (a Reel with no caption)? Then a reply describing it is made up.
+    unseen_media = False
+    for m in reversed(history):
+        if getattr(m, "sender_type", None) != "customer":
+            break
+        unseen_media = unseen_media or unseen_shared_media(m)
     customer_texts = [
         m.content for m in history[-8:] if getattr(m, "sender_type", None) == "customer" and getattr(m, "content", None)
     ]
@@ -343,6 +351,7 @@ async def run_turn(
             recent_texts,
             working_state=conversation.working_state,
             customer_texts=customer_texts,
+            unseen_media=unseen_media,
         )
         if escalation_state["escalated"]:
             # Only from an AI-active status: someone who took the conversation
@@ -498,6 +507,56 @@ _PRICE_GUARD_REPLY = {
     "en": "Apologies, our team will confirm the exact price and get back to you shortly.",
     "uz": "Aniq narxni operatorimiz tekshirib, tez orada sizga yozadi.",
 }
+_UNSEEN_MEDIA_REPLY = {
+    "ru": "Не могу открыть это видео 🙂 Какой товар вас заинтересовал? Напишите название или пришлите фото — сразу проверю.",
+    "en": "I can't open that video 🙂 Which product caught your eye? Send me its name or a photo and I'll check right away.",
+    "uz": "Bu videoni ocha olmayapman 🙂 Undagi qaysi mahsulot qiziqtirdi? Nomini yozing yoki rasmini yuboring — darhol tekshirib beraman.",
+}
+_NEUTRAL_REPLY = {
+    "ru": "Понял! Чем могу помочь?",
+    "en": "Got it! How can I help?",
+    "uz": "Tushunarli! Sizga qanday yordam bera olaman?",
+}
+
+# The model's notes about media (app/ai/context/builder.py) and the labels
+# older messages were stored with must never reach a customer, however the
+# model came to write them: the note or label itself is cut out, and a
+# sentence that talks about one ("«Template yuborildi» deganingizni
+# tushunmadim") is dropped.
+_NOTE_SPAN_RE = re.compile(r"\(note:[^)]*\)[ \t]*", re.IGNORECASE)
+_LABEL_SPAN_RE = re.compile(r"\[[^\]\n]{0,80}\][ \t]*")
+_LABEL_PHRASE_RE = re.compile(
+    r"template yuborildi|rasm yubordi|rasm yuborildi|ulashildi|story'da belgilandi|\(note:", re.IGNORECASE
+)
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def strip_internal_markers(reply: str) -> str:
+    """The reply without internal notes/labels. Returned unchanged when it
+    carries none."""
+    cleaned = _LABEL_SPAN_RE.sub("", _NOTE_SPAN_RE.sub("", reply))
+    if _LABEL_PHRASE_RE.search(cleaned):
+        lines = []
+        for line in cleaned.split("\n"):
+            kept = [s for s in _SENTENCE_END_RE.split(line) if not _LABEL_PHRASE_RE.search(s)]
+            lines.append(" ".join(kept).strip())
+        cleaned = "\n".join(line for line in lines if line)
+    return reply if cleaned == reply else cleaned.strip()
+
+
+# "Rasmdagi qora hoodie...", "на видео...", "in the reel..." — a reply that
+# describes media the model was never shown.
+_CLAIMS_TO_SEE_RE = re.compile(
+    r"\b(?:rasm|surat|video|reels?|post|story)(?:da|dagi|ingizda|ingizdagi|ngizda|ngizdagi)\b"
+    r"|ko['‘’`ʻ]?rinishidan|ko['‘’`ʻ]?ryapman|ko['‘’`ʻ]?rinyapti"
+    r"|на (?:фото|видео|картинке|рилсе)|в (?:видео|рилсе|посте)"
+    r"|in (?:the|your|this) (?:video|photo|picture|reel|post|story)|i can see",
+    re.IGNORECASE,
+)
+
+
+def claims_to_see_media(reply: str) -> bool:
+    return bool(_CLAIMS_TO_SEE_RE.search(reply))
 
 
 def _apply_reply_guards(
@@ -507,6 +566,7 @@ def _apply_reply_guards(
     recent_texts: list[str],
     working_state: dict | None = None,
     customer_texts: list[str] | None = None,
+    unseen_media: bool = False,
 ) -> tuple[str, bool]:
     """The last checks on text about to reach a customer.
 
@@ -518,8 +578,24 @@ def _apply_reply_guards(
     A reply the discount or price guard rewrites promises that an operator will
     follow up, so the guard also escalates for real: the conversation goes to
     human_needed and the owner is alerted. The promise is never an empty one.
+
+    `unseen_media`: the customer shared something the model couldn't see (a
+    Reel with no caption) — a reply describing it is invented, and is replaced
+    with an honest "I can't open it, which product was it?".
     """
     flagged = False
+    lang = detect_preferred_language(business.language, recent_texts)
+
+    cleaned = strip_internal_markers(reply)
+    if cleaned != reply:
+        logger.warning("Reply carried an internal label/note for business %s. Original: %s", business.id, reply)
+        flagged = True
+        reply = cleaned or _NEUTRAL_REPLY.get(lang, _NEUTRAL_REPLY["uz"])
+
+    if unseen_media and claims_to_see_media(reply):
+        logger.warning("Reply described media the model never saw, business %s. Original: %s", business.id, reply)
+        flagged = True
+        reply = _UNSEEN_MEDIA_REPLY.get(lang, _UNSEEN_MEDIA_REPLY["uz"])
 
     if escalation_state["escalated"]:
         fixed = _ensure_escalation_reply(
@@ -545,7 +621,6 @@ def _apply_reply_guards(
     if guard_reply is not None:
         logger.warning("Reply guard intercepted a reply for business %s. Original: %s", business.id, reply)
         flagged = True
-        lang = detect_preferred_language(business.language, recent_texts)
         reply = guard_reply.get(lang, guard_reply["uz"])
         escalation_state["escalated"] = True
         escalation_state["reason"] = reason

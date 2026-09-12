@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select, update
 
 import app.instagram.pipeline as pipeline
+from app.ai.closing import ClosingDecision
 from app.ai.orchestrator import ConversationTurnResult
 from app.ai.provider.base import LLMProvider, LLMProviderError
 from app.auth.models import User
@@ -52,15 +53,28 @@ def alerts(monkeypatch):
 
 
 class FakeProvider(LLMProvider):
-    def __init__(self, result: ConversationTurnResult | None = None, *, error: Exception | None = None, delay: float = 0):
+    def __init__(
+        self,
+        result: ConversationTurnResult | None = None,
+        *,
+        error: Exception | None = None,
+        delay: float = 0,
+        closing: ClosingDecision | Exception | None = None,
+    ):
         self._result = result
         self._error = error
         self._delay = delay
+        self._closing = closing or ClosingDecision(reasoning="still talking", conversation_finished=False)
         self.calls = 0
+        self.closing_calls = 0
         self.seen_messages: list[list[dict]] = []
 
-    async def generate_structured(self, **kwargs):
-        raise NotImplementedError
+    async def generate_structured(self, *, response_schema, **kwargs):
+        assert response_schema is ClosingDecision
+        self.closing_calls += 1
+        if isinstance(self._closing, Exception):
+            raise self._closing
+        return self._closing
 
     async def run_agentic_turn(self, *, messages, **kwargs):
         self.calls += 1
@@ -83,8 +97,12 @@ class FakeMetaClient:
     def __init__(self, fail_times: int = 0, *, permanent: bool = False):
         self.sent: list[dict] = []
         self.sent_images: list[str] = []
+        self.reactions: list[tuple[str, str]] = []
         self._fail_times = fail_times
         self._permanent = permanent
+
+    async def send_reaction(self, *, access_token, recipient_id, message_id, emoji):
+        self.reactions.append((message_id, emoji))
 
     def _maybe_fail(self):
         if self._fail_times:
@@ -795,3 +813,89 @@ def test_parse_webhook_body_normalizes_messages_echoes_and_skips_noise() -> None
         ("message", "m4", "biz", "cust"),
     ]
     assert events[2]["needs_transcription"] is True and events[2]["text"] == "[Ovozli xabar]"
+
+
+def test_media_messages_are_stored_without_labels() -> None:
+    """The dashboard shows the media itself; the model gets a note. A label as
+    the text ("[Template yuborildi]") only ever got quoted back to customers."""
+    body = {
+        "entry": [{"messaging": [
+            {"sender": {"id": "cust"}, "recipient": {"id": "biz"}, "message": {
+                "mid": "p1", "attachments": [{"type": "image", "payload": {"url": "https://cdn/p.jpg"}}]}},
+            {"sender": {"id": "cust"}, "recipient": {"id": "biz"}, "message": {
+                "mid": "p2", "attachments": [{"type": "ig_reel", "payload": {
+                    "url": "https://cdn/r.mp4", "title": "  Nike Tech Fleece\n yangi kolleksiya "}}]}},
+            {"sender": {"id": "cust"}, "recipient": {"id": "biz"}, "message": {
+                "mid": "p3", "attachments": [{"type": "template", "payload": {}}]}},
+            {"sender": {"id": "biz"}, "recipient": {"id": "cust"}, "message": {
+                "mid": "p4", "is_echo": True, "attachments": [{"type": "image", "payload": {"url": "https://cdn/e.jpg"}}]}},
+        ]}]
+    }
+    events = {e["mid"]: e for e in pipeline.parse_webhook_body(body)}
+    assert events["p1"]["text"] == "" and events["p1"]["attachment_type"] == "image"
+    assert events["p2"]["text"] == "Nike Tech Fleece yangi kolleksiya"  # the caption, and only that
+    assert events["p3"]["text"] == "" and events["p3"]["attachment_type"] == "template"
+    assert events["p4"]["kind"] == "echo" and events["p4"]["text"] == ""
+
+
+# --- closing the conversation ------------------------------------------------------------
+
+
+async def test_closing_message_gets_a_reaction_not_a_reply(db_session, alerts) -> None:
+    """"Hop" after the goodbye: the model decides the conversation is over and
+    picks a reaction; no new message goes out."""
+    business, _ = await _seed(db_session)
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("Rahmat! Hamkasbim tez orada bog'lanadi.")), meta,
+                   "cl-1", "Nike Tech Fleece olaman", customer="c-close")
+
+    provider = FakeProvider(
+        _result("should not be sent"),
+        closing=ClosingDecision(reasoning="said ok after the goodbye", conversation_finished=True, reaction="🔥"),
+    )
+    await _deliver(db_session, provider, meta, "cl-2", "hop", customer="c-close")
+
+    assert provider.closing_calls == 1 and provider.calls == 0
+    assert meta.reactions == [("cl-2", "🔥")]
+    assert [s["text"] for s in meta.sent] == ["Rahmat! Hamkasbim tez orada bog'lanadi."]
+    assert (await _event_row(db_session, "cl-2")).status == "processed"
+    conversation = await db_session.scalar(
+        select(Conversation).where(Conversation.business_id == business.id).execution_options(populate_existing=True)
+    )
+    last = (await _messages(db_session, business.id, "c-close"))[-1]
+    assert conversation.last_answered_customer_message_at == last.created_at
+
+
+async def test_short_answer_the_model_says_needs_a_reply_is_answered(db_session, alerts) -> None:
+    await _seed(db_session)
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("Qora rangdami yoki kulrangdami?")), meta,
+                   "q-1", "Tech Fleece bormi", customer="c-q")
+
+    provider = FakeProvider(_result("Zo'r, qora bor."))  # the default decision: not finished
+    await _deliver(db_session, provider, meta, "q-2", "qora", customer="c-q")
+
+    assert provider.closing_calls == 1 and provider.calls == 1
+    assert meta.reactions == [] and meta.sent[-1]["text"] == "Zo'r, qora bor."
+
+
+async def test_closing_decision_failure_means_a_normal_reply(db_session, alerts) -> None:
+    await _seed(db_session)
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("Marhamat!")), meta, "f-1", "rahmat katta", customer="c-f")
+
+    provider = FakeProvider(_result("Arzimaydi!"), closing=LLMProviderError("down"))
+    await _deliver(db_session, provider, meta, "f-2", "ok", customer="c-f")
+
+    assert provider.calls == 1 and meta.sent[-1]["text"] == "Arzimaydi!"
+
+
+async def test_long_or_question_messages_never_ask_for_a_closing_decision(db_session, alerts) -> None:
+    await _seed(db_session)
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("Marhamat!")), meta, "n-1", "salom", customer="c-n")
+
+    provider = FakeProvider(_result("450 000 so'm."))
+    await _deliver(db_session, provider, meta, "n-2", "narxi qancha?", customer="c-n")
+
+    assert provider.closing_calls == 0 and provider.calls == 1

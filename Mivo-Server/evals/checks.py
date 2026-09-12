@@ -16,8 +16,10 @@ from typing import Any
 
 from app.ai.orchestrator import (
     _contains_unverified_discount_claim,
+    claims_to_see_media,
     detect_preferred_language,
     extract_discount_numbers,
+    strip_internal_markers,
 )
 from app.ai.provider.openrouter import _PLAN_LINE_RE, _WRITER_MESSAGE_MARKER
 
@@ -80,6 +82,8 @@ class CheckContext:
     executed_tools: list[dict] = field(default_factory=list)
     known_slots: dict[str, str] = field(default_factory=dict)
     expects_phone_ask: bool = False
+    #: The customer shared something the model can't see (a Reel with no caption).
+    unseen_media: bool = False
 
 
 def _normalize_numbers(text: str) -> str:
@@ -112,7 +116,16 @@ def check_no_internal_leakage(reply: str, ctx: CheckContext) -> list[Finding]:
     lowered = reply.lower()
     if "system prompt" in lowered or '{"' in reply:
         findings.append(Finding("internal_leakage", "error", "prompt or raw JSON reached the reply"))
+    if strip_internal_markers(reply) != reply:
+        findings.append(Finding("internal_leakage", "error", "a media label or system note reached the reply"))
     return findings
+
+
+def check_does_not_describe_unseen_media(reply: str, ctx: CheckContext) -> list[Finding]:
+    """A Reel or post it was never shown can't be described — only asked about."""
+    if ctx.unseen_media and claims_to_see_media(reply):
+        return [Finding("unseen_media", "error", "described a shared Reel/post the model couldn't see")]
+    return []
 
 
 def check_no_ai_boilerplate(reply: str, ctx: CheckContext) -> list[Finding]:
@@ -242,6 +255,7 @@ ALL_CHECKS = (
     check_does_not_reask_known_slots,
     check_asks_for_phone,
     check_shape,
+    check_does_not_describe_unseen_media,
 )
 
 

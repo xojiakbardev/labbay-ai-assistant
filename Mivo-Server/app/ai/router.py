@@ -10,9 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.ai import limits
+from app.ai.closing import decide_closing, may_be_closing, unanswered_burst, valid_reaction
 from app.ai.models import AiFeedback
 from app.ai.orchestrator import handle_customer_message
-from app.ai.provider.base import LLMProvider
+from app.ai.provider.base import LLMProvider, LLMProviderError
 from app.ai.provider.factory import get_llm_provider
 from app.ai.schemas import (
     FeedbackCreate,
@@ -26,7 +27,7 @@ from app.ai.schemas import (
 from app.businesses.models import Business
 from app.common.tenancy import get_current_business
 from app.conversations.models import Conversation, Message
-from app.conversations.service import get_recent_messages
+from app.conversations.service import add_message, get_recent_messages
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.customers.models import Customer
@@ -238,6 +239,43 @@ async def post_sandbox_message(
     if spent >= get_settings().ai_daily_cost_limit_usd:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Daily AI budget reached.")
     conversation.status = "active"
+
+    # The same closing rule as on Instagram (app/ai/closing.py): a message that
+    # just ends the conversation gets no reply, at most a reaction.
+    recent = await get_recent_messages(db, conversation.id, limit=12)
+    incoming = Message(
+        sender_type="customer", content=body.content, attachment_url=body.attachment_url,
+        attachment_type="image" if body.attachment_url else None,
+        message_type="image" if body.attachment_url else "text",
+    )
+    burst, last_outbound = unanswered_burst([*recent, incoming])
+    if may_be_closing(burst, last_outbound):
+        try:
+            decision = await decide_closing(provider, [*recent, incoming], business_id=business.id)
+        except LLMProviderError as exc:
+            logger.warning("Sandbox closing decision unavailable: %s", exc)
+            decision = None
+        if decision is not None and decision.conversation_finished:
+            await add_message(db, conversation, sender_type="customer", content=body.content)
+            messages_raw = await get_recent_messages(db, conversation.id, limit=50)
+            await db.commit()
+            return SandboxTurnResponse(
+                reply="",
+                lead_status=lead.status if lead else "cold",
+                lead_score=lead.score if lead else 0,
+                qualification_reason=(lead.qualification_reason or "") if lead else "",
+                phone_detected=lead.phone if lead else None,
+                known_facts=lead.known_facts if lead and lead.known_facts else [],
+                messages=[
+                    SandboxMessageOut(
+                        id=m.id, sender_type=m.sender_type, content=m.content,
+                        attachment_url=getattr(m, "attachment_url", None), created_at=m.created_at,
+                    )
+                    for m in messages_raw
+                ],
+                conversation_closed=True,
+                reaction=valid_reaction(decision.reaction),
+            )
 
     escalation_state: dict[str, Any] = {}
     turn_result = await handle_customer_message(

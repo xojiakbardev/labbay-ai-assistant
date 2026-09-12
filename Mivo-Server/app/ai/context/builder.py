@@ -92,7 +92,7 @@ Customer: "narxi qancha?"
 Customer: "qimmat ekan"
   Weak: "Tushunaman. Boshqa mahsulotlarni ko'rsataymi?"
   Good: "Tushunaman. Bu model original charm, shuning uchun narxi shunday — 2-3 yil kiyiladi. \
-Agar 500 000 atrofida qidirsangiz, Puma Rebound bor, u ham kundalikka juda yaxshi. Ko'rsataymi?"
+Arzonrog'i kerak bo'lsa, Puma Rebound bor, u ham kundalikka juda yaxshi. Ko'rsataymi?"
 
 Customer: "oq rangda 43 bormi?"  (tool result: product carries 41, 42, 44 in white)
   Weak: "Kechirasiz, 43 razmer mavjud emas."
@@ -103,6 +103,11 @@ Customer: "shunaqasi bormi" + rasm
   Weak: "Iltimos, qanday mahsulot kerakligini yozib yuboring."
   Good: "Rasmda qora oversize hoodie ko'rinyapti — bizda ancha o'xshashi bor: Nike Tech \
 Fleece, 450 000 so'm, M dan XL gacha. Rasmini tashlayapman, ko'ring."
+
+Customer: "qaysi razmer menga to'g'ri keladi? rasmimni tashlasam aytasizmi?"
+  Weak: "Rasm shart emas, odatda XL razmer ko'pchilikka tushadi."
+  Good: "Rasm shart emas — bo'yingiz va vazningizni yozing, shunga qarab aniq aytaman. Odatda \
+qaysi razmer kiyasiz?"
 
 Customer: "42 razmer olaman"
   Weak: "Yaxshi, buyurtmangiz qabul qilindi."
@@ -151,6 +156,16 @@ anything or promise a photo when has_photo is false.
 call search_products with those keywords to check whether this business carries it or something \
 close. If the image is unclear or unrelated to products, say so honestly and ask one short \
 question. Never claim to see details you aren't confident about.
+- Lines that start with "(Note:" are written by the system, not by the customer or by you. Use \
+what they tell you, but never quote them, mention them, or answer them as if the customer had \
+said them — and never write anything in that form yourself.
+- You cannot see videos, Reels, stories or posts the customer shares — at most you get their \
+caption, in a note. Never describe, guess or react to what they show, and never pretend you \
+watched them. If a caption names a product, search for it; otherwise say briefly that you can't \
+open it and ask which product caught their eye.
+- Size questions: ask their height and weight (and what size they usually wear) before \
+recommending one, then recommend only from the sizes a tool result shows in stock. Never guess a \
+size for them, and never say one size fits most people.
 - request_human is for when they explicitly ask for a person, or you genuinely cannot help after \
 really trying to search. Never on a greeting, small talk or a general question. Ask for their \
 number in the same reply.
@@ -223,6 +238,7 @@ never need to report them — and must never restate them from memory.
 
 
 import datetime as dt
+import re
 import uuid
 from typing import Any
 
@@ -402,29 +418,92 @@ def build_message_history(messages: list[Message]) -> list[dict[str, Any]]:
     result = []
     for idx, m in enumerate(messages):
         role = _SENDER_TO_ROLE.get(m.sender_type, "user")
-        has_image = (
-            (getattr(m, "attachment_type", None) == "image" or getattr(m, "message_type", None) == "image")
-            and bool(getattr(m, "attachment_url", None))
-        )
-
-        if idx in attach_full and has_image and role == "user":
-            text_val = (m.content or "").strip()
-            if not text_val or text_val.startswith("[image:") or text_val == "[Mijoz rasm yubordi]":
-                text_val = "Mijoz rasm yubordi."
+        if idx in attach_full and role == "user":
+            _label, text = _split_label(m.content)
             content: Any = [
-                {"type": "text", "text": text_val},
+                {"type": "text", "text": text or f"{MEDIA_NOTE_PREFIX}the customer sent this photo.)"},
                 {"type": "image_url", "image_url": {"url": m.attachment_url}},
             ]
         else:
-            if has_image:
-                if m.content and "[Mijoz rasm yubordi]" in m.content:
-                    content = m.content
-                elif m.content and m.content.strip() and not m.content.startswith("[image:"):
-                    content = f"[Mijoz rasm yubordi] {m.content.strip()}"
-                else:
-                    content = "[Mijoz rasm yubordi]"
-            else:
-                content = m.content
-
+            content = _text_for_model(m, role)
         result.append({"role": role, "content": content})
     return result
+
+
+# What a media message was, told to the model as a note. It used to read the
+# bracketed labels once stored as these messages' text ("[Template
+# yuborildi]") — and, imitating what it reads, quoted them back to customers
+# ("«Template yuborildi» deganingizni tushunmadim"). The system prompt tells it
+# what these notes are and never to repeat them.
+MEDIA_NOTE_PREFIX = "(Note: "
+SHARED_MEDIA_KINDS = {
+    "ig_reel": "Reel", "reel": "Reel", "share": "post", "ig_post": "post",
+    "story_mention": "story", "story": "story",
+}
+_LABEL_RE = re.compile(r"^\s*\[([^\]]{1,80})\]\s*")
+
+
+def _split_label(content: str | None) -> tuple[str | None, str]:
+    """("[Reels ulashildi] caption") -> ("Reels ulashildi", "caption")."""
+    match = _LABEL_RE.match(content or "")
+    if not match:
+        return None, (content or "").strip()
+    return match.group(1), (content or "")[match.end():].strip()
+
+
+def unseen_shared_media(m: Message) -> bool:
+    """A shared post/Reel/story or video that came with no caption and no
+    words — nothing in it the model can actually know about."""
+    kind = _media_kind(m)
+    return (kind in SHARED_MEDIA_KINDS or kind == "video") and not _split_label(m.content)[1]
+
+
+def _media_kind(m: Message) -> str | None:
+    kind = getattr(m, "attachment_type", None) or getattr(m, "message_type", None)
+    return None if kind in (None, "text") else kind
+
+
+def _text_for_model(m: Message, role: str) -> str:
+    kind = _media_kind(m)
+    if kind is None:
+        return m.content or ""
+    # Media messages are stored with no text of their own — just a caption or
+    # what was typed with them. (Older rows carry a bracketed label instead.)
+    label, text = _split_label(m.content)
+    if kind == "audio" and label is None and text:
+        return text  # the voice note's transcript
+
+    if role == "user":
+        if kind == "image":
+            note = "the customer sent a photo earlier that you can no longer see"
+            extra = f'; with it they wrote: "{text}"' if text else ""
+        elif kind in SHARED_MEDIA_KINDS:
+            note = (
+                f"the customer shared an Instagram {SHARED_MEDIA_KINDS[kind]}. You cannot see what it shows"
+            )
+            extra = (
+                f'; its caption says: "{text}"' if text else
+                ". Don't describe or guess its content — ask which product caught their eye"
+            )
+        elif kind == "video":
+            note = "the customer sent a video you cannot watch. Don't guess what it shows"
+            extra = f'; with it they wrote: "{text}"' if text else ""
+        elif kind == "audio":
+            note = "the customer sent a voice note that couldn't be transcribed"
+            extra = ""
+        else:
+            note = (
+                f"the customer sent an Instagram {kind} message whose content you cannot see. Don't "
+                "mention it and don't repeat what you already told them — if you have nothing new to "
+                "add, ask briefly how you can help"
+            )
+            extra = f'; with it they wrote: "{text}"' if text else ""
+    else:
+        if kind == "image":
+            shown = text.removeprefix("📷").strip() if text.startswith("📷") else ""
+            note = f"a photo of {shown} was sent to the customer" if shown else "a photo was sent to the customer"
+            extra = ""
+        else:
+            note = f"the shop sent the customer an Instagram {SHARED_MEDIA_KINDS.get(kind, kind)}"
+            extra = f'; with it: "{text}"' if text else ""
+    return f"{MEDIA_NOTE_PREFIX}{note}{extra}.)"

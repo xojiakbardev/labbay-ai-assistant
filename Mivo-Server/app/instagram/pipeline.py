@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai import limits
 from app.ai.audio import TranscriptionError, transcribe_audio_url
+from app.ai.closing import decide_closing, may_be_closing, unanswered_burst, valid_reaction
 from app.ai.orchestrator import (
     _ESCALATION_CLOSING,
     _PHONE_CAPTURED_CONFIRMATION,
@@ -98,13 +99,13 @@ _HANDOFF_STATUSES = ("human_needed", "human_active")
 _AUDIO_PLACEHOLDER = AUDIO_PLACEHOLDER
 _VOICE_NOTE_MAX_AGE = dt.timedelta(hours=1)
 _AUDIO_UNREADABLE = "[Ovozli xabar — matnga o'girib bo'lmadi]"
-_PLACEHOLDERS = {
-    "image": "[Mijoz rasm yubordi]",
-    "video": "[Video yuborildi]",
-    "share": "[Reels / Story ulashildi]",
-    "ig_reel": "[Reels / Story ulashildi]",
-    "story_mention": "[Reels / Story ulashildi]",
-}
+# A message with media but no text is stored with no text: the dashboard shows
+# the media itself (or, for a type it can't show, its own localized chip), and
+# the model is told what it was (app/ai/context/builder.py). Shared posts and
+# Reels carry their caption as the payload's "title" — the only part of them
+# anyone can read without opening them — and that's kept as the text.
+_CAPTIONED = ("share", "ig_post", "ig_reel", "reel")
+_MAX_CAPTION = 500
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +131,10 @@ def parse_webhook_body(body: dict) -> list[dict[str, Any]]:
             if not mid or not sender or not recipient:
                 continue
 
+            is_echo = bool(message.get("is_echo"))
             text = (message.get("text") or "").strip()
             attachment_type = attachment_url = None
+            caption = ""
             attachments = [a for a in (message.get("attachments") or []) if isinstance(a, dict)]
             # A voice note or photo is the part worth acting on; otherwise
             # the first attachment of whatever kind.
@@ -142,17 +145,18 @@ def parse_webhook_body(body: dict) -> list[dict[str, Any]]:
                 attachment_type = str(chosen.get("type") or "media")[:20]
                 payload = chosen.get("payload") if isinstance(chosen.get("payload"), dict) else {}
                 attachment_url = payload.get("url")
+                if attachment_type in _CAPTIONED:
+                    caption = " ".join(str(payload.get("title") or "").split())[:_MAX_CAPTION]
 
             needs_transcription = attachment_type == "audio" and bool(attachment_url) and not text
             if not text:
                 if attachment_type == "audio":
-                    text = _AUDIO_PLACEHOLDER
-                elif attachment_type:
-                    text = _PLACEHOLDERS.get(attachment_type, f"[{attachment_type.capitalize()} yuborildi]")
-            if not text and not attachment_url:
+                    text = _AUDIO_PLACEHOLDER  # replaced by the transcript
+                else:
+                    text = caption
+            if not text and not attachment_type:
                 continue
 
-            is_echo = bool(message.get("is_echo"))
             events.append(
                 {
                     "kind": "echo" if is_echo else "message",
@@ -535,7 +539,43 @@ async def _process_customer_message(
             )
             return
 
+        if await _closes_the_conversation(db, ctx, resolved):
+            return
         await _run_ai_turn(db, ctx, resolved)
+
+
+async def _closes_the_conversation(db: AsyncSession, ctx: _Context, provider: LLMProvider) -> bool:
+    """The customer's burst just ends the conversation ("hop", 👍 after the
+    goodbye): no reply — at most a reaction on their message, as the model
+    decides (app/ai/closing.py). Returns whether that's what happened."""
+    recent = await get_recent_messages(db, ctx.conversation_id, limit=12)
+    burst, last_outbound = unanswered_burst(recent)
+    if not may_be_closing(burst, last_outbound):
+        return False
+    try:
+        decision = await decide_closing(provider, recent, business_id=ctx.business_id)
+    except LLMProviderError as exc:
+        # Can't tell whether it's over, so it's treated as not over: the
+        # customer gets a normal reply.
+        logger.warning("[pipeline] closing decision unavailable for conversation %s: %s", ctx.conversation_id, exc)
+        return False
+    if not decision.conversation_finished:
+        return False
+
+    ctx.conversation.last_answered_customer_message_at = ctx.message.created_at
+    await db.commit()
+    emoji = valid_reaction(decision.reaction)
+    if emoji and ctx.message.external_message_id:
+        try:
+            await ctx.meta_client.send_reaction(
+                access_token=ctx.access_token, recipient_id=ctx.recipient_id,
+                message_id=ctx.message.external_message_id, emoji=emoji,
+            )
+        except MetaAPIError as exc:
+            # Only a courtesy: the conversation is closed either way.
+            logger.warning("[pipeline] reaction not sent in conversation %s: %s", ctx.conversation_id, exc)
+    logger.info("[pipeline] conversation %s closed by the customer; reaction %s", ctx.conversation_id, emoji)
+    return True
 
 
 async def _resend_undelivered(db: AsyncSession, ctx: _Context) -> None:

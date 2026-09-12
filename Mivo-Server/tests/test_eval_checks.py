@@ -216,8 +216,10 @@ def test_scenarios_are_well_formed() -> None:
         assert scenario.turns, f"{scenario.key} has no turns"
         assert scenario.products, f"{scenario.key} seeds no catalog"
         for turn in scenario.turns:
-            assert turn.customer.strip(), f"{scenario.key} has an empty customer message"
+            # A media message with no caption is stored with no text at all.
+            assert turn.customer.strip() or turn.attachment_type, f"{scenario.key} has an empty customer message"
 
     # The regressions each phase fixed all have a scenario guarding them.
     assert {"vague_opener", "price_then_objection", "slot_memory", "closing_to_phone"} <= set(keys)
+    assert {"shared_reel_no_caption", "template_message", "size_advice"} <= set(keys)
     assert by_key("russian_customer").turns[0].customer.startswith("здравствуйте")

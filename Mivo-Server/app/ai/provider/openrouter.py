@@ -22,6 +22,7 @@ from app.ai.provider.base import (
     ToolDefinition,
     ToolExecutor,
 )
+from app.ai.context.builder import MEDIA_NOTE_PREFIX
 from app.core.config import get_settings
 
 logger = logging.getLogger("app.ai.provider.openrouter")
@@ -225,6 +226,7 @@ _NO_GROUNDING_NEEDED = {
 }
 
 _PHONE_ONLY_RE = re.compile(r"^[\d\s\-+()./]{7,25}$")
+_NOTE_QUOTE_RE = re.compile(r'(?:says|wrote|with it): "(.+)"')
 
 # --- Writer pass -----------------------------------------------------------
 #
@@ -318,6 +320,13 @@ def _message_needs_grounding(m: dict[str, Any]) -> bool:
     text = str(content_val or "").strip().lower()
     if not text:
         return True
+    if text.startswith(MEDIA_NOTE_PREFIX.lower()):
+        # Something the model can't see (a shared Reel, a template...). Only
+        # its caption, or what the customer wrote with it, can be searched
+        # for; without one, a forced search is what made the model "find" a
+        # product in a video it never saw.
+        quoted = _NOTE_QUOTE_RE.search(text)
+        return bool(quoted) and _message_needs_grounding({"content": quoted.group(1)})
     if any(hint in text for hint in _PRODUCT_HINTS):
         return True
     # A bare phone number is the customer answering "leave your number".

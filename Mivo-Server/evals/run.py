@@ -17,10 +17,12 @@ import datetime as dt
 import json
 import sys
 import uuid
+from types import SimpleNamespace
 
 from sqlalchemy import delete, func, select
 
 import app.core.models_registry  # noqa: F401  (populate Base.metadata)
+from app.ai.context.builder import unseen_shared_media
 from app.ai.orchestrator import handle_customer_message
 from app.ai.provider.factory import get_llm_provider
 from app.auth.models import User
@@ -28,7 +30,7 @@ from app.businesses.models import Business
 from app.conversations.models import Conversation, Message
 from app.conversations.service import get_or_create_conversation
 from app.core.db import async_session_factory
-from app.customers.models import Customer
+from app.customers.service import get_or_create_customer
 from app.leads.models import Lead
 from app.products.models import Product, ProductVariant
 from app.products.search_normalize import normalize_for_search
@@ -102,9 +104,7 @@ async def _cleanup(db, business: Business) -> None:
 
 async def run_scenario(db, provider, scenario: Scenario, *, use_judge: bool) -> dict:
     business, catalog_prices = await _seed_business(db, scenario)
-    customer = Customer(business_id=business.id, ig_scoped_id=f"eval-{uuid.uuid4()}")
-    db.add(customer)
-    await db.flush()
+    customer = await get_or_create_customer(db, business.id, f"eval-{uuid.uuid4()}")
     conversation = await get_or_create_conversation(db, business.id, customer.id)
     await db.commit()
 
@@ -117,6 +117,7 @@ async def run_scenario(db, provider, scenario: Scenario, *, use_judge: bool) -> 
             result = await handle_customer_message(
                 db, provider, business, conversation, turn.customer,
                 apply_lead_qualification=True, escalation_state_out=tool_state,
+                attachment_type=turn.attachment_type,
             )
             await db.commit()
             await db.refresh(conversation)
@@ -130,6 +131,9 @@ async def run_scenario(db, provider, scenario: Scenario, *, use_judge: bool) -> 
                 executed_tools=tool_state.get("executed_tools", []),
                 known_slots=(conversation.working_state or {}).get("slots", {}),
                 expects_phone_ask=turn.expects_phone_ask,
+                unseen_media=unseen_shared_media(SimpleNamespace(
+                    attachment_type=turn.attachment_type, message_type=None, content=turn.customer,
+                )),
             )
             findings = run_checks(reply, ctx)
 
@@ -143,14 +147,20 @@ async def run_scenario(db, provider, scenario: Scenario, *, use_judge: bool) -> 
             if turn.expects_question and "?" not in reply:
                 findings.append(_missing("expected a question, got none"))
 
+            # The judge reads a transcript: a media message has to say what it
+            # was, or a sensible reply to it reads as a reply to nothing.
+            shown = turn.customer
+            if turn.attachment_type:
+                shown = f"[sent an Instagram {turn.attachment_type} the assistant can't see] {turn.customer}".strip()
+
             judgement = None
             if use_judge:
                 judgement = await judge_turn(
-                    provider, history=history, customer_message=turn.customer,
+                    provider, history=history, customer_message=shown,
                     reply=reply, focus=turn.focus, business_id=business.id,
                 )
 
-            history.append(("customer", turn.customer))
+            history.append(("customer", shown))
             history.append(("assistant", reply))
 
             turn_results.append({

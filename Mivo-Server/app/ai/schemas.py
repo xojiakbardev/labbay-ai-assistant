@@ -74,6 +74,10 @@ class SandboxTurnResponse(BaseModel):
     executed_tools: list[dict] = []
     telegram_sent: bool = False
     messages: list[SandboxMessageOut] = []
+    # The customer's message just ended the conversation (app/ai/closing.py):
+    # no reply, at most a reaction on their message.
+    conversation_closed: bool = False
+    reaction: str | None = None
 
 
 class SandboxStateResponse(BaseModel):
