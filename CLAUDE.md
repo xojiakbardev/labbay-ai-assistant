@@ -146,8 +146,9 @@ rejected), then `app/instagram/pipeline.py` does the rest in two halves:
   2. `mark_seen`, then debounce (`_debounce_seconds`: Instagram doesn't say when
      someone is typing, so a fragment — "salom", a photo or share on its own —
      waits `FRAGMENT_DEBOUNCE_SECONDS`, a complete question `DEBOUNCE_SECONDS`,
-     never past `DEBOUNCE_MAX_SECONDS` from the burst's first message; in prod data
-     bursts were ~5–20 s apart). Bail if a newer customer message exists; commit
+     never past `DEBOUNCE_MAX_SECONDS` from the burst's first message). Kept short
+     (1.5 / 3 / 4 s) on purpose: customers shouldn't wait, and a message sent while
+     the reply is being written is caught by step 6. Bail if a newer customer message exists; commit
      (a waiter holds one pooled connection, not two). Sender actions go out in the
      background and never fail the turn; tests turn them and the waits off.
   3. **`conversation_lock`** (`app/conversations/locks.py`, a Postgres advisory

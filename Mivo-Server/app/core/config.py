@@ -167,9 +167,11 @@ class Settings(BaseSettings):
     # first message. A reply written while they wrote again is dropped and
     # rewritten for the whole burst, unless the burst is older than the
     # supersede age.
-    reply_debounce_seconds: NonNegativeFloat = 3.0
-    reply_fragment_debounce_seconds: NonNegativeFloat = 8.0
-    reply_debounce_max_seconds: NonNegativeFloat = 15.0
+    # Kept short on purpose: a message sent while the reply is being written
+    # (~4 s) is caught by the supersede check anyway.
+    reply_debounce_seconds: NonNegativeFloat = 1.5
+    reply_fragment_debounce_seconds: NonNegativeFloat = 3.0
+    reply_debounce_max_seconds: NonNegativeFloat = 4.0
     reply_fragment_max_words: PositiveInt = 3
     reply_supersede_max_age_seconds: NonNegativeFloat = 45.0
     reply_part_delay_seconds: NonNegativeFloat = 0.9

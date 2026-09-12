@@ -569,30 +569,31 @@ async def test_an_old_burst_gets_its_reply_even_if_the_customer_wrote_again(db_s
 @pytest.mark.parametrize(
     ("content", "attachment", "expected"),
     [
-        ("Salom", None, 8.0),
-        ("42 razmer", None, 8.0),
-        ("Narxi qancha?", None, 3.0),
-        ("Menga qora rangli krossovka kerak edi", None, 3.0),
-        ("", "image", 8.0),
-        ("Yangi kolleksiya", "ig_reel", 8.0),
-        ("[Ovozli xabar]", "audio", 3.0),
+        ("Salom", None, 3.0),
+        ("42 razmer", None, 3.0),
+        ("Narxi qancha?", None, 1.5),
+        ("Menga qora rangli krossovka kerak edi", None, 1.5),
+        ("", "image", 3.0),
+        ("Yangi kolleksiya", "ig_reel", 3.0),
+        ("[Ovozli xabar]", "audio", 1.5),
     ],
 )
 def test_fragments_wait_longer_than_questions(monkeypatch, content, attachment, expected) -> None:
-    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 3.0)
-    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 8.0)
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 1.5)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 3.0)
+    monkeypatch.setattr(pipeline, "DEBOUNCE_MAX_SECONDS", 4.0)
     now = dt.datetime.now(dt.timezone.utc)
     message = Message(content=content, attachment_type=attachment, sender_type="customer")
     assert pipeline._debounce_seconds(message, now, now) == expected
 
 
 def test_the_wait_never_runs_past_the_cap_from_the_first_message(monkeypatch) -> None:
-    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 8.0)
-    monkeypatch.setattr(pipeline, "DEBOUNCE_MAX_SECONDS", 15.0)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 3.0)
+    monkeypatch.setattr(pipeline, "DEBOUNCE_MAX_SECONDS", 4.0)
     now = dt.datetime.now(dt.timezone.utc)
     message = Message(content="aka", sender_type="customer")
-    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=12), now) == pytest.approx(3.0)
-    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=40), now) == 0.0
+    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=3), now) == pytest.approx(1.0)
+    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=10), now) == 0.0
 
 
 async def test_seen_then_typing_while_the_ai_answers(db_session, alerts, monkeypatch) -> None:
