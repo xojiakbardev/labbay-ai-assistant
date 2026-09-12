@@ -4,6 +4,7 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.conversations.models import Conversation, Message
@@ -19,22 +20,27 @@ HISTORY_LIMIT = 20
 async def get_or_create_conversation(
     db: AsyncSession, business_id: uuid.UUID, customer_id: uuid.UUID
 ) -> Conversation:
-    conversation = await db.scalar(
-        select(Conversation).where(
-            Conversation.business_id == business_id, Conversation.customer_id == customer_id
-        )
-    )
-    if conversation is None:
-        conversation = Conversation(
+    """Atomic: the unique (business_id, customer_id) constraint plus ON
+    CONFLICT DO NOTHING means concurrent first messages share one
+    conversation instead of splitting the thread across two rows."""
+    await db.execute(
+        insert(Conversation)
+        .values(
+            id=uuid.uuid4(),
             business_id=business_id,
             customer_id=customer_id,
             channel="instagram",
             status="ai_active",
+            working_state={},
             created_at=dt.datetime.now(dt.timezone.utc),
         )
-        db.add(conversation)
-        await db.flush()
-    return conversation
+        .on_conflict_do_nothing(constraint="uq_conversations_business_id_customer_id")
+    )
+    return await db.scalar(
+        select(Conversation).where(
+            Conversation.business_id == business_id, Conversation.customer_id == customer_id
+        )
+    )
 
 
 async def add_message(
@@ -47,20 +53,14 @@ async def add_message(
     flagged_for_review: bool = False,
     attachment_url: str | None = None,
     attachment_type: str | None = None,
+    delivery_status: str | None = None,
 ) -> Message:
-    if external_message_id is not None:
-        # Idempotent on retry: if a Meta webhook redelivery reaches this point
-        # after a prior attempt already persisted the message (but crashed
-        # before completing), don't violate the unique constraint or double-add
-        # it — just return what's already there (plan §11 webhook reliability).
-        existing = await db.scalar(
-            select(Message).where(Message.external_message_id == external_message_id)
-        )
-        if existing is not None:
-            return existing
-
+    """Idempotent on external_message_id: a Meta redelivery of a message that
+    is already stored returns the stored row (INSERT ... ON CONFLICT, so two
+    concurrent deliveries can't both insert)."""
     now = dt.datetime.now(dt.timezone.utc)
-    message = Message(
+    values = dict(
+        id=uuid.uuid4(),
         conversation_id=conversation.id,
         sender_type=sender_type,
         content=content,
@@ -69,8 +69,24 @@ async def add_message(
         flagged_for_review=flagged_for_review,
         attachment_url=attachment_url,
         attachment_type=attachment_type,
+        delivery_status=delivery_status,
         created_at=now,
     )
+    if external_message_id is not None:
+        inserted_id = (
+            await db.execute(
+                insert(Message)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[Message.external_message_id])
+                .returning(Message.id)
+            )
+        ).scalar_one_or_none()
+        message = await db.scalar(select(Message).where(Message.external_message_id == external_message_id))
+        if inserted_id is not None:
+            conversation.last_message_at = now
+        return message
+
+    message = Message(**values)
     db.add(message)
     conversation.last_message_at = now
     await db.flush()

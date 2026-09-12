@@ -23,5 +23,8 @@ class Customer(Base, UUIDPk):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Last time the Instagram profile lookup ran, successful or not — a profile
+    # Meta won't return is not re-requested on every message/page load.
+    profile_fetched_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)

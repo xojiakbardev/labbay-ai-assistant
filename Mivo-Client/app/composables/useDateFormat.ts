@@ -39,7 +39,8 @@ export function formatShortDay(iso: string, locale: Locale): string {
 /** "YYYY-MM" period -> "Avgust '26" / "Август '26" / "Aug '26" */
 export function formatShortMonth(period: string, locale: Locale): string {
   const [y, m] = period.split("-").map(Number);
-  const month = MONTHS_SHORT[locale][m - 1];
+  const month = m ? MONTHS_SHORT[locale][m - 1] : undefined;
+  if (!month) return period;
   const label = month.charAt(0).toUpperCase() + month.slice(1);
   return `${label} '${String(y).slice(2)}`;
 }

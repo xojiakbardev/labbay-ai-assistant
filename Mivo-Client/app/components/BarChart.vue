@@ -39,6 +39,7 @@ const bars = computed(() =>
 );
 
 const hoverIndex = ref<number | null>(null);
+const hovered = computed(() => (hoverIndex.value === null ? null : bars.value[hoverIndex.value] ?? null));
 </script>
 
 <template>
@@ -58,16 +59,16 @@ const hoverIndex = ref<number | null>(null);
     </svg>
 
     <div
-      v-if="hoverIndex !== null"
+      v-if="hovered"
       class="pointer-events-none absolute -translate-x-1/2 -translate-y-full rounded-md border border-border bg-card px-2.5 py-1.5 text-xs shadow-md whitespace-nowrap"
       :style="{
-        left: `${((bars[hoverIndex].x + barWidth / 2) / width) * 100}%`,
-        top: `${(bars[hoverIndex].y / height) * 100}%`,
+        left: `${((hovered.x + barWidth / 2) / width) * 100}%`,
+        top: `${(hovered.y / height) * 100}%`,
         marginTop: '-8px',
       }"
     >
-      <div class="font-semibold text-foreground">{{ valueFormatter(bars[hoverIndex].value) }}</div>
-      <div class="text-muted-foreground">{{ bars[hoverIndex].label }}</div>
+      <div class="font-semibold text-foreground">{{ valueFormatter(hovered.value) }}</div>
+      <div class="text-muted-foreground">{{ hovered.label }}</div>
     </div>
   </div>
 </template>

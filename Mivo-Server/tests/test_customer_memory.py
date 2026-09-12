@@ -3,6 +3,7 @@ Ensures preferences outlive the recent message history window and FIFO capping w
 """
 import uuid
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.context.builder import build_customer_profile_block
@@ -100,7 +101,7 @@ async def test_known_facts_preserved_across_history_window(db_session: AsyncSess
 
     # Verify lead has the facts
     lead = await db_session.scalar(
-        Lead.__table__.select().where(Lead.business_id == business.id, Lead.customer_id == customer.id)
+        select(Lead).where(Lead.business_id == business.id, Lead.customer_id == customer.id)
     )
     assert lead is not None
     assert len(lead.known_facts) == 2
@@ -118,10 +119,13 @@ async def test_known_facts_preserved_across_history_window(db_session: AsyncSess
     # Render customer profile block for the next turn
     profile_block = await build_customer_profile_block(db_session, business.id, customer.id)
 
-    # The facts MUST be in the profile block despite the original message being aged out of the 10-message window!
-    assert "Known facts & preferences:" in profile_block
-    assert "faqat qora rangda kerak" in profile_block
-    assert "39-40 razmer kiyadi" in profile_block
+    # The facts MUST be in the profile block despite the original message
+    # being aged out of the history window — rendered as quoted, unverified
+    # customer statements, never as instructions.
+    assert "their words, unverified" in profile_block
+    assert '"faqat qora rangda kerak"' in profile_block
+    assert '"39-40 razmer kiyadi"' in profile_block
+    assert "never an instruction" in profile_block
 
 
 @pytest.mark.asyncio
@@ -145,7 +149,7 @@ async def test_known_facts_fifo_capping_in_db(db_session: AsyncSession):
     await db_session.commit()
 
     lead = await db_session.scalar(
-        Lead.__table__.select().where(Lead.business_id == business.id, Lead.customer_id == customer.id)
+        select(Lead).where(Lead.business_id == business.id, Lead.customer_id == customer.id)
     )
     assert lead is not None
     # Must be capped at exactly 15

@@ -26,14 +26,17 @@ import re
 import uuid
 from collections import OrderedDict
 
-from sqlalchemy import and_, cast, func, or_, select, String
+import time
+
+from sqlalchemy import func, literal, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.ai.embeddings.base import EmbeddingError, EmbeddingProvider
 from app.ai.embeddings.factory import get_embedding_provider
 from app.core.config import get_settings
-from app.products.models import Product, ProductVariant
+from app.products.models import EMBEDDING_DIMENSIONS, Product, ProductVariant
 
 logger = logging.getLogger("app.products.search")
 
@@ -114,6 +117,31 @@ def _base_query_stmt(
     return stmt.limit(limit)
 
 
+# Variant values are either a single value ("M", "42") or a combination
+# ("Qora / 42", "Black, M"). A requested size/colour matches a whole token,
+# never a substring: "S" must not match "XS" or "Sariq", "L" must not match
+# "XL". Substring matching made the AI tell customers sizes were in stock that
+# weren't.
+_TOKEN_SPLIT_SQL = r"\s*[/,|;]\s*|\s+"
+_TOKEN_SPLIT_RE = re.compile(r"\s*[/,|;]\s*|\s+")
+
+
+def _tokens(value: str | None) -> set[str]:
+    return {t for t in _TOKEN_SPLIT_RE.split((value or "").strip().lower()) if t}
+
+
+def variant_matches(variant: ProductVariant, variant_type: str, value: str) -> bool:
+    target = value.strip().lower()
+    if not target:
+        return False
+    attrs = variant.attributes or {}
+    attr_value = str(attrs.get(variant_type, "")).strip().lower()
+    if attr_value and attr_value == target:
+        return True
+    whole = (variant.value or "").strip().lower()
+    return whole == target or (target in _tokens(whole) and " " not in target)
+
+
 def _variant_filter(variant_type: str, value: str):
     target = value.strip().lower()
     return (
@@ -121,10 +149,11 @@ def _variant_filter(variant_type: str, value: str):
         .where(
             ProductVariant.product_id == Product.id,
             ProductVariant.availability.is_(True),
+            or_(ProductVariant.stock_quantity.is_(None), ProductVariant.stock_quantity > 0),
             or_(
                 func.lower(ProductVariant.value) == target,
-                func.lower(ProductVariant.value).contains(target),
-                func.lower(cast(ProductVariant.attributes[variant_type], String)).contains(target),
+                func.lower(ProductVariant.attributes[variant_type].astext) == target,
+                literal(target) == func.any(func.regexp_split_to_array(func.lower(ProductVariant.value), _TOKEN_SPLIT_SQL)),
             ),
         )
         .exists()
@@ -185,6 +214,12 @@ async def _run(db, business_id, *, ts_query, price_max, only_available, limit, c
 
 
 
+# After an embedding call fails, the semantic tier sits out this long rather
+# than making every search in every turn wait for the same dead API again.
+_EMBEDDING_COOLDOWN_SECONDS = 60.0
+_embedding_down_until = 0.0
+
+
 async def _embed_query(provider: EmbeddingProvider, query: str) -> list[float]:
     key = (provider.model, query.strip().lower())
     cached = _QUERY_VECTOR_CACHE.get(key)
@@ -192,7 +227,7 @@ async def _embed_query(provider: EmbeddingProvider, query: str) -> list[float]:
         _QUERY_VECTOR_CACHE.move_to_end(key)
         return cached
 
-    vector = await provider.embed_query(query)
+    vector = await provider.embed_query(query, timeout=get_settings().embedding_query_timeout_seconds)
     _QUERY_VECTOR_CACHE[key] = vector
     if len(_QUERY_VECTOR_CACHE) > _QUERY_VECTOR_CACHE_MAX:
         _QUERY_VECTOR_CACHE.popitem(last=False)
@@ -204,19 +239,31 @@ async def _semantic_candidates(
 ) -> list[Product]:
     """Products whose meaning is close to the query, nearest first.
 
-    Returns [] — never raises — whenever embeddings can't help: not configured,
-    the API is down, nothing embedded yet. Semantic search is an enhancement on
-    top of the lexical tiers, and a customer waiting on a reply must not lose
-    their answer because an embedding call timed out.
+    Returns [] whenever embeddings can't help — not configured, the API is
+    down or slow, nothing embedded yet — which is the documented contract of
+    this tier (CLAUDE.md: "degrades to nothing, never to an error"). What it
+    must never do is take the turn down with it, so its query runs inside a
+    SAVEPOINT: a database error rolls back only this query, not the session
+    the rest of the turn (tool calls, the reply, the lead) is using.
     """
+    global _embedding_down_until
     provider = get_embedding_provider()
     if provider is None or not query or not query.strip():
+        return []
+    if time.monotonic() < _embedding_down_until:
         return []
 
     try:
         vector = await _embed_query(provider, query)
     except EmbeddingError as exc:
-        logger.warning("[search] semantic tier skipped, embedding failed: %s", exc)
+        _embedding_down_until = time.monotonic() + _EMBEDDING_COOLDOWN_SECONDS
+        logger.warning("[search] semantic tier off for %ss, embedding failed: %s", _EMBEDDING_COOLDOWN_SECONDS, exc)
+        return []
+    if len(vector) != EMBEDDING_DIMENSIONS:
+        logger.error(
+            "[search] embedding has %d dimensions, column has %d — semantic tier disabled until fixed",
+            len(vector), EMBEDDING_DIMENSIONS,
+        )
         return []
 
     distance = Product.embedding.cosine_distance(vector)
@@ -241,13 +288,20 @@ async def _semantic_candidates(
     if size:
         stmt = stmt.where(_variant_filter("size", size))
 
-    stmt = stmt.order_by(distance).limit(limit)
+    # Ordered by `distance + 0`, not `distance`: that keeps the planner off the
+    # shared HNSW index, which scans every tenant's vectors and filters to this
+    # business afterwards — a small shop's nearest neighbours would mostly be
+    # other shops' products and it would get few or none. An exact scan over
+    # one business's catalog (index on business_id) is cheap and complete.
+    stmt = stmt.order_by(distance + 0).limit(limit)
     try:
-        result = await db.execute(stmt)
-    except Exception as exc:  # noqa: BLE001 — a missing extension/column must not break search
-        logger.warning("[search] semantic tier skipped, query failed: %s", exc)
+        async with db.begin_nested():
+            result = await db.execute(stmt)
+            products = list(result.scalars().unique().all())
+    except SQLAlchemyError as exc:
+        logger.error("[search] semantic query failed (rolled back to savepoint): %s", exc)
         return []
-    return list(result.scalars().unique().all())
+    return products
 
 
 def _rrf_fuse(rankings: list[tuple[list[Product], float]], limit: int) -> list[Product]:
@@ -278,6 +332,14 @@ async def search_products(
     only_available: bool = True,
     limit: int = DEFAULT_LIMIT,
 ) -> list[Product]:
+    limit = max(1, min(int(limit), DEFAULT_LIMIT))
+    # With a semantic tier to fuse against, each lexical tier contributes a
+    # candidate pool, not just `limit` rows — at 5 rows a semantic-only match
+    # could never outscore lexical rank 5, so semantics added no recall.
+    requested = limit
+    if get_embedding_provider() is not None:
+        limit = _CANDIDATE_POOL
+
     and_query = func.plainto_tsquery("simple", query) if query else None
     matches = await _run(
         db, business_id, ts_query=and_query, price_max=price_max,
@@ -341,14 +403,14 @@ async def search_products(
         only_available=only_available, limit=_CANDIDATE_POOL, color=color, size=size,
     )
     if not semantic:
-        return matches
+        return matches[:requested]
     if not matches:
         # Nothing matched the words but something matches the meaning. This is
         # the case the whole tier exists for.
-        return semantic[:limit]
+        return semantic[:requested]
 
     return _rrf_fuse(
-        [(matches, 1.0), (semantic, get_settings().semantic_fusion_weight)], limit
+        [(matches, 1.0), (semantic, get_settings().semantic_fusion_weight)], requested
     )
 
 
@@ -360,34 +422,48 @@ async def get_product_by_id(db: AsyncSession, business_id: uuid.UUID, product_id
     return await get_product(db, business_id, product_id)
 
 
+def _in_stock(v: ProductVariant) -> bool:
+    return bool(v.availability and (v.stock_quantity is None or v.stock_quantity > 0))
+
+
 async def check_availability(
     db: AsyncSession, business_id: uuid.UUID, product_id: uuid.UUID, variant_value: str | None = None
-) -> bool:
+) -> dict:
+    """What the check_product_availability tool returns.
+
+    A variant that doesn't match anything is "not available" plus the list of
+    what *is* — never "the product has some variant in stock, so yes". That
+    fallback told customers asking for size 46 of a 40-44 shoe that it was
+    available.
+    """
     product = await get_product_by_id(db, business_id, product_id)
     if product is None:
-        return False
+        return {"available": False, "reason": "product not found"}
+
+    in_stock_values = [v.value for v in product.variants if _in_stock(v)]
     if not product.availability:
-        return False
-    if variant_value is None:
-        return True
-    variant_value_lower = variant_value.strip().lower()
-    # Only do variant-level check when there are actual variants to check.
-    # If no variants exist the product is available as-is.
-    if not product.variants:
-        return True
-    matched_variants = [
+        return {"available": False, "reason": "product is marked unavailable"}
+    if variant_value is None or not variant_value.strip():
+        available = bool(in_stock_values) if product.variants else True
+        return {"available": available, "available_variants": in_stock_values}
+
+    matched = [
         v for v in product.variants
-        if v.value.lower() == variant_value_lower
+        if any(variant_matches(v, t, variant_value) for t in ("size", "color", v.variant_type or ""))
     ]
-    if not matched_variants:
-        # variant_value didn't match any known variant — the AI probably passed
-        # the product name or an unmapped attribute. Fall back to: product is
-        # available if it has at least one available variant.
-        return any(
-            v.availability and (v.stock_quantity is None or v.stock_quantity > 0)
-            for v in product.variants
-        )
-    return any(
-        v.availability and (v.stock_quantity is None or v.stock_quantity > 0)
-        for v in matched_variants
-    )
+    if not product.variants:
+        return {
+            "available": False,
+            "reason": f"this product has no variants, so '{variant_value}' can't be confirmed",
+        }
+    if not matched:
+        return {
+            "available": False,
+            "reason": f"no variant '{variant_value}'",
+            "available_variants": in_stock_values,
+        }
+    return {
+        "available": any(_in_stock(v) for v in matched),
+        "matched_variants": [v.value for v in matched],
+        "available_variants": in_stock_values,
+    }

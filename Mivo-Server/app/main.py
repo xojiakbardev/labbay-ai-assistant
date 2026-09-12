@@ -1,19 +1,22 @@
 """Mivo FastAPI application entrypoint."""
 import datetime as dt
+import logging
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from sqlalchemy import text
 
 from app.ai.router import router as ai_router
 from app.auth.router import router as auth_router
 from app.businesses.router import router as businesses_router
 from app.conversations.router import router as conversations_router
+from app.core.config import get_settings
+from app.core.db import async_session_factory, engine
 from app.customers.router import router as customers_router
-from app.core.db import async_session_factory
+from app.instagram import pipeline
 from app.instagram import service as instagram_service
 from app.instagram.client import MetaClient
 from app.instagram.router import router as instagram_router
@@ -23,34 +26,84 @@ from app.products.router import router as products_router
 from app.push.router import router as push_router
 from app.superadmin.router import router as superadmin_router
 from app.telegram.router import router as telegram_router
-from app.core.config import get_settings
 
 settings = get_settings()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs every request URL at INFO — and the Telegram bot token is part of
+# the URL path, Instagram token calls carry access_token/client_secret as query
+# parameters. Only warnings and errors from the HTTP client are logged.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+logger = logging.getLogger("app.main")
+
+# Distinct advisory-lock keys per scheduled job. A job body only runs in the
+# process that wins its lock, so running several API workers or replicas never
+# sends every follow-up (or refreshes every token) N times.
+_JOB_LOCKS = {
+    "refresh_instagram_tokens": 7_400_001,
+    "smart_follow_up": 7_400_002,
+    "webhook_sweep": 7_400_003,
+    "profile_backfill": 7_400_004,
+}
+
+
+async def _run_exclusively(job: str, body) -> None:
+    async with engine.connect() as raw:
+        conn = await raw.execution_options(isolation_level="AUTOCOMMIT")
+        got = (await conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _JOB_LOCKS[job]})).scalar()
+        if not got:
+            return
+        try:
+            await body()
+        except Exception:  # noqa: BLE001 — a failed run is logged; the next run retries
+            logger.exception("[scheduler] job %s failed", job)
+        finally:
+            await conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _JOB_LOCKS[job]})
 
 
 async def _refresh_instagram_tokens_job() -> None:
-    """Runs daily — see app/instagram/service.py:refresh_expiring_tokens for
-    why this means a business owner never has to manually reconnect
-    Instagram every 60 days."""
-    async with async_session_factory() as db:
-        try:
+    """Daily — see app/instagram/service.py:refresh_expiring_tokens for why
+    an owner never has to reconnect Instagram every 60 days."""
+
+    async def body() -> None:
+        async with async_session_factory() as db:
             count = await instagram_service.refresh_expiring_tokens(db, MetaClient())
             if count:
-                print(f"[scheduler] refreshed {count} Instagram access token(s)")
-        except Exception as exc:  # noqa: BLE001 — a bad sweep must not crash the process
-            print(f"[scheduler] Instagram token refresh sweep failed: {exc}")
+                logger.info("[scheduler] refreshed %d Instagram access token(s)", count)
+
+    await _run_exclusively("refresh_instagram_tokens", body)
 
 
 async def _smart_follow_up_job() -> None:
-    """Runs periodically to re-engage warm/hot leads who stopped responding."""
     from app.ai.follow_up import sweep_inactive_leads_follow_up
-    async with async_session_factory() as db:
-        try:
+
+    async def body() -> None:
+        async with async_session_factory() as db:
             count = await sweep_inactive_leads_follow_up(db, MetaClient())
             if count:
-                print(f"[scheduler] Sent {count} smart follow-up(s) to inactive leads")
-        except Exception as exc:
-            print(f"[scheduler] Smart follow-up sweep failed: {exc}")
+                logger.info("[scheduler] sent %d follow-up(s)", count)
+
+    await _run_exclusively("smart_follow_up", body)
+
+
+async def _profile_backfill_job() -> None:
+    async def body() -> None:
+        async with async_session_factory() as db:
+            await instagram_service.backfill_customer_profiles(db, MetaClient())
+
+    await _run_exclusively("profile_backfill", body)
+
+
+async def _webhook_sweep_job() -> None:
+    """Re-drives webhook events that failed or whose worker died mid-turn."""
+    from app.ai.provider.factory import get_llm_provider
+
+    async def body() -> None:
+        count = await pipeline.sweep_events(get_llm_provider, MetaClient())
+        if count:
+            logger.info("[scheduler] re-drove %d webhook event(s)", count)
+
+    await _run_exclusively("webhook_sweep", body)
 
 
 @asynccontextmanager
@@ -63,11 +116,10 @@ async def lifespan(_app: FastAPI):
         next_run_time=dt.datetime.now(),  # also sweep once on startup
         id="refresh_instagram_tokens",
     )
+    scheduler.add_job(_smart_follow_up_job, "interval", minutes=15, id="smart_follow_up_job")
+    scheduler.add_job(_profile_backfill_job, "interval", minutes=30, id="profile_backfill")
     scheduler.add_job(
-        _smart_follow_up_job,
-        "interval",
-        minutes=15,
-        id="smart_follow_up_job",
+        _webhook_sweep_job, "interval", seconds=30, next_run_time=dt.datetime.now(), id="webhook_sweep", max_instances=1
     )
     scheduler.start()
     try:
@@ -76,42 +128,46 @@ async def lifespan(_app: FastAPI):
         scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Mivo AI API", version="0.1.0", lifespan=lifespan, root_path=settings.root_path)
+_docs_enabled = not settings.is_production
+app = FastAPI(
+    title="Mivo AI API",
+    version="0.1.0",
+    lifespan=lifespan,
+    root_path=settings.root_path,
+    # The full API map (superadmin routes included) is not published in
+    # production.
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
 
+# Header auth (Bearer), not cookies — so credentials are off and only the
+# configured origins may call the API from a browser. The production SPA goes
+# through the same-origin Cloudflare proxy and needs no CORS at all.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_origins=settings.cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
-@app.exception_handler(StarletteHTTPException)
-async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    response = JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
-    origin = request.headers.get("origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
     return response
 
 
 @app.exception_handler(Exception)
-async def custom_general_exception_handler(request: Request, exc: Exception):
-    response = JSONResponse(
-        status_code=500,
-        content={"detail": str(exc)},
-    )
-    origin = request.headers.get("origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # The detail stays in the server log. Returning str(exc) sent SQL text and
+    # bound parameters (customer data included) to whoever made the request.
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 
 app.include_router(auth_router)

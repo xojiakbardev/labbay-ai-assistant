@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { Product } from "~/types/api";
-import { ApiError } from "~/composables/useApi";
+import { toast } from "vue-sonner";
+import type { Product, ProductInput } from "~/types/api";
 import {
   Plus,
   Pencil,
@@ -19,8 +19,11 @@ import {
   SlidersHorizontal,
   Check,
   ChevronLeft,
-  ChevronRight
-} from "lucide-vue-next";
+  ChevronRight,
+  ArrowLeft,
+  AlertCircle,
+  RefreshCw
+} from "@lucide/vue";
 import {
   Select,
   SelectContent,
@@ -66,10 +69,32 @@ const fileContent = ref("");
 const aiImporting = ref(false);
 const aiError = ref<string | null>(null);
 
+// Import is two steps: extract (or parse JSON) -> the owner reviews/edits
+// the rows -> only then confirm. Nothing is saved before the confirm.
+const MAX_IMPORT_TEXT = 50000;
+const importStep = ref<"input" | "review">("input");
+interface ReviewRow {
+  key: number;
+  // Everything the extraction produced (variants, attributes, images) is
+  // kept; the review edits name/price/currency on top.
+  source: ProductInput;
+  name: string;
+  price: string | number;
+  currency: string;
+}
+const reviewRows = ref<ReviewRow[]>([]);
+const confirmingImport = ref(false);
+
+const loadError = ref<string | null>(null);
+
 async function reload() {
   loading.value = true;
+  loadError.value = null;
   try {
     products.value = await api.listProducts();
+  } catch (err) {
+    console.error("Failed to load products", err);
+    loadError.value = err instanceof Error && err.message ? err.message : t("products.loadError");
   } finally {
     loading.value = false;
   }
@@ -85,7 +110,7 @@ onMounted(async () => {
 });
 
 function getProductCategory(p: Product): string {
-  return p.category || (p.attributes?.category as string) || "Boshqa";
+  return (p.attributes?.category as string) || "Boshqa";
 }
 
 // Category & Availability filters
@@ -133,7 +158,6 @@ const filteredProducts = computed(() => {
     list = list.filter(
       (p) =>
         p.name.toLowerCase().includes(q) ||
-        (p.category && p.category.toLowerCase().includes(q)) ||
         (p.description && p.description.toLowerCase().includes(q)) ||
         ((p.attributes?.category as string) && (p.attributes.category as string).toLowerCase().includes(q))
     );
@@ -177,7 +201,8 @@ watch([searchQuery, selectedCategory, selectedAvailability, pageSize], () => {
 });
 
 function getProductImage(p: Product): string | null {
-  if (p.images && p.images.length > 0) return p.images[0].url;
+  const first = p.images?.[0];
+  if (first) return first.url;
   if (p.attributes?.image_url) return p.attributes.image_url as string;
   return null;
 }
@@ -194,9 +219,10 @@ async function onToggleAvailability(p: Product) {
   try {
     const updated = await api.updateProduct(p.id, { availability: !p.availability });
     const idx = products.value.findIndex((x) => x.id === p.id);
-    if (idx !== -1) products.value[idx] = { ...products.value[idx], availability: updated.availability };
+    if (idx !== -1) products.value[idx] = { ...products.value[idx]!, availability: updated.availability };
   } catch (err) {
-    alert(t("products.toggleError"));
+    console.error("Failed to toggle availability", err);
+    toast.error(t("products.toggleError"));
   } finally {
     togglingId.value = null;
   }
@@ -206,10 +232,12 @@ async function onDelete(id: string) {
   if (!confirm(t("products.deleteConfirm"))) return;
   try {
     await api.deleteProduct(id);
-    await reload();
   } catch (err) {
-    alert(t("products.deleteError"));
+    console.error("Failed to delete product", err);
+    toast.error(t("products.deleteError"));
+    return;
   }
+  await reload();
 }
 
 function openAiImport() {
@@ -220,68 +248,136 @@ function openAiImport() {
   uploadedFile.value = null;
   fileContent.value = "";
   importTab.value = "text";
+  importStep.value = "input";
+  reviewRows.value = [];
   showAiImportModal.value = true;
 }
 
 function handleFileSelect(e: Event) {
   const target = e.target as HTMLInputElement;
-  if (!target.files || target.files.length === 0) return;
-  const file = target.files[0];
+  const file = target.files?.[0];
+  if (!file) return;
   uploadedFile.value = file;
+  fileContent.value = "";
+  aiError.value = null;
 
   const reader = new FileReader();
   reader.onload = (evt) => {
     fileContent.value = (evt.target?.result as string) || "";
   };
+  reader.onerror = () => {
+    aiError.value = t("products.fileReadError");
+  };
   reader.readAsText(file);
 }
 
+function parseJsonProducts(text: string): ProductInput[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(t("products.importJsonInvalid"));
+  }
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  if (!list.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
+    throw new Error(t("products.importJsonInvalid"));
+  }
+  return list as ProductInput[];
+}
+
+async function extractWithAi(text: string): Promise<ProductInput[]> {
+  if (text.length > MAX_IMPORT_TEXT) {
+    throw new Error(t("products.importTooLong", { max: MAX_IMPORT_TEXT }));
+  }
+  return (await api.previewImport(text)).products;
+}
+
+function toReviewRows(items: ProductInput[]): ReviewRow[] {
+  return items.map((item, idx) => ({
+    key: idx,
+    source: item,
+    name: typeof item.name === "string" ? item.name : "",
+    price: item.price === null || item.price === undefined ? "" : item.price,
+    currency: typeof item.currency === "string" && item.currency ? item.currency : "UZS",
+  }));
+}
+
+// Step 1: turn the input into rows to review. Nothing is written yet.
 async function onAiImportSubmit() {
   aiError.value = null;
   aiImporting.value = true;
 
   try {
+    let items: ProductInput[];
     if (importTab.value === "json") {
-      if (!jsonText.value.trim()) throw new Error("JSON kiritilmadi.");
-      let parsed: any;
-      try {
-        parsed = JSON.parse(jsonText.value);
-      } catch {
-        throw new Error("JSON formati noto'g'ri.");
-      }
-      const list = Array.isArray(parsed) ? parsed : [parsed];
-      await api.confirmImport(list);
+      if (!jsonText.value.trim()) throw new Error(t("products.importJsonEmpty"));
+      items = parseJsonProducts(jsonText.value);
     } else if (importTab.value === "file") {
-      if (!fileContent.value.trim()) throw new Error("Fayl tanlanmadi yoki bo'sh.");
-
-      if (uploadedFile.value?.name.endsWith(".json")) {
-        let parsed = JSON.parse(fileContent.value);
-        const list = Array.isArray(parsed) ? parsed : [parsed];
-        await api.confirmImport(list);
-      } else {
-        const previewRes = await api.previewImport(fileContent.value);
-        if (previewRes && previewRes.products && previewRes.products.length > 0) {
-          await api.confirmImport(previewRes.products);
-        } else {
-          throw new Error("Fayl ichidan mahsulotlar topilmadi.");
-        }
-      }
+      if (!fileContent.value.trim()) throw new Error(t("products.importFileEmpty"));
+      items = uploadedFile.value?.name.toLowerCase().endsWith(".json")
+        ? parseJsonProducts(fileContent.value)
+        : await extractWithAi(fileContent.value);
     } else {
-      if (!rawText.value.trim()) throw new Error("Matn kiritilmadi.");
-      const previewRes = await api.previewImport(rawText.value);
-      if (previewRes && previewRes.products && previewRes.products.length > 0) {
-        await api.confirmImport(previewRes.products);
-      } else {
-        throw new Error("Matn ichidan mahsulotlar topilmadi.");
-      }
+      if (!rawText.value.trim()) throw new Error(t("products.importTextEmpty"));
+      items = await extractWithAi(rawText.value);
     }
 
-    showAiImportModal.value = false;
-    await reload();
+    if (items.length === 0) throw new Error(t("products.importNothingFound"));
+    reviewRows.value = toReviewRows(items);
+    importStep.value = "review";
   } catch (err) {
-    aiError.value = err instanceof ApiError ? err.message : (err as Error).message || t("products.importError");
+    aiError.value = err instanceof Error && err.message ? err.message : t("products.importError");
   } finally {
     aiImporting.value = false;
+  }
+}
+
+function variantCount(row: ReviewRow): number {
+  return Array.isArray(row.source.variants) ? row.source.variants.length : 0;
+}
+
+function removeReviewRow(key: number) {
+  reviewRows.value = reviewRows.value.filter((r) => r.key !== key);
+}
+
+function reviewProblem(): string | null {
+  if (reviewRows.value.length === 0) return t("products.importNothingToSave");
+  for (const row of reviewRows.value) {
+    if (!row.name.trim()) return t("products.importNameRequired");
+    if (String(row.price).trim() !== "") {
+      const n = Number(row.price);
+      if (!Number.isFinite(n) || n < 0) return t("products.importPriceInvalid", { name: row.name.trim() });
+    }
+    if (row.currency.trim().length < 3) return t("products.importCurrencyInvalid", { name: row.name.trim() });
+  }
+  return null;
+}
+
+// Step 2: the owner confirmed — save all rows together (all-or-nothing).
+async function onConfirmImport() {
+  if (confirmingImport.value) return;
+  const problem = reviewProblem();
+  if (problem) {
+    aiError.value = problem;
+    return;
+  }
+  aiError.value = null;
+  confirmingImport.value = true;
+  try {
+    const products = reviewRows.value.map<ProductInput>((row) => ({
+      ...row.source,
+      name: row.name.trim(),
+      price: String(row.price).trim() === "" ? null : Number(row.price),
+      currency: row.currency.trim().toUpperCase(),
+    }));
+    const saved = await api.confirmImport(products);
+    showAiImportModal.value = false;
+    toast.success(t("products.importSaved", { count: saved.length }));
+    await reload();
+  } catch (err) {
+    aiError.value = err instanceof Error && err.message ? err.message : t("products.importError");
+  } finally {
+    confirmingImport.value = false;
   }
 }
 </script>
@@ -574,6 +670,17 @@ async function onAiImportSubmit() {
     <div v-if="loading" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2.5 sm:gap-3">
       <Skeleton v-for="i in 8" :key="i" class="h-56 sm:h-64 rounded-xl w-full" />
     </div>
+
+    <!-- Load Error -->
+    <Card v-else-if="loadError" class="text-center py-10 px-4 border-destructive/30 shadow-xs space-y-3">
+      <AlertCircle :size="28" class="mx-auto text-destructive" />
+      <p class="text-sm font-semibold text-foreground">{{ t("products.loadError") }}</p>
+      <p class="text-xs text-muted-foreground">{{ loadError }}</p>
+      <Button variant="outline" size="sm" class="h-8 text-xs gap-1.5 cursor-pointer" @click="reload">
+        <RefreshCw :size="13" />
+        <span>{{ t("common.retry") }}</span>
+      </Button>
+    </Card>
 
     <!-- Empty State -->
     <Card
@@ -904,17 +1011,67 @@ async function onAiImportSubmit() {
       </div>
     </div>
 
-    <!-- AI Import Modal (Compact) -->
+    <!-- AI Import Modal: step 1 input, step 2 review -> confirm -->
     <Dialog :open="showAiImportModal" @update:open="showAiImportModal = $event">
-      <DialogContent class="sm:max-w-xl p-0 gap-0 overflow-hidden">
+      <DialogContent class="p-0 gap-0 overflow-hidden" :class="importStep === 'review' ? 'sm:max-w-3xl' : 'sm:max-w-xl'">
         <!-- Modal Header -->
         <DialogHeader class="p-4 border-b border-border">
           <DialogTitle class="text-sm font-bold text-foreground flex items-center gap-2">
             <Sparkles :size="16" class="text-amber-500" />
-            <span>Universal AI Import</span>
+            <span>{{ importStep === "review" ? t("products.importReviewTitle", { count: reviewRows.length }) : t("products.universalAiImport") }}</span>
           </DialogTitle>
         </DialogHeader>
 
+        <!-- Review step: nothing is saved until "Save" below -->
+        <div v-if="importStep === 'review'" class="p-4 space-y-3">
+          <div v-if="aiError" class="p-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-xs">
+            {{ aiError }}
+          </div>
+          <p class="text-xs text-muted-foreground">{{ t("products.importReviewHint") }}</p>
+
+          <div class="max-h-[55vh] overflow-auto rounded-lg border border-border">
+            <Table>
+              <TableHeader class="bg-muted/40">
+                <TableRow>
+                  <TableHead class="py-2 px-3 min-w-[180px]">{{ t("products.thName") }}</TableHead>
+                  <TableHead class="py-2 px-3 w-32">{{ t("products.thPrice") }}</TableHead>
+                  <TableHead class="py-2 px-3 w-24">{{ t("productForm.currency") }}</TableHead>
+                  <TableHead class="py-2 px-3 w-20 text-center">{{ t("products.thVariants") }}</TableHead>
+                  <TableHead class="py-2 px-3 w-10" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                <TableRow v-for="row in reviewRows" :key="row.key">
+                  <TableCell class="py-1.5 px-3">
+                    <Input v-model="row.name" maxlength="255" class="h-8 text-xs" />
+                  </TableCell>
+                  <TableCell class="py-1.5 px-3">
+                    <Input v-model="row.price" type="number" min="0" step="any" class="h-8 text-xs font-mono" />
+                  </TableCell>
+                  <TableCell class="py-1.5 px-3">
+                    <Input v-model="row.currency" maxlength="10" class="h-8 text-xs uppercase" />
+                  </TableCell>
+                  <TableCell class="py-1.5 px-3 text-center text-xs font-mono text-muted-foreground">
+                    {{ variantCount(row) }}
+                  </TableCell>
+                  <TableCell class="py-1.5 px-3 text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      class="h-7 w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+                      :title="t('common.delete')"
+                      @click="removeReviewRow(row.key)"
+                    >
+                      <Trash2 :size="13" />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
+          </div>
+        </div>
+
+        <template v-else>
         <!-- Import Tabs -->
         <div class="px-4 pt-3">
           <Tabs v-model="importTab" class="w-full">
@@ -946,9 +1103,11 @@ async function onAiImportSubmit() {
             <Textarea
               v-model="rawText"
               :rows="6"
+              :maxlength="MAX_IMPORT_TEXT"
               class="font-mono text-xs resize-none bg-background"
               :placeholder="t('products.inputPlaceholder')"
             />
+            <p class="mt-1 text-right text-[11px] text-muted-foreground font-mono">{{ rawText.length }} / {{ MAX_IMPORT_TEXT }}</p>
           </div>
 
           <!-- JSON Tab -->
@@ -985,27 +1144,63 @@ async function onAiImportSubmit() {
           </div>
         </div>
 
+        </template>
+
         <!-- Modal Footer -->
         <DialogFooter class="p-3.5 bg-muted/30 border-t border-border flex items-center justify-end gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            class="h-8 text-xs cursor-pointer shadow-none"
-            @click="showAiImportModal = false"
-          >
-            {{ t("common.cancel") }}
-          </Button>
-          <Button
-            variant="default"
-            size="sm"
-            class="h-8 text-xs gap-1.5 font-semibold cursor-pointer shadow-xs"
-            :disabled="aiImporting"
-            @click="onAiImportSubmit"
-          >
-            <Sparkles v-if="!aiImporting" :size="13" />
-            <div v-else class="h-3 w-3 border-2 border-primary-foreground border-t-transparent rounded-full animate-spin"></div>
-            <span>{{ aiImporting ? t("products.importing") : t("products.startImport") }}</span>
-          </Button>
+          <template v-if="importStep === 'review'">
+            <Button
+              variant="outline"
+              size="sm"
+              class="h-8 text-xs gap-1.5 cursor-pointer shadow-none mr-auto"
+              :disabled="confirmingImport"
+              @click="importStep = 'input'; aiError = null"
+            >
+              <ArrowLeft :size="13" />
+              <span>{{ t("common.back") }}</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              class="h-8 text-xs cursor-pointer shadow-none"
+              :disabled="confirmingImport"
+              @click="showAiImportModal = false"
+            >
+              {{ t("common.cancel") }}
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              class="h-8 text-xs gap-1.5 font-semibold cursor-pointer shadow-xs"
+              :disabled="confirmingImport || reviewRows.length === 0"
+              @click="onConfirmImport"
+            >
+              <Check v-if="!confirmingImport" :size="13" />
+              <div v-else class="h-3 w-3 border-2 border-primary-foreground border-t-transparent rounded-full animate-spin"></div>
+              <span>{{ confirmingImport ? t("products.importing") : t("products.importConfirm", { count: reviewRows.length }) }}</span>
+            </Button>
+          </template>
+          <template v-else>
+            <Button
+              variant="outline"
+              size="sm"
+              class="h-8 text-xs cursor-pointer shadow-none"
+              @click="showAiImportModal = false"
+            >
+              {{ t("common.cancel") }}
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              class="h-8 text-xs gap-1.5 font-semibold cursor-pointer shadow-xs"
+              :disabled="aiImporting"
+              @click="onAiImportSubmit"
+            >
+              <Sparkles v-if="!aiImporting" :size="13" />
+              <div v-else class="h-3 w-3 border-2 border-primary-foreground border-t-transparent rounded-full animate-spin"></div>
+              <span>{{ aiImporting ? t("products.extracting") : t("products.startImport") }}</span>
+            </Button>
+          </template>
         </DialogFooter>
       </DialogContent>
     </Dialog>

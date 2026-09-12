@@ -50,10 +50,10 @@
   - **Web Push:** `pywebpush 2.3.0` (VAPID orqali brauzer push xabarlari).
   - **Server-Sent Events (SSE):** `app/notifications/broadcaster.py` orqali Dashboard bilan live real-time aloqa (`/notifications/stream`).
 * **Joylashtirish (Deploy):**
-  - VPS (Ubuntu/Debian server: IP `169.58.222.33`).
-  - Docker Compose (`docker-compose.yml`, `docker-compose.prod.yml`).
-  - Konteynerlar: `mivo-api-1` (backend), `mivo-db-1` (Postgres).
-  - Reverse proxy / SSL: Cloudflare Tunnel / Nginx.
+  - VPS (Ubuntu 24.04). Server manzili repoda saqlanmaydi.
+  - Docker Compose (`docker-compose.yml` + `docker-compose.prod.yml`; prod'da `migrate` servisi migratsiyani API'dan oldin bajaradi).
+  - Konteynerlar: `mivo-api-1` (backend, `127.0.0.1:8000`), `mivo-db-1` (Postgres, tashqariga ochilmaydi).
+  - Reverse proxy / SSL: host'dagi Nginx (`127.0.0.1:8000` ga proxy).
 
 ### Frontend (`Mivo-Client`)
 * Nuxt 3 / Nuxt 4 (`nuxt 4.5.2`, Vue 3.5, Vite).

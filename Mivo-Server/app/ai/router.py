@@ -1,4 +1,5 @@
 import datetime as dt
+import html
 import logging
 import uuid
 from typing import Annotated, Any
@@ -8,6 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.ai import limits
 from app.ai.models import AiFeedback
 from app.ai.orchestrator import handle_customer_message
 from app.ai.provider.base import LLMProvider
@@ -25,12 +27,14 @@ from app.businesses.models import Business
 from app.common.tenancy import get_current_business
 from app.conversations.models import Conversation, Message
 from app.conversations.service import get_recent_messages
+from app.core.config import get_settings
 from app.core.db import get_db
 from app.customers.models import Customer
 from app.leads.models import Lead
 from app.leads.notifications import get_telegram_client
 from app.products.media import get_display_image_url
 from app.products.models import Product
+from app.telegram.client import TelegramAPIError
 from app.telegram.models import TelegramConnection
 
 logger = logging.getLogger("app.ai.router")
@@ -128,6 +132,11 @@ async def _get_or_create_sandbox_session(
             lead = None
         conversation.status = "ai_active"
         conversation.last_message_at = None
+        conversation.last_answered_customer_message_at = None
+        # The sale-in-progress outlives the messages it came from — a reset
+        # that kept it would start the next session holding the previous
+        # one's focus product, prices and open question.
+        conversation.working_state = {}
         await db.flush()
     elif conversation.status == "human_needed":
         # Sandbox conversations should never stay in human_needed permanently.
@@ -220,7 +229,14 @@ async def post_sandbox_message(
     provider: Annotated[LLMProvider, Depends(get_llm_provider)],
 ) -> SandboxTurnResponse:
     """Executes a simulated customer message in the Sandbox and returns detailed turn introspection."""
+    if business.ai_suspended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI is suspended for this business.")
     customer, conversation, lead = await _get_or_create_sandbox_session(db, business)
+    # Sandbox turns cost the same as real ones and count against the same
+    # daily budget.
+    spent = await limits.cost_today_usd(db, business.id)
+    if spent >= get_settings().ai_daily_cost_limit_usd:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Daily AI budget reached.")
     conversation.status = "active"
 
     escalation_state: dict[str, Any] = {}
@@ -259,29 +275,26 @@ async def post_sandbox_message(
             )
         )
         if connection and connection.telegram_chat_id:
+            sandbox_url = html.escape(f"{get_settings().frontend_url}/sandbox", quote=True)
             try:
                 tg_client = get_telegram_client()
                 text = (
                     f"🧪 <b>[AI SINOVCHISI - TEST XABARNOMASI]</b>\n\n"
-                    f"👤 <b>Mijoz (Simulyatsiya):</b> @{customer.username}\n"
-                    f"📞 <b>Telefon:</b> <code>{lead.phone or '—'}</code>\n"
+                    f"👤 <b>Mijoz (Simulyatsiya):</b> @{html.escape(customer.username or '')}\n"
+                    f"📞 <b>Telefon:</b> <code>{html.escape(lead.phone or '—')}</code>\n"
                     f"📊 <b>Niyat holati:</b> <code>{lead.status.upper()} ({lead.score}/100)</code>\n"
-                    f"💡 <b>AI Xulosasi:</b> <i>{lead.summary or lead.qualification_reason or '—'}</i>\n\n"
-                    f"👉 <a href='https://mivo.nasriddinov.dev/sandbox'>Mivo AI Sinovchisini ochish</a>"
+                    f"💡 <b>AI Xulosasi:</b> <i>{html.escape(lead.summary or lead.qualification_reason or '—')}</i>\n\n"
+                    f"👉 <a href='{sandbox_url}'>Mivo AI Sinovchisini ochish</a>"
                 )
-                keyboard = [
-                    [
-                        {"text": "🧪 Sinovchini ochish", "url": "https://mivo.nasriddinov.dev/sandbox"},
-                    ]
-                ]
+                keyboard = [[{"text": "🧪 Sinovchini ochish", "url": sandbox_url}]]
                 await tg_client.send_message(
                     connection.telegram_chat_id,
                     text,
                     reply_markup={"inline_keyboard": keyboard},
                 )
                 telegram_sent = True
-            except Exception as e:
-                logger.warning(f"Failed to send sandbox telegram alert: {e}")
+            except TelegramAPIError as e:
+                logger.warning("Failed to send sandbox telegram alert: %s", e)
 
     messages_raw = await get_recent_messages(db, conversation.id, limit=50)
     messages_out = [

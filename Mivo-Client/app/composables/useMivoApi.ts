@@ -1,14 +1,24 @@
 import type {
   AiFeedback,
   Business,
+  BusinessUpdate,
   ConversationDetail,
+  ConversationStatus,
   ConversationSummary,
+  Customer,
   FeedbackCreateInput,
+  InstagramStatus,
   Lead,
+  MediaUpload,
+  Message,
   NotificationItem,
   Product,
+  ProductImage,
+  ProductInput,
+  ProductPatch,
   SandboxState,
   SandboxTurnResponse,
+  TelegramStatus,
 } from "~/types/api";
 
 
@@ -17,48 +27,73 @@ export function useMivoApi() {
 
   return {
     getBusiness: () => apiRequest<Business>("/business"),
-    updateBusiness: (patch: Partial<Business>) =>
+    updateBusiness: (patch: BusinessUpdate) =>
       apiRequest<Business>("/business", { method: "PATCH", body: patch }),
 
     listProducts: () => apiRequest<Product[]>("/products"),
     getProduct: (id: string) => apiRequest<Product>(`/products/${id}`),
-    createProduct: (product: Partial<Product>) =>
+    createProduct: (product: ProductInput) =>
       apiRequest<Product>("/products", { method: "POST", body: product }),
-    updateProduct: (id: string, patch: Partial<Product>) =>
+    updateProduct: (id: string, patch: ProductPatch) =>
       apiRequest<Product>(`/products/${id}`, { method: "PATCH", body: patch }),
     deleteProduct: (id: string) => apiRequest<void>(`/products/${id}`, { method: "DELETE" }),
-    uploadProductImage: (id: string, file: File) => {
+    // Adds an image row to an existing product; is_primary makes it the only primary.
+    uploadProductImage: (id: string, file: File, isPrimary = false) => {
       const form = new FormData();
       form.append("file", file);
-      return apiRequest(`/products/${id}/images`, { method: "POST", body: form, isForm: true });
+      return apiRequest<ProductImage>(`/products/${id}/images?is_primary=${isPrimary}`, {
+        method: "POST",
+        body: form,
+        isForm: true,
+      });
+    },
+    // Stores an image and returns its public URL (variant photos, and the main
+    // photo of a product that doesn't exist yet). jpeg/png/webp, ≤ 5 MB.
+    uploadProductMedia: (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      return apiRequest<MediaUpload>("/products/media", { method: "POST", body: form, isForm: true });
     },
 
+    // Extraction only — nothing is saved until confirmImport.
     previewImport: (text: string) =>
-      apiRequest<{ products: Partial<Product>[] }>("/products/import/preview", {
+      apiRequest<{ products: ProductInput[] }>("/products/import/preview", {
         method: "POST",
         body: { text },
       }),
-    confirmImport: (products: Partial<Product>[]) =>
+    // All-or-nothing; 422 with a message on invalid data.
+    confirmImport: (products: ProductInput[]) =>
       apiRequest<Product[]>("/products/import/confirm", { method: "POST", body: { products } }),
 
-    listLeads: () => apiRequest<Lead[]>("/leads"),
+    listLeads: (limit = 500, offset = 0) => apiRequest<Lead[]>(`/leads?limit=${limit}&offset=${offset}`),
     getLead: (id: string) => apiRequest<Lead>(`/leads/${id}`),
 
-    listConversations: () => apiRequest<ConversationSummary[]>("/conversations"),
-    getConversation: (id: string) => apiRequest<ConversationDetail>(`/conversations/${id}`),
+    // Newest activity first; limit ≤ 200.
+    listConversations: (limit = 50, offset = 0) =>
+      apiRequest<ConversationSummary[]>(`/conversations?limit=${limit}&offset=${offset}`),
+    getConversation: (id: string, opts: { limit?: number; signal?: AbortSignal } = {}) =>
+      apiRequest<ConversationDetail>(`/conversations/${id}?limit=${opts.limit ?? 100}`, { signal: opts.signal }),
+    // Only messages newer than `afterId` (oldest first) — for polling.
+    listMessagesAfter: (id: string, afterId: string, opts: { limit?: number; signal?: AbortSignal } = {}) =>
+      apiRequest<Message[]>(
+        `/conversations/${id}/messages?after=${encodeURIComponent(afterId)}&limit=${opts.limit ?? 100}`,
+        { signal: opts.signal }
+      ),
+    // 400 {detail} when delivery fails — the message is still stored (as failed).
     sendConversationReply: (id: string, content: string) =>
-      apiRequest<any>(`/conversations/${id}/reply`, {
+      apiRequest<Message>(`/conversations/${id}/reply`, {
         method: "POST",
         body: { content },
       }),
-    updateConversationStatus: (id: string, status: string) =>
+    updateConversationStatus: (id: string, status: ConversationStatus) =>
       apiRequest<ConversationSummary>(`/conversations/${id}/status?status_value=${status}`, {
         method: "PATCH",
       }),
     deleteConversation: (id: string) =>
       apiRequest<void>(`/conversations/${id}`, { method: "DELETE" }),
-    updateCustomer: (id: string, patch: { username?: string; phone?: string }) =>
-      apiRequest<any>(`/customers/${id}`, {
+    // phone: a valid phone number or "" to clear (422 otherwise).
+    updateCustomer: (id: string, patch: { username?: string; name?: string; phone?: string }) =>
+      apiRequest<Customer>(`/customers/${id}`, {
         method: "PATCH",
         body: patch,
       }),
@@ -69,24 +104,28 @@ export function useMivoApi() {
     deleteLearnedRule: (id: string) =>
       apiRequest<void>(`/ai/learned-rules/${id}`, { method: "DELETE" }),
 
-    getInstagramStatus: () =>
-      apiRequest<{ connected: boolean; username?: string; expires_at?: string }>(
-        "/integrations/instagram/status"
-      ),
+    getInstagramStatus: () => apiRequest<InstagramStatus>("/integrations/instagram/status"),
     connectInstagram: () =>
       apiRequest<{ oauth_url: string }>("/integrations/instagram/connect", { method: "POST" }),
+    // Second half of the OAuth flow: the callback lands the browser on
+    // /integrations?instagram_pending=<completion_id>.
+    completeInstagramConnect: (completionId: string) =>
+      apiRequest<InstagramStatus>("/integrations/instagram/complete", {
+        method: "POST",
+        body: { completion_id: completionId },
+      }),
     disconnectInstagram: () =>
       apiRequest<void>("/integrations/instagram/disconnect", { method: "DELETE" }),
-    getTelegramStatus: () =>
-      apiRequest<{ connected: boolean; username?: string; chat_id?: string }>(
-        "/integrations/telegram/status"
-      ),
+    getTelegramStatus: () => apiRequest<TelegramStatus>("/integrations/telegram/status"),
+    // 503 when the bot isn't configured on the server.
     connectTelegram: () =>
       apiRequest<{ deep_link: string; expires_at: string }>("/integrations/telegram/connect", { method: "POST" }),
     disconnectTelegram: () =>
       apiRequest<void>("/integrations/telegram/disconnect", { method: "DELETE" }),
 
-    listNotifications: () => apiRequest<NotificationItem[]>("/notifications"),
+    // limit ≤ 100.
+    listNotifications: (limit = 50, offset = 0) =>
+      apiRequest<NotificationItem[]>(`/notifications?limit=${limit}&offset=${offset}`),
     getUnreadCount: () => apiRequest<{ unread_count: number }>("/notifications/unread-count"),
     markNotificationRead: (id: string) =>
       apiRequest<NotificationItem>(`/notifications/${id}/read`, { method: "PATCH" }),
@@ -96,11 +135,16 @@ export function useMivoApi() {
       apiRequest<void>(`/notifications/${id}`, { method: "DELETE" }),
     deleteReadNotifications: () =>
       apiRequest<void>("/notifications/read", { method: "DELETE" }),
+    // A one-minute, stream-only credential: the access token never goes into a URL.
+    getStreamTicket: () =>
+      apiRequest<{ ticket: string; expires_in: number }>("/notifications/stream-ticket", { method: "POST" }),
 
+    // public_key is "" when push isn't configured on the server.
     getVapidPublicKey: () =>
       apiRequest<{ public_key: string }>("/push/vapid-public-key"),
     getPushStatus: () =>
       apiRequest<{ subscribed: boolean; devices_count: number }>("/push/status"),
+    // 503 when push isn't configured, 422 when the endpoint isn't a browser push service.
     subscribePush: (data: { endpoint: string; keys: { p256dh: string; auth: string }; user_agent?: string }) =>
       apiRequest<{ subscribed: boolean; devices_count: number }>("/push/subscribe", { method: "POST", body: data }),
     unsubscribePush: (data: { endpoint: string }) =>
@@ -116,4 +160,3 @@ export function useMivoApi() {
       apiRequest<{ status: string; message: string }>("/ai/sandbox/reset", { method: "POST" }),
   };
 }
-

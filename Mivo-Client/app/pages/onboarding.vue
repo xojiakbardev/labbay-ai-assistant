@@ -1,14 +1,19 @@
 <script setup lang="ts">
-import { Instagram, Send, Package, Sparkles, ArrowRight } from "lucide-vue-next";
+import { Package, Sparkles, ArrowRight } from "@lucide/vue";
+import InstagramIcon from "~/components/InstagramIcon.vue";
+import TelegramIcon from "~/components/TelegramIcon.vue";
 
 definePageMeta({ layout: "default" });
 
-const STEPS = [
-  { to: "/integrations", label: "Connect Instagram", detail: "Let customers DM your business.", icon: Instagram },
-  { to: "/integrations", label: "Connect Telegram", detail: "So you get notified about hot leads.", icon: Send },
-  { to: "/products", label: "Add your products", detail: "Manually, or paste text for AI import.", icon: Package },
-  { to: "/ai-settings", label: "Configure your AI selling style", detail: "Tone, rules, policies.", icon: Sparkles },
-];
+const { t } = useI18n();
+
+// Lucide dropped brand icons in v1 — Instagram/Telegram use the local ones.
+const STEPS = computed(() => [
+  { to: "/integrations", label: t("onboarding.stepInstagram"), detail: t("onboarding.stepInstagramDetail"), icon: InstagramIcon },
+  { to: "/integrations", label: t("onboarding.stepTelegram"), detail: t("onboarding.stepTelegramDetail"), icon: TelegramIcon },
+  { to: "/products", label: t("onboarding.stepProducts"), detail: t("onboarding.stepProductsDetail"), icon: Package },
+  { to: "/ai-settings", label: t("onboarding.stepAi"), detail: t("onboarding.stepAiDetail"), icon: Sparkles },
+]);
 </script>
 
 <template>
@@ -16,10 +21,9 @@ const STEPS = [
     <Card class="w-full max-w-lg p-8">
       <div class="mb-6 flex flex-col items-center text-center">
         <img src="/logo.png" alt="Mivo AI" class="mb-3 h-11 w-11 rounded-xl object-contain" />
-        <h1 class="text-xl font-bold text-foreground">Welcome to Mivo AI</h1>
+        <h1 class="text-xl font-bold text-foreground">{{ t("onboarding.title") }}</h1>
         <p class="mt-2 text-sm text-muted-foreground leading-relaxed">
-          Connect Instagram, add your products, tell Mivo AI how you sell — and it handles your
-          incoming customers.
+          {{ t("onboarding.subtitle") }}
         </p>
       </div>
 
@@ -42,7 +46,7 @@ const STEPS = [
 
       <NuxtLink v-slot="{ navigate }" to="/" custom>
         <Button class="mt-6 w-full gap-2" @click="navigate">
-          <span>Go to dashboard</span>
+          <span>{{ t("onboarding.goToDashboard") }}</span>
           <ArrowRight :size="16" />
         </Button>
       </NuxtLink>

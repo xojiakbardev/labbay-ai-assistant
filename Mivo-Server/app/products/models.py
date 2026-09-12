@@ -1,13 +1,18 @@
 import uuid
 
-from sqlalchemy import Boolean, Computed, ForeignKey, Index, Numeric, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Computed, ForeignKey, Index, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, deferred, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 
+# Attribute *values* only, and never the internal keys: indexing
+# `attributes::text` made JSON keys ("color", "fit") and fields like image_url
+# searchable words, so a query mentioning "color" matched every product that
+# merely had a colour attribute. Must match the b8c9d0e1f2a3 migration.
 _SEARCH_VECTOR_EXPR = (
-    "to_tsvector('simple', coalesce(name, '') || ' ' || coalesce(description, '') "
-    "|| ' ' || coalesce(attributes::text, ''))"
+    "to_tsvector('simple', coalesce(name, '') || ' ' || coalesce(description, '')) "
+    "|| jsonb_to_tsvector('simple', coalesce(attributes, '{}'::jsonb) - 'image_url' - 'ai_instructions', "
+    "'[\"string\", \"numeric\"]')"
 )
 
 from app.common.mixins import TimestampMixin, UUIDPk
@@ -32,6 +37,23 @@ class Product(Base, UUIDPk, TimestampMixin):
             postgresql_using="gin",
             postgresql_ops={"search_normalized": "gin_trgm_ops"},
         ),
+        # Declared so `alembic revision --autogenerate` doesn't propose
+        # dropping indexes the migrations created by hand.
+        Index("ix_products_name_trgm", "name", postgresql_using="gin", postgresql_ops={"name": "gin_trgm_ops"}),
+        Index(
+            "ix_products_description_trgm",
+            "description",
+            postgresql_using="gin",
+            postgresql_ops={"description": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_products_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_where=text("embedding IS NOT NULL"),
+        ),
+        CheckConstraint("price IS NULL OR price >= 0", name="ck_products_price_non_negative"),
     )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
@@ -54,8 +76,10 @@ class Product(Base, UUIDPk, TimestampMixin):
     # down, simply doesn't take part in the semantic tier (app/products/search.py).
     # Width is pinned by EMBEDDING_DIMENSIONS — changing it needs a migration
     # and a full re-embed, which is what embedding_hash detects.
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(EMBEDDING_DIMENSIONS), nullable=True
+    # Deferred: 1536 floats per row, and nothing but the embedding code reads
+    # it — every search, list and discovery query would otherwise haul it along.
+    embedding: Mapped[list[float] | None] = deferred(
+        mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)
     )
     embedding_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -77,18 +101,26 @@ class Product(Base, UUIDPk, TimestampMixin):
 
 class ProductVariant(Base, UUIDPk):
     __tablename__ = "product_variants"
+    __table_args__ = (
+        CheckConstraint("stock_quantity IS NULL OR stock_quantity >= 0", name="ck_product_variants_stock_non_negative"),
+        CheckConstraint("price_override IS NULL OR price_override >= 0", name="ck_product_variants_price_non_negative"),
+    )
 
     product_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
     )
     variant_type: Mapped[str] = mapped_column(String(50), nullable=False, default="combination")  # combination | size | color | ...
     value: Mapped[str] = mapped_column(String(100), nullable=False)
-    attributes: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    attributes: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
     price_override: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     stock_quantity: Mapped[int | None] = mapped_column(nullable=True)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    images: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    images: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
     barcode: Mapped[str | None] = mapped_column(String(100), nullable=True)
     availability: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

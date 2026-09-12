@@ -21,8 +21,10 @@ class Lead(Base, UUIDPk, TimestampMixin):
     customer_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    # SET NULL, not CASCADE: an owner tidying up a chat must not silently
+    # lose the captured phone number and lead history with it.
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(10), default="cold", nullable=False)  # cold | warm | hot
     score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

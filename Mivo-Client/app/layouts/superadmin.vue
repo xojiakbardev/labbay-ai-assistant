@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { LayoutDashboard, Building2, LogOut, Sun, Moon } from "lucide-vue-next";
-import type { Locale } from "~/composables/useI18n";
+import { LayoutDashboard, Building2, LogOut, Sun, Moon } from "@lucide/vue";
 import { useTheme } from "~/composables/useTheme";
 
 const { signOut } = useAuth();
@@ -9,8 +8,8 @@ const { t } = useI18n();
 const { theme, toggleTheme } = useTheme();
 
 const NAV_ITEMS = computed(() => [
-  { to: "/superadmin", label: t("superadmin.nav.dashboard"), shortLabel: "Dashboard", component: LayoutDashboard },
-  { to: "/superadmin/businesses", label: t("superadmin.nav.businesses"), shortLabel: "Bizneslar", component: Building2 },
+  { to: "/superadmin", label: t("superadmin.nav.dashboard"), shortLabel: t("superadmin.nav.dashboard"), component: LayoutDashboard },
+  { to: "/superadmin/businesses", label: t("superadmin.nav.businesses"), shortLabel: t("superadmin.nav.businesses"), component: Building2 },
 ]);
 
 function isActive(to: string) {
@@ -30,7 +29,7 @@ function isActive(to: string) {
           <Sun v-if="theme === 'dark'" :size="15" class="text-amber-400" />
           <Moon v-else :size="15" class="text-primary" />
         </Button>
-        <Button variant="ghost" size="icon" class="h-8 w-8 text-muted-foreground hover:text-destructive shrink-0" title="Chiqish" @click="signOut">
+        <Button variant="ghost" size="icon" class="h-8 w-8 text-muted-foreground hover:text-destructive shrink-0" :title="t('nav.signOut')" @click="signOut">
           <LogOut :size="15" />
         </Button>
       </div>
@@ -67,7 +66,7 @@ function isActive(to: string) {
         >
           <Sun v-if="theme === 'dark'" :size="15" class="text-amber-400" />
           <Moon v-else :size="15" class="text-primary" />
-          <span>{{ theme === 'dark' ? 'Light' : 'Dark' }}</span>
+          <span>{{ theme === 'dark' ? t("dashboard.lightMode") : t("dashboard.darkMode") }}</span>
         </Button>
 
         <LanguageSelect class="w-full mb-2" trigger-class="w-full justify-between" align="start" />

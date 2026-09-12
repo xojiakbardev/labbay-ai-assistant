@@ -62,6 +62,7 @@ def embedding_hash(text: str, model: str, dimensions: int) -> str:
 
 
 def needs_reembedding(product, text: str, model: str, dimensions: int) -> bool:
-    if getattr(product, "embedding", None) is None:
-        return True
+    """Decided from the hash alone — the vector column is deferred (never
+    loaded with the product), and the hash is written together with it, so a
+    missing hash is a missing vector."""
     return getattr(product, "embedding_hash", None) != embedding_hash(text, model, dimensions)

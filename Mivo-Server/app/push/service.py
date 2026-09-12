@@ -21,7 +21,13 @@ async def save_subscription(
     auth: str,
     user_agent: str | None = None,
 ) -> PushSubscription:
-    """Saves or updates a Web Push subscription for a business/user."""
+    """Saves or updates a Web Push subscription for a business/user.
+
+    An endpoint is a capability URL the push service issued to one browser;
+    whoever presents it is logged in on that browser now. So an existing row
+    moves to the presenting business — that's the same device changing hands
+    (one owner logged out, another logged in), and the previous owner's alerts
+    must stop going to it."""
     query = select(PushSubscription).where(PushSubscription.endpoint == endpoint)
     result = await db.execute(query)
     sub = result.scalar_one_or_none()
@@ -84,6 +90,9 @@ def _sync_send_webpush(
         data=data_str,
         vapid_private_key=vapid_private_key,
         vapid_claims=vapid_claims,
+        # Without a timeout a push service that never answers pins a worker
+        # thread for good.
+        timeout=10,
     )
 
 
@@ -100,9 +109,8 @@ async def send_push_notification(
     Automatically removes dead / expired endpoints (404 or 410).
     Never raises an unhandled error to the caller."""
     settings = get_settings()
-    if not settings.vapid_private_key:
-        logger.info("[PushService] VAPID private key not configured — skipping web push.")
-        return 0
+    if not settings.vapid_private_key or not settings.vapid_public_key:
+        return 0  # push not configured on this server
 
     subscriptions = await list_subscriptions(db, business_id)
     if not subscriptions:
@@ -138,9 +146,11 @@ async def send_push_notification(
             )
             sent_count += 1
         except pywebpush.WebPushException as exc:
-            # 404 or 410 indicates the client unregistered / expired
+            # 404/410: the browser unregistered. 401/403: the subscription was
+            # made with a different VAPID key (e.g. after a key rotation) and
+            # can never be delivered to again. Either way it's dead.
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code in (404, 410):
+            if status_code in (401, 403, 404, 410):
                 logger.info(f"[PushService] Removing expired push subscription {sub.id} (HTTP {status_code})")
                 dead_endpoint_ids.append(sub.id)
             else:

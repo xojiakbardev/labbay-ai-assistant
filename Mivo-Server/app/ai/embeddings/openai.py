@@ -22,7 +22,15 @@ import random
 import httpx
 
 from app.ai.embeddings.base import EmbeddingError, EmbeddingProvider
+from app.ai.usage_context import billed_business
 from app.core.config import get_settings
+
+# OpenAI list prices, for the superadmin cost figures (the embeddings API
+# returns token counts, not cost). Unknown models are logged at $0.
+_USD_PER_MILLION_TOKENS = {
+    "text-embedding-3-large": 0.13,
+    "text-embedding-3-small": 0.02,
+}
 
 logger = logging.getLogger("app.ai.embeddings.openai")
 
@@ -45,16 +53,17 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._timeout = settings.embedding_request_timeout_seconds
         self._max_retries = 2
 
-    async def _post(self, client: httpx.AsyncClient, payload: dict) -> dict:
+    async def _post(self, client: httpx.AsyncClient, payload: dict, max_retries: int | None = None) -> dict:
         last_error: Exception | None = None
-        for attempt in range(self._max_retries + 1):
+        retries = self._max_retries if max_retries is None else max_retries
+        for attempt in range(retries + 1):
             try:
                 response = await client.post(
                     _OPENAI_EMBEDDINGS_URL,
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     json=payload,
                 )
-                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < retries:
                     delay = 0.4 * (2**attempt) + random.uniform(0.05, 0.15)
                     logger.warning(
                         "[embeddings] HTTP %s, retrying in %.2fs", response.status_code, delay
@@ -65,7 +74,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 return response.json()
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
-                if attempt < self._max_retries:
+                if attempt < retries:
                     await asyncio.sleep(0.4 * (2**attempt))
                     continue
                 raise EmbeddingError(f"embedding request failed: {exc}") from exc
@@ -82,12 +91,29 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
     @staticmethod
     def _vectors(data: dict, expected: int) -> list[list[float]]:
-        items = data.get("data") or []
-        if len(items) != expected:
-            raise EmbeddingError(f"expected {expected} embeddings, got {len(items)}")
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list) or len(items) != expected:
+            raise EmbeddingError(f"expected {expected} embeddings, got {len(items or [])}")
+        if not all(isinstance(item, dict) and isinstance(item.get("embedding"), list) for item in items):
+            raise EmbeddingError("embedding response is malformed")
         # The API documents index order but doesn't guarantee it in transit.
         ordered = sorted(items, key=lambda item: item.get("index", 0))
         return [item["embedding"] for item in ordered]
+
+    async def _log(self, data: dict) -> None:
+        business_id = billed_business()
+        tokens = int((data.get("usage") or {}).get("total_tokens") or 0)
+        if business_id is None or not tokens:
+            return
+        from app.ai.provider.openrouter import log_usage
+
+        price = _USD_PER_MILLION_TOKENS.get(self.model, 0.0)
+        await log_usage(
+            business_id,
+            "embedding",
+            self.model,
+            {"prompt_tokens": tokens, "total_tokens": tokens, "cost": tokens * price / 1_000_000},
+        )
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         cleaned = [t.strip() or " " for t in texts]
@@ -98,13 +124,15 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             for start in range(0, len(cleaned), MAX_BATCH):
                 batch = cleaned[start : start + MAX_BATCH]
                 data = await self._post(client, self._payload(batch))
+                await self._log(data)
                 vectors.extend(self._vectors(data, len(batch)))
         return vectors
 
-    async def embed_query(self, text: str) -> list[float]:
+    async def embed_query(self, text: str, timeout: float | None = None) -> list[float]:
         cleaned = (text or "").strip()
         if not cleaned:
             raise EmbeddingError("cannot embed an empty query")
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            data = await self._post(client, self._payload([cleaned]))
+        async with httpx.AsyncClient(timeout=timeout or self._timeout) as client:
+            data = await self._post(client, self._payload([cleaned]), max_retries=0 if timeout else None)
+        await self._log(data)
         return self._vectors(data, 1)[0]

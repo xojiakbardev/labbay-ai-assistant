@@ -10,7 +10,7 @@ import pytest
 from app.auth.models import User
 from app.businesses.models import Business
 from app.core.security import decrypt_secret, encrypt_secret
-from app.instagram.client import RefreshedToken
+from app.instagram.client import MetaAPIError, RefreshedToken
 from app.instagram.models import InstagramAccount
 from app.instagram.service import refresh_expiring_tokens
 
@@ -25,7 +25,7 @@ class FakeMetaClient:
     async def refresh_long_lived_token(self, access_token: str) -> RefreshedToken:
         self.calls.append(access_token)
         if access_token in self._fail_for:
-            raise RuntimeError("simulated Meta API failure")
+            raise MetaAPIError("simulated Meta API failure")
         return RefreshedToken(
             access_token=f"refreshed-{access_token}",
             expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=60),

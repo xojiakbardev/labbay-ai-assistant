@@ -9,8 +9,7 @@ import {
   LogOut,
   Sun,
   Moon
-} from "lucide-vue-next";
-import type { Locale } from "~/composables/useI18n";
+} from "@lucide/vue";
 import { useUserPreferences } from "~/composables/useUserPreferences";
 
 const { signOut } = useAuth();

@@ -80,9 +80,11 @@ async def test_multiword_query_falls_back_to_or_match_when_and_finds_nothing(db_
 
     # A strict AND match finds nothing (no product has both words); the OR
     # fallback still surfaces the product that shares "poyabzal" instead of
-    # leaving the customer with zero results.
+    # leaving the customer with zero results. (The synonym expansion also
+    # maps "poyabzal" to "krossovka", so the sport sneaker — arguably the
+    # better answer to "sport shoe" — comes back too.)
     results = await search_products(db_session, business_id, query="sportivniy poyabzal")
-    assert [p.name for p in results] == ["Klassik charm poyabzal"]
+    assert "Klassik charm poyabzal" in [p.name for p in results]
 
 
 async def test_query_with_no_token_overlap_at_all_falls_back_to_trigram_similarity(db_session) -> None:
@@ -128,13 +130,21 @@ async def test_color_and_size_filters_narrow_results(db_session) -> None:
     assert [p.name for p in results] == ["Nike Hoodie"]
 
 
-async def test_unavailable_products_excluded_by_default(db_session) -> None:
+async def test_available_products_win_and_sold_out_ones_are_shown_as_sold_out(db_session) -> None:
+    """Available stock is what search returns first; only when nothing
+    available matches does a sold-out product come back — marked unavailable,
+    so the AI says "we carry it, it's sold out" instead of "we don't sell it"."""
     business_id = await _seed_business(db_session)
     await _add_product(db_session, business_id, "Sold Out Hoodie", availability=False)
     await db_session.commit()
 
     results = await search_products(db_session, business_id, query="hoodie")
-    assert results == []
+    assert [(p.name, p.availability) for p in results] == [("Sold Out Hoodie", False)]
+
+    await _add_product(db_session, business_id, "Fresh Hoodie", availability=True)
+    await db_session.commit()
+    results = await search_products(db_session, business_id, query="hoodie")
+    assert [p.name for p in results] == ["Fresh Hoodie"]
 
 
 async def test_price_max_filter(db_session) -> None:
@@ -207,11 +217,32 @@ async def test_check_availability_true_for_matching_variant(db_session) -> None:
     )
     await db_session.commit()
 
-    assert await check_availability(db_session, business_id, product.id, "M") is True
-    assert await check_availability(db_session, business_id, product.id, "XL") is False
+    matched = await check_availability(db_session, business_id, product.id, "M")
+    assert matched["available"] is True and matched["matched_variants"] == ["M"]
+
+    # Regression: a size that isn't carried used to fall back to "the product
+    # has *some* variant in stock -> available: true".
+    missing = await check_availability(db_session, business_id, product.id, "XL")
+    assert missing["available"] is False
+    assert missing["available_variants"] == ["M", "L"]
+
+    assert (await check_availability(db_session, business_id, product.id))["available"] is True
 
 
-    assert await check_availability(db_session, business_id, product.id) is False
+async def test_size_matches_whole_tokens_not_substrings(db_session) -> None:
+    """Regression: substring matching made "S" match "XS" and "Sariq", and
+    "L" match "XL" — the AI then told customers sizes were in stock that weren't."""
+    business_id = await _seed_business(db_session)
+    await _add_product(db_session, business_id, "Hoodie XS", variants=[("size", "XS"), ("color", "Sariq")])
+    await _add_product(db_session, business_id, "Hoodie Combo", variants=[("combination", "Qora / S")])
+    await db_session.commit()
+
+    results = await search_products(db_session, business_id, query="hoodie", size="S")
+    assert [p.name for p in results] == ["Hoodie Combo"]
+
+    xs_only = (await search_products(db_session, business_id, query="hoodie xs"))[0]
+    assert (await check_availability(db_session, business_id, xs_only.id, "S"))["available"] is False
+    assert (await check_availability(db_session, business_id, xs_only.id, "XS"))["available"] is True
 
 
 async def test_search_cyrillic_query_matches_latin_product(db_session) -> None:

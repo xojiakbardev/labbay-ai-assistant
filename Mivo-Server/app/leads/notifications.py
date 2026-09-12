@@ -8,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.businesses.models import Business
+from app.core.config import get_settings
 from app.customers.models import Customer
 from app.leads.models import Lead
-from app.telegram.client import TelegramClient
+from app.telegram.client import TelegramAPIError, TelegramClient
 from app.telegram.models import TelegramConnection
 
 logger = logging.getLogger("app.leads.notifications")
@@ -27,7 +28,7 @@ _TEMPLATE = """🔥 <b>YANGI ISSIQ LID (HOT LEAD)!</b>
 💡 <b>AI Xulosasi:</b>
 <i>{summary}</i>
 
-👉 <a href="https://mivo.nasriddinov.dev/leads?id={lead_id}">Mivo Dashboard-da ochish</a>"""
+👉 <a href="{frontend}/leads?id={lead_id}">Mivo Dashboard-da ochish</a>"""
 
 
 def get_telegram_client() -> TelegramClient:
@@ -39,7 +40,7 @@ def _sanitize_summary(raw: str | None) -> str:
     """Removes any internal system prompt tokens, <think> tags, raw tool calls,
     or stack traces to ensure clean, customer-safe text."""
     if not raw or not raw.strip():
-        return "Mijoz mahsulotlarga qiziqish bildirdi va bog'lanishni kutmoqda."
+        return "—"  # no summary exists; don't make one up
     text = raw.strip()
     # Remove internal thinking/tool XML tags if any leaked
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -47,7 +48,7 @@ def _sanitize_summary(raw: str | None) -> str:
     text = re.sub(r"<.*?>", "", text)
     # Remove prompt headers
     text = re.sub(r"^(SYSTEM|USER|ASSISTANT|HUMAN):", "", text, flags=re.IGNORECASE).strip()
-    return text or "Mijoz mahsulotlarga qiziqish bildirdi va bog'lanishni kutmoqda."
+    return text or "—"
 
 
 def _format_notification(customer: Customer, lead: Lead) -> str:
@@ -68,6 +69,7 @@ def _format_notification(customer: Customer, lead: Lead) -> str:
         products=products,
         summary=clean_summary,
         lead_id=lead.id,
+        frontend=html.escape(get_settings().frontend_url, quote=True),
     )
 
 
@@ -99,28 +101,20 @@ async def notify_hot_lead(
         return False
 
     text = _format_notification(customer, lead)
-    telegram_client = client or get_telegram_client()
-
-    keyboard_buttons = [
-        [
-            {
-                "text": "💬 Suhbatni ochish",
-                "url": f"https://mivo.nasriddinov.dev/?id={lead.conversation_id}",
-            },
-            {
-                "text": "👤 Lid tafsilotlari",
-                "url": f"https://mivo.nasriddinov.dev/leads?id={lead.id}",
-            },
-        ]
-    ]
-    reply_markup = {"inline_keyboard": keyboard_buttons}
+    frontend = get_settings().frontend_url
+    buttons = [{"text": "👤 Lid tafsilotlari", "url": f"{frontend}/leads?id={lead.id}"}]
+    if lead.conversation_id:
+        buttons.insert(0, {"text": "💬 Suhbatni ochish", "url": f"{frontend}/?id={lead.conversation_id}"})
+    reply_markup = {"inline_keyboard": [buttons]}
 
     try:
+        telegram_client = client or get_telegram_client()
         await telegram_client.send_message(connection.telegram_chat_id, text, reply_markup=reply_markup)
-        lead.last_notification_error = None
-        return True
-    except Exception as exc:
-        err_msg = str(exc)
-        logger.error(f"[LeadNotification] Telegram notification failed for lead {lead.id}: {err_msg}")
-        lead.last_notification_error = err_msg[:500]
+    except TelegramAPIError as exc:
+        # TelegramAPIError text is built without the request URL (which
+        # carries the bot token), so it's safe to store and log.
+        logger.error("[LeadNotification] Telegram notification failed for lead %s: %s", lead.id, exc)
+        lead.last_notification_error = str(exc)[:500]
         return False
+    lead.last_notification_error = None
+    return True

@@ -16,9 +16,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.models import User
 from app.businesses.models import Business
 from app.core.db import get_db
-from app.core.security import decode_token
+from app.core.security import TOKEN_ACCESS, decode_token
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def user_from_token(db: AsyncSession, raw_token: str, expected_type: str) -> User:
+    try:
+        payload = decode_token(raw_token, expected_type)
+        user_id = uuid.UUID(payload["sub"])
+    except (jwt.PyJWTError, ValueError) as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token.") from exc
+
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists.")
+    return user
+
+
+async def business_for_user(db: AsyncSession, user: User) -> Business:
+    """The caller's own business — refused once the superadmin has
+    soft-deleted it, immediately rather than when the access token expires."""
+    business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
+    if business is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No business found for this account.")
+    if business.deleted_at is not None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has been deactivated.")
+    return business
 
 
 async def get_current_user(
@@ -27,19 +51,7 @@ async def get_current_user(
 ) -> User:
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token.")
-
-    try:
-        payload = decode_token(credentials.credentials)
-    except jwt.PyJWTError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token.") from exc
-
-    if payload.get("type") != "access":
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token type.")
-
-    user = await db.get(User, uuid.UUID(payload["sub"]))
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists.")
-    return user
+    return await user_from_token(db, credentials.credentials, TOKEN_ACCESS)
 
 
 async def get_current_superadmin(user: User = Depends(get_current_user)) -> User:
@@ -58,7 +70,4 @@ async def get_current_business(
 ) -> Business:
     """Resolves the caller's own business. Every business-owned query in every
     router should filter by this ID — never by a client-supplied business_id."""
-    business = await db.scalar(select(Business).where(Business.owner_user_id == user.id))
-    if business is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No business found for this account.")
-    return business
+    return await business_for_user(db, user)

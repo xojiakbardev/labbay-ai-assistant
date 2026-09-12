@@ -8,11 +8,30 @@ os.environ.setdefault(
     "DATABASE_URL_SYNC", "postgresql+psycopg://mivo:mivo@localhost:5432/mivo_test"
 )
 # Tests must be hermetic w.r.t. whatever real secrets happen to be in the
-# developer's .env — a real META_APP_SECRET there would otherwise make
-# webhook-signature tests demand a signature they never send.
-os.environ.setdefault("META_APP_SECRET", "")
+# developer's .env. Every secret gets a test-only value here; webhook tests
+# sign their payloads with TEST_META_APP_SECRET (see sign_webhook below).
+TEST_META_APP_SECRET = "test-meta-app-secret"
+TEST_TELEGRAM_SECRET = "test-telegram-webhook-secret"
+os.environ["APP_ENV"] = "test"
+os.environ["DEBUG"] = "false"
+os.environ["JWT_SECRET"] = "test-jwt-secret-that-is-long-enough-0123456789"
+os.environ["FERNET_KEY"] = "yQ2Ky0-PWXVYd5o1S4cTL8C2n0Wf7tT7xmFJwlm3i-8="
+os.environ["META_APP_SECRET"] = TEST_META_APP_SECRET
+os.environ["META_WEBHOOK_VERIFY_TOKEN"] = "test-verify-token"
+os.environ["TELEGRAM_WEBHOOK_SECRET"] = TEST_TELEGRAM_SECRET
+os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-bot-token"
+os.environ["TELEGRAM_BOT_USERNAME"] = "TestMivoBot"
+os.environ["VAPID_PUBLIC_KEY"] = "BTestOnlyVapidPublicKey-not-a-real-key-0123456789"
+os.environ["VAPID_PRIVATE_KEY"] = "test-only-vapid-private-key-not-real"
+os.environ["EMBEDDING_API_KEY"] = ""
+os.environ.setdefault("OPENROUTER_API_KEY", "test-openrouter-key")
+os.environ["STT_PROVIDER"] = ""
+os.environ["FRONTEND_URL"] = "https://app.mivo.test"
 
 import datetime as dt
+import hashlib
+import hmac
+import json
 import subprocess
 import sys
 import uuid
@@ -27,9 +46,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import service as auth_service
 from app.core.config import get_settings
 from app.core.db import Base, async_session_factory, engine
+from app.core.security import create_access_token
 import app.core.models_registry  # noqa: F401  (populates Base.metadata for TRUNCATE)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def sign_webhook(payload: dict) -> tuple[bytes, dict]:
+    """(raw body, headers) for a Meta webhook signed the way Meta signs it."""
+    body = json.dumps(payload).encode()
+    signature = hmac.new(TEST_META_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return body, {"X-Hub-Signature-256": f"sha256={signature}", "Content-Type": "application/json"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_login_throttle():
+    auth_service.login_throttle.reset()
+    yield
+    auth_service.login_throttle.reset()
 
 
 def _sync_dsn() -> str:
@@ -61,8 +95,7 @@ def create_business_and_headers(
             (business_id, user_id, business_name, trial_expires),
         )
         conn.commit()
-    access, _ = auth_service.issue_tokens(user_id)
-    return {"Authorization": f"Bearer {access}"}
+    return {"Authorization": f"Bearer {create_access_token(str(user_id))}"}
 
 
 def create_superadmin_and_headers(email: str = "admin@mivo.test", password: str = "supersecret1") -> dict:
@@ -73,23 +106,21 @@ def create_superadmin_and_headers(email: str = "admin@mivo.test", password: str 
             (user_id, email, auth_service.hash_password(password)),
         )
         conn.commit()
-    access, _ = auth_service.issue_tokens(user_id)
-    return {"Authorization": f"Bearer {access}"}
+    return {"Authorization": f"Bearer {create_access_token(str(user_id))}"}
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _migrated_database():
-    """Run Alembic migrations once against the test database before the test session."""
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=REPO_ROOT,
-            check=True,
-            env={**os.environ},
-        )
-    except Exception as exc:
-        # Local postgres might not be running; pure unit tests can still run
-        print(f"Warning: Alembic test migration skipped ({exc})")
+    """Run Alembic migrations once against the test database before the test
+    session. A failed migration fails the run: continuing would make every DB
+    test fail later with a confusing unrelated error (this is how the missing
+    product_variants columns went unnoticed)."""
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        check=True,
+        env={**os.environ},
+    )
     yield
 
 

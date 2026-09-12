@@ -5,7 +5,8 @@ import { cn } from '@/lib/utils'
 
 const props = defineProps<{
   defaultValue?: string | number
-  modelValue?: string | number
+  // null = empty (optional numeric fields like stock or a price override)
+  modelValue?: string | number | null
   class?: HTMLAttributes['class']
 }>()
 

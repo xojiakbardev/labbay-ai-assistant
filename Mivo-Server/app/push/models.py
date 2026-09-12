@@ -21,7 +21,8 @@ class PushSubscription(Base, UUIDPk, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    # Uniqueness (and its index) comes from uq_push_subscriptions_endpoint.
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
     p256dh: Mapped[str] = mapped_column(Text, nullable=False)
     auth: Mapped[str] = mapped_column(Text, nullable=False)
     user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)

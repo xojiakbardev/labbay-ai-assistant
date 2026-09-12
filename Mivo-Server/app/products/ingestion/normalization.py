@@ -38,7 +38,7 @@ def _parse_price_and_currency(
         return None, _normalize_currency(raw_currency)
 
     if isinstance(raw_price, (int, float)):
-        return float(raw_price), _normalize_currency(raw_currency)
+        return round(float(raw_price), 2), _normalize_currency(raw_currency)
 
     text = str(raw_price).strip().lower()
     if not text:
@@ -69,10 +69,11 @@ def _parse_price_and_currency(
         text = text.replace(" ", "").replace(",", ".")
 
     try:
-        val = float(text) * multiplier
-        return val, _normalize_currency(curr)
-    except ValueError:
-        return None, _normalize_currency(curr)
+        val = round(float(text) * multiplier, 2)
+    except ValueError as exc:
+        # An unreadable price is reported, never silently turned into "no price".
+        raise ValueError(f"Can't read the price {raw_price!r}") from exc
+    return val, _normalize_currency(curr)
 
 
 def _dedupe_case_insensitive(values: list[str]) -> list[str]:
@@ -136,8 +137,8 @@ def normalize_extracted_product(raw: RawExtractedProduct | dict[str, Any]) -> Pr
                 stock = v.get("quantity") or v.get("miqdor")
             try:
                 stock_int = int(stock) if stock is not None and str(stock).strip() != "" else None
-            except (ValueError, TypeError):
-                stock_int = None
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Can't read the stock {stock!r} of variant {val!r}") from exc
 
             # Parse SKU images / photos
             sku_images: list[str] = []
@@ -158,10 +159,8 @@ def normalize_extracted_product(raw: RawExtractedProduct | dict[str, Any]) -> Pr
                 sku_image_url = sku_image_url.strip()
                 if sku_image_url not in sku_images:
                     sku_images.insert(0, sku_image_url)
-            elif sku_images:
-                sku_image_url = sku_images[0]
-            else:
-                sku_image_url = None
+            sku_images = [u for u in sku_images if u.startswith(("https://", "http://"))]
+            sku_image_url = sku_images[0] if sku_images else None
 
             barcode = v.get("barcode") or v.get("shtrixkod") or v.get("bar_code")
             barcode_str = str(barcode).strip() if barcode is not None and str(barcode).strip() else None
@@ -255,14 +254,21 @@ def normalize_extracted_product(raw: RawExtractedProduct | dict[str, Any]) -> Pr
             url = str(getattr(img, "url", "")).strip()
             is_primary = bool(getattr(img, "is_primary", idx == 0))
 
-        if url and url not in seen_images:
+        # Only real links are images; anything else the extraction picked up
+        # (a file name, a caption) isn't something Instagram can send.
+        if url.startswith(("https://", "http://")) and url not in seen_images:
             seen_images.add(url)
             images.append(ImageIn(url=url, is_primary=is_primary))
 
     # Also check attributes["image_url"]
     attrs = dict(raw_attrs) if isinstance(raw_attrs, dict) else {}
     attr_img = attrs.get("image_url")
-    if attr_img and isinstance(attr_img, str) and attr_img.strip() not in seen_images:
+    if (
+        attr_img
+        and isinstance(attr_img, str)
+        and attr_img.strip().startswith(("https://", "http://"))
+        and attr_img.strip() not in seen_images
+    ):
         url = attr_img.strip()
         seen_images.add(url)
         images.append(ImageIn(url=url, is_primary=(len(images) == 0)))

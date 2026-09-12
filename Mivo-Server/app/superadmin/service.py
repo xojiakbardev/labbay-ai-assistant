@@ -37,6 +37,7 @@ def _to_out(business: Business, owner_email: str, cost_last_30d: float, now: dt.
         "name": business.name,
         "owner_email": owner_email,
         "ai_enabled": business.ai_enabled,
+        "ai_suspended": business.ai_suspended,
         "subscription_expires_at": business.subscription_expires_at,
         "subscription_active": bool(
             business.subscription_expires_at and business.subscription_expires_at > now
@@ -124,8 +125,8 @@ async def extend_subscription(
     return business
 
 
-async def set_ai_enabled(db: AsyncSession, business: Business, ai_enabled: bool) -> Business:
-    business.ai_enabled = ai_enabled
+async def set_ai_suspended(db: AsyncSession, business: Business, ai_suspended: bool) -> Business:
+    business.ai_suspended = ai_suspended
     await db.commit()
     await db.refresh(business)
     return business
@@ -134,9 +135,11 @@ async def set_ai_enabled(db: AsyncSession, business: Business, ai_enabled: bool)
 async def soft_delete_business(db: AsyncSession, business: Business) -> None:
     """Marks the business (and its owner's access) deleted without touching
     any row a lead/conversation/usage-log foreign key points at — see
-    Business.deleted_at."""
+    Business.deleted_at. The owner's sessions end now: their refresh tokens
+    are revoked, and get_current_business refuses the business outright."""
     business.deleted_at = dt.datetime.now(dt.timezone.utc)
-    business.ai_enabled = False
+    business.ai_suspended = True
+    await auth_service.revoke_all_refresh_tokens(db, business.owner_user_id)
     await db.commit()
 
 

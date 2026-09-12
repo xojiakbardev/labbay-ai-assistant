@@ -38,9 +38,9 @@ const linePath = computed(() =>
 );
 
 const areaPath = computed(() => {
-  if (points.value.length === 0) return "";
   const first = points.value[0];
   const last = points.value[points.value.length - 1];
+  if (!first || !last) return "";
   return `${linePath.value} L ${last.x.toFixed(2)} ${height - padY} L ${first.x.toFixed(2)} ${height - padY} Z`;
 });
 

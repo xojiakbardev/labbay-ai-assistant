@@ -5,6 +5,7 @@ customer who hasn't named anything — "nima bor?", "sovg'aga nimadir kerak",
 "boshqasi bormi?" — which is what stops the AI from having to ask people to
 phrase their request as a search query.
 """
+import datetime as dt
 import uuid
 
 import pytest
@@ -144,11 +145,16 @@ async def test_popular_products_ranks_by_what_customers_asked_about(db_session) 
         customer_id = uuid.uuid4()
         from app.customers.models import Customer
 
-        db_session.add(Customer(id=customer_id, business_id=business.id, ig_scoped_id=str(uuid.uuid4())))
+        from app.conversations.service import get_or_create_conversation
+
+        now = dt.datetime.now(dt.timezone.utc)
+        db_session.add(Customer(id=customer_id, business_id=business.id, ig_scoped_id=str(uuid.uuid4()),
+                                first_seen_at=now, last_seen_at=now))
         await db_session.flush()
+        conversation = await get_or_create_conversation(db_session, business.id, customer_id)
         db_session.add(
-            Lead(business_id=business.id, customer_id=customer_id, status="warm",
-                 score=50, interested_products=interested)
+            Lead(business_id=business.id, customer_id=customer_id, conversation_id=conversation.id,
+                 status="warm", score=50, interested_products=interested)
         )
     await db_session.flush()
 
@@ -196,7 +202,8 @@ def test_slots_accumulate_across_turns_and_are_never_re_asked() -> None:
 
     block = render_state_block(state)
     assert "never ask for any of this again" in block
-    assert "use_case: sportga" in block
+    # Rendered as the customer's own (quoted) words — data, not instructions.
+    assert 'use_case: "sportga"' in block
     # The one essential still missing is the one it's told to chase.
     assert "Still unknown: budget" in block
     for known in ("use_case", "size"):

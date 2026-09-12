@@ -147,10 +147,16 @@ async def test_run_agentic_turn_executes_tool_call_then_returns_final_answer() -
     assert executed_calls == [("search_products", {"query": "hoodie"})]
     assert route.call_count == 3
 
-    # Final request must not include tools, and must be schema-constrained.
+    # Final request may not call tools (tool_choice none — the definitions are
+    # still sent because the history contains tool calls, which several
+    # providers in the fallback chain reject otherwise), and is
+    # schema-constrained with a strict-compatible schema.
     final_body = json.loads(route.calls[-1].request.content)
-    assert "tools" not in final_body
-    assert final_body["response_format"]["json_schema"]["name"] == "_TurnResult"
+    assert final_body["tool_choice"] == "none"
+    schema = final_body["response_format"]["json_schema"]
+    assert schema["name"] == "_TurnResult"
+    assert schema["schema"]["additionalProperties"] is False
+    assert set(schema["schema"]["required"]) == set(schema["schema"]["properties"])
 
 
 @respx.mock

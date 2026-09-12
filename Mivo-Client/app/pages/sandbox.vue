@@ -20,7 +20,7 @@ import {
   Code2,
   BrainCircuit,
   MessageSquare
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import { toast } from "vue-sonner";
 import type { SandboxMessage, SandboxProduct, SandboxState } from "~/types/api";
 
@@ -79,7 +79,7 @@ async function loadSandboxState() {
     scrollToBottom();
   } catch (err: any) {
     console.error("Failed to load sandbox state:", err);
-    toast.error("Sinov maydoni holatini yuklashda xatolik yuz berdi");
+    toast.error(err?.message || t("sandbox.loadError"));
   } finally {
     isInitialLoading.value = false;
   }
@@ -96,7 +96,7 @@ async function onSendMessage(quickText?: string) {
   const tempCustomerMsg: SandboxMessage = {
     id: `temp_${Date.now()}`,
     sender_type: "customer",
-    content: textToSend || (attachment ? "[Rasm yuborildi]" : ""),
+    content: textToSend || (attachment ? t("sandbox.imageSentPlaceholder") : ""),
     attachment_url: attachment,
     created_at: new Date().toISOString(),
   };
@@ -110,7 +110,7 @@ async function onSendMessage(quickText?: string) {
 
   try {
     const res = await api.sendSandboxMessage({
-      content: textToSend || "Rasm yubordim, shuni ko'rib bering",
+      content: textToSend || t("sandbox.imageOnlyMessage"),
       attachment_url: attachment,
       simulate_telegram: simulateTelegram.value,
     });
@@ -118,7 +118,7 @@ async function onSendMessage(quickText?: string) {
     messages.value = res.messages || [];
     leadStatus.value = res.lead_status;
     leadScore.value = res.lead_score;
-    phoneDetected.value = res.phone_detected;
+    phoneDetected.value = res.phone_detected ?? null;
     qualificationReason.value = res.qualification_reason;
     knownFacts.value = res.known_facts || [];
     interestedProducts.value = res.interested_products || [];
@@ -126,11 +126,11 @@ async function onSendMessage(quickText?: string) {
     lastTelegramSent.value = res.telegram_sent;
 
     if (res.telegram_sent) {
-      toast.success("Telegram botingizga test bildirishnoma yuborildi! 🚀");
+      toast.success(t("sandbox.telegramSentToast"));
     }
   } catch (err: any) {
     console.error("Failed to send message in sandbox:", err);
-    toast.error(err?.message || "AI javobini olishda xatolik yuz berdi");
+    toast.error(err?.message || t("sandbox.sendError"));
   } finally {
     isLoading.value = false;
     scrollToBottom();
@@ -154,7 +154,7 @@ async function onResetSandbox() {
     toast.success(t("sandbox.resetSuccess"));
   } catch (err: any) {
     console.error("Failed to reset sandbox:", err);
-    toast.error("Sinovni tozalashda xatolik yuz berdi");
+    toast.error(err?.message || t("sandbox.resetError"));
   } finally {
     isResetting.value = false;
   }
@@ -215,8 +215,8 @@ onMounted(() => {
                   <Badge variant="secondary" class="text-[10px] py-0 px-1 font-mono">Gemini 2.5</Badge>
                 </div>
                 <p class="text-[11px] text-muted-foreground flex items-center gap-1">
-                  <span>Instagram Direct Simulyatsiyasi</span>
-                  <span v-if="simulateTelegram" class="text-sky-500 font-medium">• TG Test Active</span>
+                  <span>{{ t("sandbox.simulationLabel") }}</span>
+                  <span v-if="simulateTelegram" class="text-sky-500 font-medium">• {{ t("sandbox.telegramTestActive") }}</span>
                 </p>
               </div>
             </div>
@@ -254,7 +254,7 @@ onMounted(() => {
                 <Sparkles class="w-7 h-7 animate-pulse" />
               </div>
               <div class="space-y-1 max-w-sm">
-                <h3 class="font-bold text-sm text-foreground">Xush kelibsiz!</h3>
+                <h3 class="font-bold text-sm text-foreground">{{ t("sandbox.welcome") }}</h3>
                 <p class="text-xs text-muted-foreground">
                   {{ t("sandbox.emptyHistory") }}
                 </p>
@@ -301,13 +301,13 @@ onMounted(() => {
                 <div class="max-w-[82%] sm:max-w-[70%] flex flex-col items-end space-y-1">
                   <!-- Image if attached -->
                   <div v-if="msg.attachment_url" class="rounded-xl overflow-hidden border border-primary/20 max-w-[240px] shadow-sm">
-                    <img :src="msg.attachment_url" alt="Customer uploaded" class="w-full max-h-48 object-cover" />
+                    <img :src="msg.attachment_url" :alt="t('sandbox.customerImageAlt')" class="w-full max-h-48 object-cover" />
                   </div>
                   <!-- Bubble -->
                   <div class="rounded-2xl rounded-br-xs px-3.5 py-2.5 bg-primary text-primary-foreground text-xs sm:text-[13px] leading-relaxed shadow-sm">
                     {{ msg.content }}
                   </div>
-                  <span class="text-[10px] text-muted-foreground pr-1">Mijoz</span>
+                  <span class="text-[10px] text-muted-foreground pr-1">{{ t("sandbox.customerLabel") }}</span>
                 </div>
                 <div class="w-7 h-7 rounded-full bg-muted border border-border flex items-center justify-center text-muted-foreground shrink-0 text-xs">
                   <User class="w-3.5 h-3.5" />
@@ -433,7 +433,7 @@ onMounted(() => {
                 <Sparkles class="w-4 h-4 text-primary" />
                 {{ t("sandbox.leadStatus") }}
               </CardTitle>
-              <CardDescription class="text-[11px]">Real-time Lead Intent & Qualification</CardDescription>
+              <CardDescription class="text-[11px]">{{ t("sandbox.leadStatusDesc") }}</CardDescription>
             </div>
 
             <!-- Status Pill -->
@@ -443,21 +443,21 @@ onMounted(() => {
                 class="bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-500/30 gap-1 text-xs font-bold px-2.5 py-0.5"
               >
                 <Flame class="w-3.5 h-3.5 fill-rose-500 text-rose-500" />
-                HOT LEAD (Issiq)
+                {{ t("sandbox.badgeHot") }}
               </Badge>
               <Badge
                 v-else-if="leadStatus === 'warm'"
                 class="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 gap-1 text-xs font-bold px-2.5 py-0.5"
               >
                 <Zap class="w-3.5 h-3.5 fill-amber-500 text-amber-500" />
-                WARM (Qiziqish bor)
+                {{ t("sandbox.badgeWarm") }}
               </Badge>
               <Badge
                 v-else-if="leadStatus === 'cold'"
                 class="bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/30 gap-1 text-xs font-bold px-2.5 py-0.5"
               >
                 <Snowflake class="w-3.5 h-3.5 text-slate-500" />
-                COLD (Shunchaki ko'ryapti)
+                {{ t("sandbox.badgeCold") }}
               </Badge>
               <span v-else class="text-xs text-muted-foreground italic">—</span>
             </div>
@@ -502,7 +502,7 @@ onMounted(() => {
                 {{ t("sandbox.reasoning") }}:
               </span>
               <p class="text-xs text-foreground bg-muted/20 p-2.5 rounded-lg border border-border/50 italic leading-relaxed">
-                {{ qualificationReason || "Mijoz xabari tahlil qilinmoqda..." }}
+                {{ qualificationReason || t("sandbox.analyzing") }}
               </p>
             </div>
           </CardContent>
@@ -550,7 +550,7 @@ onMounted(() => {
               >
                 <div class="flex items-center justify-between text-primary font-bold">
                   <span>{{ tool.name }}()</span>
-                  <Badge variant="outline" class="text-[9px] py-0 px-1">Called</Badge>
+                  <Badge variant="outline" class="text-[9px] py-0 px-1">{{ t("sandbox.toolCalled") }}</Badge>
                 </div>
                 <div class="text-muted-foreground text-[10px] break-all">
                   {{ JSON.stringify(tool.arguments) }}

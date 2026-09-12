@@ -137,10 +137,13 @@ def test_mark_all_read(client) -> None:
 
 @pytest.mark.asyncio
 async def test_hot_lead_creates_persistent_notification_via_webhook(db_session, monkeypatch) -> None:
+    import app.conversations.delivery as delivery
+    import app.instagram.pipeline as pipeline
     from app.ai.orchestrator import ConversationTurnResult
     from app.ai.provider.base import LLMProvider
-    from app.instagram.client import ConnectedAccount
-    from app.instagram.service import process_incoming_message
+
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(delivery, "PART_DELAY_SECONDS", 0)
 
     user = User(email=f"{uuid.uuid4()}@test.com", password_hash="x")
     db_session.add(user)
@@ -180,20 +183,20 @@ async def test_hot_lead_creates_persistent_notification_via_webhook(db_session, 
 
     class FakeMetaClient:
         async def send_message(self, **kwargs):
-            pass
+            return {"message_id": "out-1"}
 
-    import app.instagram.service as service_module
-    monkeypatch.setattr(service_module, "notify_hot_lead", lambda *args, **kwargs: True)
+        async def get_user_profile(self, user_id, access_token):
+            return {"username": "hot_customer"}
 
-    await process_incoming_message(
+    event_id = await pipeline.ingest_event(
         db_session,
-        FakeLLMProvider(),
-        FakeMetaClient(),
-        ig_recipient_id="ig-hot-biz-1",
-        customer_ig_scoped_id="cust-hot-notif-1",
-        message_text="90 123 45 67",
-        external_message_id="mid-hot-notif-1",
+        {
+            "kind": "message", "mid": "mid-hot-notif-1", "business_ig_id": "ig-hot-biz-1",
+            "customer_igsid": "cust-hot-notif-1", "text": "90 123 45 67",
+            "attachment_type": None, "attachment_url": None, "needs_transcription": False,
+        },
     )
+    await pipeline.process_event(event_id, provider=FakeLLMProvider(), meta_client=FakeMetaClient())
 
     # Verify notification exists in database
     notifs = (
@@ -224,17 +227,41 @@ async def test_broadcaster_publishes_to_connected_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_broadcaster_async_iterator_stream() -> None:
-    test_biz_id = uuid.uuid4()
-    subscriber = broadcaster.subscribe(test_biz_id)
+async def test_sse_stream_survives_heartbeats_and_unsubscribes_on_close(db_session, monkeypatch) -> None:
+    """Regression: the heartbeat timeout cancelled the subscription itself, so
+    every idle stream ended right after its first ping."""
+    import app.notifications.router as notif_router
+    from app.core.security import create_sse_ticket
 
-    async def fetch_one():
-        return await subscriber.__anext__()
+    monkeypatch.setattr(notif_router, "_HEARTBEAT_SECONDS", 0.05)
+    user = User(email=f"{uuid.uuid4()}@test.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    business = Business(owner_user_id=user.id, name="SSE Biz")
+    db_session.add(business)
+    await db_session.commit()
 
-    task = asyncio.create_task(fetch_one())
-    await asyncio.sleep(0.02)  # allow task to enter subscriber loop
-    payload = {"id": "n2", "title": "Stream test", "type": "lead_hot"}
-    await broadcaster.broadcast(test_biz_id, payload)
-    result = await asyncio.wait_for(task, timeout=1.0)
-    assert result == payload
-    await subscriber.aclose()
+    response = await notif_router.stream_notifications(ticket=create_sse_ticket(str(user.id)))
+    stream = response.body_iterator
+
+    async def next_event() -> str:
+        return await asyncio.wait_for(stream.__anext__(), timeout=2.0)
+
+    assert (await next_event()).startswith("event: connected")
+    assert (await next_event()).startswith("event: ping")
+    assert (await next_event()).startswith("event: ping")  # still alive after a heartbeat
+    await broadcaster.broadcast(business.id, {"id": "n2", "type": "lead_hot"})
+    assert '"id": "n2"' in await next_event()
+    assert broadcaster.subscriber_count(business.id) == 1
+    await stream.aclose()
+    assert broadcaster.subscriber_count(business.id) == 0
+
+
+def test_sse_stream_rejects_an_access_token_as_ticket(client) -> None:
+    """The stream only accepts its own short-lived ticket — never the access
+    token, which used to be put in the URL (and so in access logs)."""
+    headers = create_business_and_headers("sse@test.com", "SSE Biz")
+    access_token = headers["Authorization"].removeprefix("Bearer ")
+    assert client.get(f"/notifications/stream?ticket={access_token}").status_code == 401
+    ticket = client.post("/notifications/stream-ticket", headers=headers)
+    assert ticket.status_code == 200 and ticket.json()["expires_in"] == 60

@@ -1,7 +1,7 @@
 import datetime as dt
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,6 +13,12 @@ class Discount(Base, UUIDPk):
     """Structured discount and promotion model owned by a tenant business."""
 
     __tablename__ = "discounts"
+    __table_args__ = (
+        CheckConstraint("discount_type IN ('percentage', 'fixed')", name="ck_discounts_type"),
+        CheckConstraint(
+            "value >= 0 AND (discount_type <> 'percentage' OR value <= 100)", name="ck_discounts_value"
+        ),
+    )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True

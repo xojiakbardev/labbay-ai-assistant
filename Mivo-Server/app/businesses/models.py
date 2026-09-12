@@ -1,7 +1,7 @@
 import datetime as dt
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, false
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,7 +30,13 @@ class Business(Base, UUIDPk, TimestampMixin):
     payment_info: Mapped[str | None] = mapped_column(Text, nullable=True)
     handoff_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # The owner's own on/off switch (AI settings page).
     ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # The platform's kill switch — superadmin only, and the owner has no way to
+    # override it. AI replies need ai_enabled AND NOT ai_suspended.
+    ai_suspended: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     ui_preferences: Mapped[dict | None] = mapped_column(
         JSONB, default=dict, server_default="{}", nullable=True
     )

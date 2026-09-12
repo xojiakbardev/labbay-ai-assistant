@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { Product, Variant } from "~/types/api";
-import { ApiError } from "~/composables/useApi";
+import type { ImageInput, ProductImage, ProductInput, ProductPatch, VariantInput } from "~/types/api";
+import { IMAGE_UPLOAD_MAX_BYTES, imageUploadProblem } from "~/lib/utils";
 import {
   ArrowLeft,
   Save,
@@ -14,11 +14,11 @@ import {
   Info,
   Sparkles,
   X,
-  Settings2,
   Camera,
   Star,
   Upload,
-} from "lucide-vue-next";
+  Loader2,
+} from "@lucide/vue";
 
 // Shadcn Vue UI Components
 import { Button } from "@/components/ui/button";
@@ -63,9 +63,17 @@ const price = ref<string | number>("");
 const currency = ref("UZS");
 const category = ref("Poyabzal");
 const availability = ref(true);
+// The main photo: its URL (typed, uploaded, or the product's current primary
+// image) — or a picked file, uploaded on save.
 const imageUrl = ref("");
 const selectedImageFile = ref<File | null>(null);
 const imagePreviewUrl = ref<string | null>(null);
+
+// Edit mode: the server's state, which the PATCH is computed against.
+const serverImages = ref<ProductImage[]>([]);
+const originalPrimaryUrl = ref<string | null>(null);
+// Attribute keys this form doesn't edit (e.g. from an AI import) are kept.
+const originalAttributes = ref<Record<string, any>>({});
 
 // Attributes
 const material = ref("");
@@ -74,7 +82,41 @@ const gender = ref("unisex");
 const aiInstructions = ref("");
 
 // Variants
-const variants = ref<Variant[]>([]);
+interface FormVariant {
+  id?: string;
+  variant_type: string;
+  color: string;
+  size: string;
+  value: string;
+  attributes: Record<string, any>;
+  sku: string | null;
+  barcode: string | null;
+  price_override: string | number | null;
+  stock_quantity: string | number | null;
+  image_url: string | null;
+  images: string[];
+  new_image_url: string;
+  availability: boolean;
+  // Photo uploads still in flight for this variant.
+  uploading: number;
+}
+
+const variants = ref<FormVariant[]>([]);
+const uploadingVariantImages = computed(() => variants.value.some((v) => v.uploading > 0));
+
+function errorText(err: unknown): string {
+  return err instanceof Error && err.message ? err.message : t("productForm.saveError");
+}
+
+function uploadProblemText(problem: "type" | "size", fileName: string): string {
+  return problem === "type"
+    ? t("productForm.imageTypeInvalid", { name: fileName })
+    : t("productForm.imageTooLarge", { name: fileName, mb: IMAGE_UPLOAD_MAX_BYTES / (1024 * 1024) });
+}
+
+function isHttpUrl(url: string): boolean {
+  return /^https?:\/\/\S+$/i.test(url);
+}
 
 // Categories State & Management
 const defaultCategories = [
@@ -148,7 +190,6 @@ function confirmAddCategory() {
 function addVariantRow(color: string = "", size: string = "") {
   const c = color.trim();
   const s = size.trim();
-  const val = c && s ? `${c} / ${s}` : c || s || "";
   const attrs: Record<string, any> = {};
   if (c) attrs.color = c;
   if (s) attrs.size = s;
@@ -157,7 +198,7 @@ function addVariantRow(color: string = "", size: string = "") {
     variant_type: "combination",
     color: c,
     size: s,
-    value: val,
+    value: c && s ? `${c} / ${s}` : c || s || "",
     attributes: attrs,
     sku: null,
     barcode: null,
@@ -167,10 +208,11 @@ function addVariantRow(color: string = "", size: string = "") {
     images: [],
     new_image_url: "",
     availability: true,
-  } as any);
+    uploading: 0,
+  });
 }
 
-function updateVariantValue(v: any) {
+function updateVariantValue(v: FormVariant) {
   const c = (v.color || "").trim();
   const s = (v.size || "").trim();
   if (c && s) {
@@ -178,7 +220,6 @@ function updateVariantValue(v: any) {
   } else {
     v.value = c || s || v.value || "";
   }
-  if (!v.attributes) v.attributes = {};
   if (c) v.attributes.color = c;
   if (s) v.attributes.size = s;
 }
@@ -200,7 +241,7 @@ function generateSkuCode(c: string = "", s: string = ""): string {
 }
 
 function autoGenerateAllSkus() {
-  for (const v of variants.value as any[]) {
+  for (const v of variants.value) {
     if (!v.sku || !v.sku.trim()) {
       v.sku = generateSkuCode(v.color, v.size);
     }
@@ -211,20 +252,10 @@ function parseImageUrls(raw: string): string[] {
   const trimmed = raw.trim();
   if (!trimmed) return [];
 
-  // If base64 data URI, NEVER split by comma (data URI always has a comma separating header and data)
-  if (trimmed.startsWith("data:")) {
-    return [trimmed];
-  }
-
-  // Split by newlines
   const lines = trimmed.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   const result: string[] = [];
 
   for (const line of lines) {
-    if (line.startsWith("data:")) {
-      result.push(line);
-      continue;
-    }
     // If line has multiple http/https URLs
     if ((line.match(/https?:\/\//g) || []).length > 1) {
       const parts = line
@@ -241,71 +272,97 @@ function parseImageUrls(raw: string): string[] {
   return result;
 }
 
-function addSkuImage(v: any) {
-  const raw = (v.new_image_url || "").trim();
-  if (!raw) return;
-  const parts = parseImageUrls(raw);
-  if (!v.images) v.images = [];
-  for (const p of parts) {
-    if (!v.images.includes(p)) {
-      v.images.push(p);
-    }
+// Typed URLs must be http(s) links — the server rejects anything else
+// (a photo from the device goes through the upload button instead).
+// Returns false when something typed was rejected.
+function addSkuImage(v: FormVariant): boolean {
+  const parts = parseImageUrls(v.new_image_url || "");
+  const invalid = parts.filter((p) => !isHttpUrl(p));
+  for (const p of parts.filter(isHttpUrl)) {
+    if (!v.images.includes(p)) v.images.push(p);
   }
   if (!v.image_url && v.images.length > 0) {
-    v.image_url = v.images[0];
+    v.image_url = v.images[0]!;
+  }
+  if (invalid.length > 0) {
+    v.new_image_url = invalid.join("\n");
+    error.value = t("productForm.imageUrlInvalid");
+    return false;
   }
   v.new_image_url = "";
+  return true;
 }
 
-function onVariantFileSelect(e: Event, v: any) {
+// Device photos are uploaded right away (POST /products/media) and the
+// variant stores the returned URL — never the file inlined as base64.
+async function onVariantFileSelect(e: Event, v: FormVariant) {
   const target = e.target as HTMLInputElement;
-  if (!target.files || target.files.length === 0) return;
-  const files = Array.from(target.files);
-  for (const file of files) {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        if (!v.images) v.images = [];
-        v.images.push(dataUrl);
-        if (!v.image_url) {
-          v.image_url = dataUrl;
-        }
-      }
-    };
-    reader.readAsDataURL(file);
-  }
+  const files = Array.from(target.files ?? []);
   target.value = "";
+  for (const file of files) {
+    const problem = imageUploadProblem(file);
+    if (problem) {
+      error.value = uploadProblemText(problem, file.name);
+      continue;
+    }
+    v.uploading++;
+    try {
+      const { url } = await api.uploadProductMedia(file);
+      if (!v.images.includes(url)) v.images.push(url);
+      if (!v.image_url) v.image_url = url;
+    } catch (err) {
+      error.value = t("productForm.imageUploadFailed", { name: file.name, reason: errorText(err) });
+    } finally {
+      v.uploading--;
+    }
+  }
 }
 
-function setPrimarySkuImage(v: any, index: number) {
-  if (!v.images || !v.images[index]) return;
+function setPrimarySkuImage(v: FormVariant, index: number) {
   const selected = v.images[index];
+  if (!selected) return;
   v.images.splice(index, 1);
   v.images.unshift(selected);
   v.image_url = selected;
 }
 
-function removeSkuImage(v: any, index: number) {
-  if (!v.images) return;
+function removeSkuImage(v: FormVariant, index: number) {
   const removed = v.images.splice(index, 1)[0];
   if (v.image_url === removed) {
-    v.image_url = v.images.length > 0 ? v.images[0] : null;
+    v.image_url = v.images.length > 0 ? v.images[0]! : null;
   }
+}
+
+function clearSelectedFile() {
+  selectedImageFile.value = null;
+  if (imagePreviewUrl.value) URL.revokeObjectURL(imagePreviewUrl.value);
+  imagePreviewUrl.value = null;
 }
 
 function onFileSelect(e: Event) {
   const target = e.target as HTMLInputElement;
-  if (target.files && target.files.length > 0) {
-    const file = target.files[0];
-    selectedImageFile.value = file;
-    imagePreviewUrl.value = URL.createObjectURL(file);
+  const file = target.files?.[0];
+  target.value = "";
+  if (!file) return;
+  const problem = imageUploadProblem(file);
+  if (problem) {
+    error.value = uploadProblemText(problem, file.name);
+    return;
   }
+  clearSelectedFile();
+  // The picked file replaces the current main photo when saved.
+  imageUrl.value = "";
+  selectedImageFile.value = file;
+  imagePreviewUrl.value = URL.createObjectURL(file);
+}
+
+// Typing a URL replaces a picked-but-not-yet-uploaded file.
+function onImageUrlInput() {
+  if (selectedImageFile.value) clearSelectedFile();
 }
 
 function clearImage() {
-  selectedImageFile.value = null;
-  imagePreviewUrl.value = null;
+  clearSelectedFile();
   imageUrl.value = "";
 }
 
@@ -328,8 +385,9 @@ onMounted(async () => {
       price.value = p.price !== null && p.price !== undefined ? p.price : "";
       currency.value = p.currency || "UZS";
       availability.value = p.availability ?? true;
+      originalAttributes.value = { ...(p.attributes || {}) };
 
-      const pCat = p.category || (p.attributes?.category as string) || "Poyabzal";
+      const pCat = (p.attributes?.category as string) || "Poyabzal";
       if (!availableCategories.value.includes(pCat)) {
         availableCategories.value.unshift(pCat);
       }
@@ -340,17 +398,15 @@ onMounted(async () => {
         fit.value = (p.attributes.fit as string) || "";
         gender.value = (p.attributes.gender as string) || "unisex";
         aiInstructions.value = (p.attributes.ai_instructions as string) || (p.attributes.ai_notes as string) || "";
-        if (p.attributes.image_url) {
-          imageUrl.value = p.attributes.image_url as string;
-        }
       }
 
-      if (p.images && p.images.length > 0) {
-        imageUrl.value = p.images[0].url;
-      }
+      serverImages.value = [...(p.images || [])];
+      const primary = serverImages.value.find((img) => img.is_primary) ?? serverImages.value[0];
+      originalPrimaryUrl.value = primary?.url ?? null;
+      imageUrl.value = primary?.url ?? "";
 
       variants.value = (p.variants || []).map((v) => {
-        const attrs = (v.attributes || {}) as Record<string, any>;
+        const attrs = { ...(v.attributes || {}) } as Record<string, any>;
         let color = attrs.color ? String(attrs.color).trim() : "";
         let size = attrs.size ? String(attrs.size).trim() : "";
         if (!color && !size && v.value) {
@@ -373,11 +429,12 @@ onMounted(async () => {
           barcode: v.barcode || null,
           price_override: v.price_override ?? null,
           stock_quantity: v.stock_quantity ?? null,
-          image_url: v.image_url || (v.images && v.images.length > 0 ? v.images[0] : null),
+          image_url: v.image_url || (v.images && v.images.length > 0 ? v.images[0]! : null),
           images: v.images && v.images.length > 0 ? [...v.images] : (v.image_url ? [v.image_url] : []),
           new_image_url: "",
           availability: v.availability ?? true,
-        } as any;
+          uploading: 0,
+        };
       });
     } catch (err) {
       error.value = t("productForm.fetchError");
@@ -387,44 +444,62 @@ onMounted(async () => {
   }
 });
 
-function normalizedVariants(): Variant[] {
-  return (variants.value as any[])
-    .filter((v) => (v.color && v.color.trim()) || (v.size && v.size.trim()) || (v.value && v.value.trim()))
-    .map((v) => {
-      const color = (v.color || "").trim();
-      const size = (v.size || "").trim();
-      let val = (v.value || "").trim();
-      if (color && size) {
-        val = `${color} / ${size}`;
-      } else if (color) {
-        val = color;
-      } else if (size) {
-        val = size;
-      }
+// --- Save --------------------------------------------------------------------
 
-      const attrs: Record<string, any> = { ...(v.attributes || {}) };
+function isBlank(value: string | number | null | undefined): boolean {
+  return value === null || value === undefined || String(value).trim() === "";
+}
+
+// Older versions of this form stored variant photos inline as data: URLs,
+// which the server now rejects. Such photos are uploaded as files on save so
+// an old product stays editable.
+function dataUrlToFile(dataUrl: string, index: number): File | null {
+  const match = /^data:([^;,]*)((?:;[^;,]*)*),(.*)$/s.exec(dataUrl);
+  if (!match) return null;
+  const mime = match[1] || "application/octet-stream";
+  const isBase64 = /;base64/i.test(match[2] ?? "");
+  const payload = match[3] ?? "";
+  const bytes = isBase64
+    ? Uint8Array.from(atob(payload), (ch) => ch.charCodeAt(0))
+    : new TextEncoder().encode(decodeURIComponent(payload));
+  const ext = mime.split("/")[1] || "bin";
+  return new File([bytes], `variant-photo-${index}.${ext}`, { type: mime });
+}
+
+async function uploadInlineVariantImages() {
+  let counter = 0;
+  for (const v of variants.value) {
+    const inline = v.images.filter((img) => img.startsWith("data:"));
+    if (v.image_url?.startsWith("data:") && !inline.includes(v.image_url)) inline.push(v.image_url);
+    for (const dataUrl of inline) {
+      const file = dataUrlToFile(dataUrl, ++counter);
+      const problem = file ? imageUploadProblem(file) : "type";
+      if (!file || problem) throw new Error(t("productForm.legacyImageInvalid", { variant: v.value || "—" }));
+      const { url } = await api.uploadProductMedia(file);
+      v.images = v.images.map((img) => (img === dataUrl ? url : img));
+      if (v.image_url === dataUrl) v.image_url = url;
+    }
+  }
+}
+
+function buildVariants(): VariantInput[] {
+  return variants.value
+    .filter((v) => v.color.trim() || v.size.trim() || v.value.trim())
+    .map((v) => {
+      const color = v.color.trim();
+      const size = v.size.trim();
+      const val = color && size ? `${color} / ${size}` : color || size || v.value.trim();
+
+      const attrs: Record<string, any> = { ...v.attributes };
       if (color) attrs.color = color;
       if (size) attrs.size = size;
 
-      if (v.new_image_url && v.new_image_url.trim()) {
-        const extra = parseImageUrls(v.new_image_url);
-        if (!v.images) v.images = [];
-        for (const e of extra) {
-          if (!v.images.includes(e)) v.images.push(e);
-        }
+      const images = v.images.filter((img) => img.trim().length > 0);
+      const primary = v.image_url?.trim() || images[0] || null;
+      if (primary && images.includes(primary)) {
+        images.splice(images.indexOf(primary), 1);
       }
-
-      const effectiveImages = (v.images || (v.image_url ? [v.image_url] : [])).filter((img: any) => typeof img === "string" && img.trim().length > 0);
-      const primaryImage = v.image_url?.trim() || (effectiveImages.length > 0 ? effectiveImages[0] : null);
-      if (primaryImage && effectiveImages.includes(primaryImage)) {
-        const pIdx = effectiveImages.indexOf(primaryImage);
-        if (pIdx > 0) {
-          effectiveImages.splice(pIdx, 1);
-          effectiveImages.unshift(primaryImage);
-        }
-      } else if (primaryImage && !effectiveImages.includes(primaryImage)) {
-        effectiveImages.unshift(primaryImage);
-      }
+      if (primary) images.unshift(primary);
 
       return {
         variant_type: "combination",
@@ -432,91 +507,148 @@ function normalizedVariants(): Variant[] {
         attributes: attrs,
         sku: v.sku?.trim() || null,
         barcode: v.barcode?.trim() || null,
-        price_override: v.price_override ? Number(v.price_override) : null,
-        stock_quantity:
-          v.stock_quantity === null || v.stock_quantity === undefined || String(v.stock_quantity) === ""
-            ? null
-            : Number(v.stock_quantity),
-        image_url: primaryImage,
-        images: effectiveImages,
+        price_override: isBlank(v.price_override) ? null : Number(v.price_override),
+        stock_quantity: isBlank(v.stock_quantity) ? null : Number(v.stock_quantity),
+        image_url: primary,
+        images,
         availability: v.availability,
       };
     });
 }
 
+// attributes.image_url mirrors the primary image (the server keeps it that
+// way when images change) — set it to what the primary will be after save.
+function buildAttributes(primaryUrl: string | null): Record<string, any> {
+  const attrs: Record<string, any> = { ...originalAttributes.value };
+  delete attrs.image_url;
+  delete attrs.ai_notes;
+  attrs.category = category.value || "Poyabzal";
+  const optional: Record<string, string> = {
+    material: material.value.trim(),
+    fit: fit.value.trim(),
+    gender: gender.value.trim(),
+    ai_instructions: aiInstructions.value.trim(),
+  };
+  for (const [key, value] of Object.entries(optional)) {
+    if (value) attrs[key] = value;
+    else delete attrs[key];
+  }
+  if (primaryUrl) attrs.image_url = primaryUrl;
+  return attrs;
+}
+
+/** Edit mode: the product's image list after save — the main photo as the
+ * only primary, the other existing images kept, and the previous primary
+ * dropped if the main photo was replaced or cleared. */
+function desiredImages(): ImageInput[] {
+  const main = imageUrl.value.trim() || null;
+  const replaced = originalPrimaryUrl.value && originalPrimaryUrl.value !== main ? originalPrimaryUrl.value : null;
+  const others = serverImages.value
+    .filter((img) => img.url !== main && img.url !== replaced)
+    .map((img) => ({ url: img.url, is_primary: false }));
+  return main ? [{ url: main, is_primary: true }, ...others] : others;
+}
+
+function primaryOf(images: { url: string; is_primary: boolean }[]): string | null {
+  return (images.find((img) => img.is_primary) ?? images[0])?.url ?? null;
+}
+
+// The server keeps rows for unchanged URLs and deletes removed ones, so
+// `images` is only sent when the list actually changed.
+function imagesChanged(desired: ImageInput[]): boolean {
+  const current = serverImages.value;
+  if (desired.length !== current.length) return true;
+  const currentUrls = new Set(current.map((img) => img.url));
+  if (desired.some((img) => !currentUrls.has(img.url))) return true;
+  return primaryOf(desired) !== primaryOf(current);
+}
+
+function validate(): string | null {
+  if (!name.value.trim()) return t("productForm.productNameRequired");
+  if (!isBlank(price.value)) {
+    const n = Number(price.value);
+    if (!Number.isFinite(n) || n < 0) return t("productForm.priceInvalid");
+  }
+  for (const v of variants.value) {
+    if (!isBlank(v.stock_quantity)) {
+      const n = Number(v.stock_quantity);
+      if (!Number.isInteger(n) || n < 0) return t("productForm.stockInvalid");
+    }
+    if (!isBlank(v.price_override)) {
+      const n = Number(v.price_override);
+      if (!Number.isFinite(n) || n < 0) return t("productForm.priceInvalid");
+    }
+  }
+  const typedUrl = imageUrl.value.trim();
+  if (typedUrl && !isHttpUrl(typedUrl)) return t("productForm.imageUrlInvalid");
+  return null;
+}
+
 async function onSubmit() {
-  if (!name.value.trim()) {
-    error.value = t("productForm.productNameRequired");
+  // Ctrl+S (or a second click) while a save is running must not save twice.
+  if (saving.value || loading.value) return;
+  if (uploadingVariantImages.value) {
+    error.value = t("productForm.waitForUploads");
+    return;
+  }
+  // A URL typed into a variant but not yet added counts too.
+  for (const v of variants.value) {
+    if (v.new_image_url.trim() && !addSkuImage(v)) return;
+  }
+  const problem = validate();
+  if (problem) {
+    error.value = problem;
     return;
   }
 
   error.value = null;
   saving.value = true;
 
-  const finalCategory = category.value || "Poyabzal";
-  const effectiveImageUrl = imageUrl.value.trim();
-
-  const attributesPayload: Record<string, any> = {
-    category: finalCategory,
-  };
-  if (effectiveImageUrl) attributesPayload.image_url = effectiveImageUrl;
-  if (material.value.trim()) attributesPayload.material = material.value.trim();
-  if (fit.value.trim()) attributesPayload.fit = fit.value.trim();
-  if (gender.value.trim()) attributesPayload.gender = gender.value.trim();
-  if (aiInstructions.value.trim()) attributesPayload.ai_instructions = aiInstructions.value.trim();
-
-  const imagesPayload = effectiveImageUrl
-    ? [{ url: effectiveImageUrl, is_primary: true }]
-    : [];
-
+  // Each step leaves the form in a state where pressing Save again resumes
+  // from where it failed: an uploaded file becomes the form's URL.
   try {
+    await uploadInlineVariantImages();
+    const base = {
+      name: name.value.trim(),
+      description: description.value.trim() || null,
+      price: isBlank(price.value) ? null : Number(price.value),
+      currency: currency.value,
+      availability: availability.value,
+      variants: buildVariants(),
+    };
+
     if (props.mode === "create") {
-      const created = await api.createProduct({
-        name: name.value.trim(),
-        description: description.value.trim() || null,
-        price: price.value !== "" && price.value !== null ? Number(price.value) : null,
-        currency: currency.value,
-        category: finalCategory,
-        availability: availability.value,
-        variants: normalizedVariants(),
-        attributes: attributesPayload,
-        images: imagesPayload as any,
-      });
-
-      if (selectedImageFile.value && created.id) {
-        try {
-          await api.uploadProductImage(created.id, selectedImageFile.value);
-        } catch (e) {
-          console.warn("Rasm yuklashda xatolik:", e);
-        }
+      // A new product has no id to attach an image to yet: the file goes to
+      // /products/media first and its URL is sent with the product.
+      if (selectedImageFile.value) {
+        const { url } = await api.uploadProductMedia(selectedImageFile.value);
+        clearSelectedFile();
+        imageUrl.value = url;
       }
-
+      const main = imageUrl.value.trim() || null;
+      const payload: ProductInput = {
+        ...base,
+        attributes: buildAttributes(main),
+        images: main ? [{ url: main, is_primary: true }] : [],
+      };
+      await api.createProduct(payload);
       router.push("/products");
     } else if (props.mode === "edit" && props.productId) {
-      await api.updateProduct(props.productId, {
-        name: name.value.trim(),
-        description: description.value.trim() || null,
-        price: price.value !== "" && price.value !== null ? Number(price.value) : null,
-        currency: currency.value,
-        category: finalCategory,
-        availability: availability.value,
-        variants: normalizedVariants(),
-        attributes: attributesPayload,
-        images: imagesPayload as any,
-      });
-
       if (selectedImageFile.value) {
-        try {
-          await api.uploadProductImage(props.productId, selectedImageFile.value);
-        } catch (e) {
-          console.warn("Rasm yuklashda xatolik:", e);
-        }
+        // Uploaded straight onto the product as its (only) primary image.
+        const img = await api.uploadProductImage(props.productId, selectedImageFile.value, true);
+        serverImages.value = [...serverImages.value.map((i) => ({ ...i, is_primary: false })), img];
+        clearSelectedFile();
+        imageUrl.value = img.url;
       }
-
+      const images = desiredImages();
+      const patch: ProductPatch = { ...base, attributes: buildAttributes(primaryOf(images)) };
+      if (imagesChanged(images)) patch.images = images;
+      await api.updateProduct(props.productId, patch);
       router.push("/products");
     }
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : t("productForm.saveError");
+    error.value = errorText(err);
   } finally {
     saving.value = false;
   }
@@ -535,6 +667,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
+  if (imagePreviewUrl.value) URL.revokeObjectURL(imagePreviewUrl.value);
 });
 </script>
 
@@ -570,7 +703,7 @@ onUnmounted(() => {
           variant="default"
           size="sm"
           class="h-9 px-5 gap-2 font-semibold"
-          :disabled="saving || loading || !name.trim()"
+          :disabled="saving || loading || uploadingVariantImages || !name.trim()"
           @click="onSubmit"
         >
           <Save v-if="!saving" :size="16" />
@@ -604,7 +737,7 @@ onUnmounted(() => {
           </div>
           <!-- Compact Sotuvda mavjud switch -->
           <label class="flex items-center gap-2 cursor-pointer">
-            <Switch v-model:checked="availability" />
+            <Switch v-model="availability" />
             <span class="text-xs font-semibold text-foreground">{{ t("productForm.inStock") }}</span>
           </label>
         </div>
@@ -669,6 +802,7 @@ onUnmounted(() => {
               <Input
                 v-model="price"
                 type="number"
+                min="0"
                 step="any"
                 class="flex-1"
                 placeholder="149000"
@@ -741,6 +875,7 @@ onUnmounted(() => {
                 v-model="imageUrl"
                 type="url"
                 placeholder="https://example.com/rasm.jpg"
+                @input="onImageUrlInput"
               />
             </div>
             <div class="space-y-1">
@@ -749,7 +884,7 @@ onUnmounted(() => {
               </Label>
               <input
                 type="file"
-                accept="image/*"
+                accept="image/jpeg,image/png,image/webp"
                 class="w-full text-xs text-muted-foreground file:mr-2 file:py-1 file:px-2.5 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-muted file:text-foreground hover:file:bg-muted/80 cursor-pointer"
                 @change="onFileSelect"
               />
@@ -861,7 +996,7 @@ onUnmounted(() => {
                       #{{ idx + 1 }}
                     </span>
                     <span>
-                      {{ (v as any).color || (v as any).size ? [(v as any).color, (v as any).size].filter(Boolean).join(" • ") : t("productForm.newVariant") }}
+                      {{ v.color || v.size ? [v.color, v.size].filter(Boolean).join(" • ") : t("productForm.newVariant") }}
                     </span>
                   </div>
                   <div class="text-[11px] text-muted-foreground font-mono mt-0.5">
@@ -907,8 +1042,8 @@ onUnmounted(() => {
                   {{ t("productForm.color") }}
                 </Label>
                 <Input
-                  v-model="(v as any).color"
-                  placeholder="Masalan: Qora"
+                  v-model="v.color"
+                  :placeholder="t('productForm.colorPlaceholder')"
                   class="h-8 text-xs font-medium"
                   @input="updateVariantValue(v)"
                 />
@@ -920,8 +1055,8 @@ onUnmounted(() => {
                   {{ t("productForm.size") }}
                 </Label>
                 <Input
-                  v-model="(v as any).size"
-                  placeholder="Masalan: M yoki 42"
+                  v-model="v.size"
+                  :placeholder="t('productForm.sizePlaceholder')"
                   class="h-8 text-xs font-medium"
                   @input="updateVariantValue(v)"
                 />
@@ -1016,11 +1151,12 @@ onUnmounted(() => {
                   class="h-8 px-3 text-xs gap-1.5 cursor-pointer shrink-0 font-medium inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground transition-colors shadow-xs"
                   :title="t('productForm.pickFromDevice')"
                 >
-                  <Upload :size="13" class="text-primary" />
-                  <span class="hidden sm:inline">{{ t("productForm.selectFile") }}</span>
+                  <Loader2 v-if="v.uploading > 0" :size="13" class="text-primary animate-spin" />
+                  <Upload v-else :size="13" class="text-primary" />
+                  <span class="hidden sm:inline">{{ v.uploading > 0 ? t("productForm.uploading") : t("productForm.selectFile") }}</span>
                   <input
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp"
                     multiple
                     class="hidden"
                     @change="onVariantFileSelect($event, v)"
@@ -1166,7 +1302,7 @@ onUnmounted(() => {
           variant="default"
           size="default"
           class="h-9 px-6 gap-2 font-semibold"
-          :disabled="saving || loading || !name.trim()"
+          :disabled="saving || loading || uploadingVariantImages || !name.trim()"
           @click="onSubmit"
         >
           <Save v-if="!saving" :size="16" />

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { z } from "zod";
 import { ApiError } from "~/composables/useApi";
-import type { Locale } from "~/composables/useI18n";
 
 definePageMeta({ layout: "default" });
 
@@ -16,17 +15,29 @@ const loading = ref(false);
 // Login is whatever identifier was set for this account (username, phone, or key)
 const loginSchema = computed(() =>
   z.object({
-    loginKey: z.string().min(1, t("auth.loginRequired") || t("auth.emailRequired")),
+    loginKey: z.string().min(1, t("auth.loginRequired")),
     password: z.string().min(1, t("auth.passwordRequired")),
   })
 );
 
+function loginErrorText(err: unknown): string {
+  if (err instanceof ApiError && err.status === 429) {
+    // Retry-After is in seconds; it's absent when the header isn't readable.
+    return err.retryAfter !== null
+      ? t("auth.tooManyAttempts", { minutes: Math.max(1, Math.ceil(err.retryAfter / 60)) })
+      : t("auth.tooManyAttemptsNoTime");
+  }
+  if (err instanceof ApiError && err.status === 401) return t("auth.loginFailed");
+  return err instanceof Error && err.message ? err.message : t("auth.loginFailed");
+}
+
 async function onSubmit() {
+  if (loading.value) return;
   error.value = null;
 
   const result = loginSchema.value.safeParse({ loginKey: loginKey.value, password: password.value });
   if (!result.success) {
-    error.value = result.error.issues[0]?.message ?? (t("auth.loginInvalid") || t("auth.emailInvalid"));
+    error.value = result.error.issues[0]?.message ?? t("auth.loginInvalid");
     return;
   }
 
@@ -35,7 +46,7 @@ async function onSubmit() {
     await signIn(result.data.loginKey, result.data.password);
     await navigateTo(isSuperadmin.value ? "/superadmin" : "/");
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : t("auth.loginFailed");
+    error.value = loginErrorText(err);
   } finally {
     loading.value = false;
   }
@@ -59,7 +70,7 @@ async function onSubmit() {
       <CardContent class="pt-2">
         <form class="space-y-4" @submit.prevent="onSubmit">
           <div class="space-y-1.5">
-            <Label for="login-key" class="text-xs font-medium text-foreground/80">{{ t("auth.loginPlaceholder") || t("auth.emailPlaceholder") }}</Label>
+            <Label for="login-key" class="text-xs font-medium text-foreground/80">{{ t("auth.loginPlaceholder") }}</Label>
             <Input
               id="login-key"
               v-model="loginKey"

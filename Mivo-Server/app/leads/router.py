@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,13 +16,18 @@ router = APIRouter(prefix="/leads", tags=["leads"])
 
 @router.get("", response_model=list[LeadOut])
 async def list_leads(
-    business: Business = Depends(get_current_business), db: AsyncSession = Depends(get_db)
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    business: Business = Depends(get_current_business),
+    db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
         select(Lead, Customer)
         .join(Customer, Lead.customer_id == Customer.id)
         .where(Lead.business_id == business.id)
-        .order_by(Lead.updated_at.desc())
+        .order_by(Lead.updated_at.desc(), Lead.id)
+        .limit(limit)
+        .offset(offset)
     )
     items = []
     for lead, cust in result.all():

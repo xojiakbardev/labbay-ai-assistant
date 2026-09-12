@@ -23,6 +23,17 @@ MODEL = "text-embedding-3-large"
 DIMS = 1536
 
 
+@pytest.fixture(autouse=True)
+def _reset_embedding_cooldown():
+    """A failed embedding call switches the semantic tier off for a minute —
+    tests must not inherit that from each other."""
+    search._embedding_down_until = 0.0
+    search._QUERY_VECTOR_CACHE.clear()
+    yield
+    search._embedding_down_until = 0.0
+    search._QUERY_VECTOR_CACHE.clear()
+
+
 class _Variant:
     def __init__(self, value):
         self.value = value
@@ -142,16 +153,71 @@ async def test_search_survives_the_embedding_api_being_down(monkeypatch) -> None
     class _Broken:
         model = MODEL
         dimensions = DIMS
+        calls = 0
 
-        async def embed_query(self, text):
+        async def embed_query(self, text, timeout=None):
+            _Broken.calls += 1
             raise EmbeddingError("API down")
 
     monkeypatch.setattr(search, "get_embedding_provider", lambda: _Broken())
-    results = await search._semantic_candidates(
+    for query in ("krossovka", "boshqa so'rov"):
+        results = await search._semantic_candidates(
+            None, uuid.uuid4(), query=query, price_max=None,
+            only_available=True, limit=5, color=None, size=None,
+        )
+        assert results == []
+    # After one failure the tier sits out instead of making every search in
+    # the turn wait on the same dead API again.
+    assert _Broken.calls == 1
+
+
+async def test_a_database_error_in_the_semantic_tier_does_not_poison_the_session(db_session, monkeypatch) -> None:
+    """Regression: the semantic query failing inside Postgres (e.g. a vector
+    width mismatch) left the transaction aborted, so every later statement of
+    the turn — the reply, the lead — failed. It runs in a SAVEPOINT now."""
+    from sqlalchemy import text
+
+    from app.auth.models import User
+    from app.businesses.models import Business
+
+    user = User(email=f"{uuid.uuid4()}@test.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    business = Business(owner_user_id=user.id, name="Savepoint Biz")
+    db_session.add(business)
+    await db_session.flush()
+
+    class _WrongWidthButClaimsRight:
+        model = MODEL
+        dimensions = DIMS
+
+        async def embed_query(self, text, timeout=None):
+            return [0.1] * DIMS
+
+    monkeypatch.setattr(search, "get_embedding_provider", lambda: _WrongWidthButClaimsRight())
+    # Force the query itself to fail inside Postgres.
+    monkeypatch.setattr(search, "_SEMANTIC_MAX_DISTANCE", "not-a-number")
+    assert await search._semantic_candidates(
+        db_session, business.id, query="krossovka", price_max=None,
+        only_available=True, limit=5, color=None, size=None,
+    ) == []
+    # The session is still usable.
+    assert (await db_session.execute(text("SELECT 1"))).scalar() == 1
+
+
+async def test_a_vector_of_the_wrong_width_is_never_queried(monkeypatch) -> None:
+    class _Wrong:
+        model = MODEL
+        dimensions = DIMS
+
+        async def embed_query(self, text, timeout=None):
+            return [0.1] * 12
+
+    monkeypatch.setattr(search, "get_embedding_provider", lambda: _Wrong())
+    assert await search._semantic_candidates(
         None, uuid.uuid4(), query="krossovka", price_max=None,
         only_available=True, limit=5, color=None, size=None,
-    )
-    assert results == []
+    ) == []
 
 
 async def test_no_provider_means_no_semantic_tier(monkeypatch) -> None:
@@ -169,7 +235,7 @@ async def test_an_empty_query_is_never_embedded(monkeypatch) -> None:
         model = MODEL
         dimensions = DIMS
 
-        async def embed_query(self, text):
+        async def embed_query(self, text, timeout=None):
             raise AssertionError("should not have been called")
 
     monkeypatch.setattr(search, "get_embedding_provider", lambda: _NeverCalled())

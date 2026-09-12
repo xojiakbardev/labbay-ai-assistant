@@ -84,7 +84,7 @@ def test_tenant_isolation_push(client) -> None:
     client.post(
         "/push/subscribe",
         json={
-            "endpoint": "https://push.service.com/t1-device",
+            "endpoint": "https://fcm.googleapis.com/fcm/send/t1-device",
             "keys": {"p256dh": "k1", "auth": "a1"},
         },
         headers=headers1,
@@ -97,11 +97,34 @@ def test_tenant_isolation_push(client) -> None:
     # Tenant 2 tries to unsubscribe Tenant 1's endpoint -> does not affect Tenant 1
     client.post(
         "/push/unsubscribe",
-        json={"endpoint": "https://push.service.com/t1-device"},
+        json={"endpoint": "https://fcm.googleapis.com/fcm/send/t1-device"},
         headers=headers2,
     )
     resp1 = client.get("/push/status", headers=headers1)
     assert resp1.json() == {"subscribed": True, "devices_count": 1}
+
+
+def test_subscription_endpoint_must_be_a_real_push_service(client) -> None:
+    """The server POSTs to the endpoint: anything but a browser push service
+    would turn /push/test into a way to reach internal addresses (SSRF)."""
+    headers = create_business_and_headers("push_ssrf@test.com", "Push SSRF")
+    for endpoint in (
+        "http://169.254.169.254/latest/meta-data/",
+        "http://db:5432/",
+        "https://fcm.googleapis.com.evil.example/x",
+        "http://fcm.googleapis.com/fcm/send/x",
+        "https://fcm.googleapis.com:8443/x",
+    ):
+        resp = client.post(
+            "/push/subscribe", json={"endpoint": endpoint, "keys": {"p256dh": "k", "auth": "a"}}, headers=headers
+        )
+        assert resp.status_code == 422, endpoint
+    ok = client.post(
+        "/push/subscribe",
+        json={"endpoint": "https://web.push.apple.com/QGuQyavXutnMei", "keys": {"p256dh": "k", "auth": "a"}},
+        headers=headers,
+    )
+    assert ok.status_code == 200
 
 
 async def test_invalid_subscription_cleanup_on_410_gone(db_session, monkeypatch) -> None:
@@ -150,11 +173,16 @@ async def test_invalid_subscription_cleanup_on_410_gone(db_session, monkeypatch)
 
 
 async def test_hot_lead_triggers_push_notification_via_webhook(db_session, monkeypatch) -> None:
+    import app.conversations.delivery as delivery
+    import app.instagram.pipeline as pipeline
+    import app.notifications.owner_alerts as owner_alerts
     from app.ai.orchestrator import ConversationTurnResult
     from app.ai.provider.base import LLMProvider
-    from app.instagram.service import process_incoming_message
     from app.core.security import encrypt_secret
     from app.instagram.models import InstagramAccount
+
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(delivery, "PART_DELAY_SECONDS", 0)
 
     user = User(email=f"{uuid.uuid4()}@test.com", password_hash="x")
     db_session.add(user)
@@ -181,9 +209,7 @@ async def test_hot_lead_triggers_push_notification_via_webhook(db_session, monke
         push_calls.append({"title": title, "body": body, "url": url, "tag": tag})
         return 1
 
-    import app.instagram.service as service_module
-    monkeypatch.setattr(service_module, "send_push_notification", fake_push)
-    monkeypatch.setattr(service_module, "notify_hot_lead", lambda *args, **kwargs: True)
+    monkeypatch.setattr(owner_alerts, "send_push_notification", fake_push)
 
     class FakeLLMProvider(LLMProvider):
         async def generate_structured(self, **kwargs):
@@ -200,17 +226,20 @@ async def test_hot_lead_triggers_push_notification_via_webhook(db_session, monke
 
     class FakeMetaClient:
         async def send_message(self, **kwargs):
-            pass
+            return {"message_id": "out-push-1"}
 
-    await process_incoming_message(
+        async def get_user_profile(self, user_id, access_token):
+            return {"username": "push_customer"}
+
+    event_id = await pipeline.ingest_event(
         db_session,
-        FakeLLMProvider(),
-        FakeMetaClient(),
-        ig_recipient_id="ig-push-biz-1",
-        customer_ig_scoped_id="cust-push-hot-1",
-        message_text="+998 90 123 45 67",
-        external_message_id="mid-push-hot-1",
+        {
+            "kind": "message", "mid": "mid-push-hot-1", "business_ig_id": "ig-push-biz-1",
+            "customer_igsid": "cust-push-hot-1", "text": "+998 90 123 45 67",
+            "attachment_type": None, "attachment_url": None, "needs_transcription": False,
+        },
     )
+    await pipeline.process_event(event_id, provider=FakeLLMProvider(), meta_client=FakeMetaClient())
 
     assert len(push_calls) == 1
     assert "Yangi Issiq Lid" in push_calls[0]["title"]

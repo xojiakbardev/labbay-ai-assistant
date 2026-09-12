@@ -38,14 +38,32 @@ class FakeMetaClient:
 
     async def send_message(self, *, ig_business_id, access_token, recipient_id, text):
         self.sent_messages.append(text)
+        return {"message_id": f"out-{len(self.sent_messages)}"}
+
+    async def get_user_profile(self, user_id, access_token):
+        return {"username": "e2e_customer"}
 
 
 class FakeTelegramClient:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
 
-    async def send_message(self, chat_id: str, text: str) -> None:
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None, **kwargs) -> dict:
         self.sent.append((chat_id, text))
+        return {"ok": True}
+
+
+def _post_webhook(client, mid: str, text: str):
+    from tests.conftest import sign_webhook
+
+    body, headers = sign_webhook(
+        {"entry": [{"messaging": [{
+            "sender": {"id": "customer-e2e-1"},
+            "recipient": {"id": "ig-biz-e2e"},
+            "message": {"mid": mid, "text": text},
+        }]}]}
+    )
+    return client.post("/webhooks/instagram", content=body, headers=headers)
 
 
 class ScriptedProvider(LLMProvider):
@@ -85,10 +103,14 @@ class ScriptedProvider(LLMProvider):
 
 
 def test_full_mvp_flow_end_to_end(client, monkeypatch) -> None:
-    import app.instagram.service as service_module
+    from urllib.parse import parse_qs, urlsplit
 
-    # See app/instagram/service.py:DEBOUNCE_SECONDS — skip the real wait in tests.
-    monkeypatch.setattr(service_module, "DEBOUNCE_SECONDS", 0)
+    import app.conversations.delivery as delivery
+    import app.instagram.pipeline as pipeline
+
+    # Skip the real debounce / typing pauses in tests.
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(delivery, "PART_DELAY_SECONDS", 0)
 
     fake_meta = FakeMetaClient()
     fake_telegram = FakeTelegramClient()
@@ -115,7 +137,11 @@ def test_full_mvp_flow_end_to_end(client, monkeypatch) -> None:
             follow_redirects=False,
         )
         assert callback.status_code in (302, 307)
-        assert "instagram_connected=1" in callback.headers["location"]
+        completion_id = parse_qs(urlsplit(callback.headers["location"]).query)["instagram_pending"][0]
+        completed = client.post(
+            "/integrations/instagram/complete", json={"completion_id": completion_id}, headers=headers
+        )
+        assert completed.status_code == 200 and completed.json()["connected"] is True
 
         # 3. Connect Telegram.
         connect_tg = client.post("/integrations/telegram/connect", headers=headers).json()
@@ -162,20 +188,7 @@ def test_full_mvp_flow_end_to_end(client, monkeypatch) -> None:
         assert settings_resp.status_code == 200
 
         # 6. Customer sends a first Instagram DM — generic product interest.
-        webhook_1 = {
-            "entry": [
-                {
-                    "messaging": [
-                        {
-                            "sender": {"id": "customer-e2e-1"},
-                            "recipient": {"id": "ig-biz-e2e"},
-                            "message": {"mid": "mid-e2e-1", "text": "Salom, hoodie bormi?"},
-                        }
-                    ]
-                }
-            ]
-        }
-        resp1 = client.post("/webhooks/instagram", json=webhook_1)
+        resp1 = _post_webhook(client, "mid-e2e-1", "Salom, hoodie bormi?")
         assert resp1.status_code == 200
         assert fake_meta.sent_messages == ["Hoodie 250 000 so'm, qora M razmer mavjud. Olishni xohlaysizmi?"]
 
@@ -186,20 +199,7 @@ def test_full_mvp_flow_end_to_end(client, monkeypatch) -> None:
         assert leads_after_first[0]["status"] == "warm"
 
         # 7. Customer shows purchase intent and provides a phone number.
-        webhook_2 = {
-            "entry": [
-                {
-                    "messaging": [
-                        {
-                            "sender": {"id": "customer-e2e-1"},
-                            "recipient": {"id": "ig-biz-e2e"},
-                            "message": {"mid": "mid-e2e-2", "text": "+998901234567"},
-                        }
-                    ]
-                }
-            ]
-        }
-        resp2 = client.post("/webhooks/instagram", json=webhook_2)
+        resp2 = _post_webhook(client, "mid-e2e-2", "+998901234567")
         assert resp2.status_code == 200
 
         # 8. HOT lead created and persisted.
@@ -217,20 +217,7 @@ def test_full_mvp_flow_end_to_end(client, monkeypatch) -> None:
         assert "HOT LEAD" in notification_text
 
         # 10. A third message from the same now-hot customer must not re-notify.
-        webhook_3 = {
-            "entry": [
-                {
-                    "messaging": [
-                        {
-                            "sender": {"id": "customer-e2e-1"},
-                            "recipient": {"id": "ig-biz-e2e"},
-                            "message": {"mid": "mid-e2e-3", "text": "Salom yana"},
-                        }
-                    ]
-                }
-            ]
-        }
-        client.post("/webhooks/instagram", json=webhook_3)
+        _post_webhook(client, "mid-e2e-3", "Salom yana")
         assert len(fake_telegram.sent) == 1  # still just one notification
     finally:
         app.dependency_overrides.pop(get_meta_client, None)

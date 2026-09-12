@@ -1,75 +1,79 @@
-# Mivo — Backend (`server/`)
+# Mivo — Backend (`Mivo-Server/`)
 
-FastAPI + PostgreSQL. Fully self-contained: everything needed to run and
-deploy the backend lives in this folder. See `MIVO_MVP.md` in this folder for
-the full product/architecture spec.
+FastAPI + PostgreSQL (pgvector). Everything needed to run and deploy the
+backend lives in this folder.
 
 ## Local development
 
 ```bash
-cp .env.example .env   # fill in real secrets
+cp .env.example .env             # fill in the REQUIRED values (the app refuses to start without them)
 uv sync                          # creates .venv from pyproject.toml/uv.lock (incl. dev deps)
-docker compose up db -d          # Postgres only, or run your own local instance
+docker compose up db -d          # Postgres + pgvector on 127.0.0.1:5432
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --reload
 ```
 
+Or everything in Docker: `docker compose up -d --build` (API on
+`127.0.0.1:8000`, source bind-mounted with `--reload`).
+
 Dependencies live in `pyproject.toml`/`uv.lock`, managed with [uv](https://docs.astral.sh/uv/).
-Add a runtime dependency with `uv add <pkg>`, a dev-only one with
-`uv add --dev <pkg>`; either updates both files — commit both. Plain
-`uv sync` re-installs from the lockfile (add `--no-dev` to skip test-only
-packages, e.g. for prod).
+`uv add <pkg>` / `uv add --dev <pkg>` update both files — commit both.
 
-Tests: `.venv/bin/pytest`.
-
-## Docker (this folder only — no nginx, no client)
-
-```bash
-docker compose up -d --build
-curl http://localhost:8000/health
-```
+Tests need a Postgres with the `vector` extension and a `mivo_test` database:
+`.venv/bin/pytest`. A failed migration fails the test run.
 
 ## Production
 
+`docker-compose.prod.yml` is a complete, standalone file (not an override of
+the dev one):
+
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-No nginx/certbot in this repo — put a Cloudflare Tunnel (or your own reverse
-proxy) in front of the `api` container's port 8000 for TLS/domain routing.
+- `migrate` runs `alembic upgrade head` once; the API starts only after it
+  succeeded, so new code never runs against the old schema.
+- The database is not published to the host at all; the API listens on
+  `127.0.0.1:8000` for the host's reverse proxy (nginx).
+- Run one API process: the SSE broadcaster is in-memory. Scheduled jobs and
+  the webhook sweeper take Postgres advisory locks, so extra processes never
+  double-send — they would only split SSE subscribers.
 
-### First-deploy checklist
+### Required configuration (`.env`, never commit)
 
-1. **Secrets** (`.env`, never commit): `JWT_SECRET` (`openssl rand -hex 32`),
-   `FERNET_KEY` (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`),
-   strong `POSTGRES_PASSWORD`.
+The app refuses to start with a missing secret or with any value that has
+ever appeared in this repository. With `APP_ENV=production` it additionally
+requires `DEBUG=false`, `META_APP_SECRET`, `META_WEBHOOK_VERIFY_TOKEN`, and
+`TELEGRAM_WEBHOOK_SECRET` when a bot token is set.
+
+1. **Secrets**: `JWT_SECRET` (≥ 32 chars, `python -c "import secrets; print(secrets.token_urlsafe(48))"`),
+   `FERNET_KEY`, a strong `POSTGRES_PASSWORD`.
+   - Rotating `FERNET_KEY`: set `FERNET_KEY=<new>,<old>`, restart, run
+     `python rotate_fernet_key.py`, then set `FERNET_KEY=<new>`.
+   - Rotating `JWT_SECRET` signs every user out (they log in again).
 2. **Cloudflare R2**: bucket + S3 API token + a bound custom domain for public
-   image URLs (`R2_*` — don't use `*.r2.dev` in production).
-3. **OpenRouter**: `OPENROUTER_API_KEY` + `OPENROUTER_MODEL`.
+   image URLs (`R2_*`).
+3. **OpenRouter**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`; spend guards
+   `AI_DAILY_COST_LIMIT_USD`, `AI_MAX_TURNS_PER_CONVERSATION_PER_HOUR`.
 4. **Meta app**: Instagram Business Login (`instagram_business_basic` +
-   `instagram_business_manage_messages`, account linked to a Facebook Page).
-   `META_REDIRECT_URI=https://api.yourbusiness.com/integrations/instagram/callback`.
-   Register the webhook (Meta dashboard → Webhooks → `messages` field →
-   `https://api.yourbusiness.com/webhooks/instagram`, verify token =
-   `META_WEBHOOK_VERIFY_TOKEN`).
+   `instagram_business_manage_messages`). `META_REDIRECT_URI` points at
+   `/integrations/instagram/callback` on this API. Webhook: `messages` field →
+   `/webhooks/instagram`, verify token = `META_WEBHOOK_VERIFY_TOKEN`. Without
+   `META_APP_SECRET` every webhook is rejected (signatures can't be verified).
 5. **Telegram bot** via [@BotFather](https://t.me/BotFather):
    ```bash
    curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-     -d "url=https://api.yourbusiness.com/webhooks/telegram" \
+     -d "url=https://<api-host>/webhooks/telegram" \
      -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
    ```
-6. **CORS**: `CORS_ALLOW_ORIGINS` must include the deployed `client/` URL(s).
-7. **DB backups**: the `mivo_pgdata` volume is the source of truth — snapshot
-   it on whatever schedule your VPS provider supports (not automated here).
-8. **First superadmin**: there's no public signup — every business account is
-   created from the superadmin panel, and every superadmin after the first is
-   just an `UPDATE users SET is_superadmin = true`. Bootstrap the very first
-   one directly:
-   ```bash
-   .venv/bin/python create_superadmin.py you@yourcompany.com
-   ```
+6. **Web push**: `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` (`npx web-push generate-vapid-keys`); empty = push off.
+7. **Voice notes**: `STT_PROVIDER` (`openrouter` | `groq` | `openai` | empty).
+8. **DB backups**: the `mivo_pgdata` volume is the source of truth — snapshot it.
+9. **First superadmin**: `python create_superadmin.py you@yourcompany.com`
+   (every business account is then created from the superadmin panel).
 
 ## Day-2
 
-- Deploy: `git pull && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`
-- Logs: `docker compose logs -f api`
+- Deploy: `git pull && docker compose -f docker-compose.prod.yml up -d --build`
+- Logs: `docker compose -f docker-compose.prod.yml logs -f api`
+- Customer profiles now, instead of waiting for the scheduled backfill: `python sync_script.py`
