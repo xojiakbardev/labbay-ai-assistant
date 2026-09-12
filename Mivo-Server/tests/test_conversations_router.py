@@ -99,6 +99,9 @@ def test_conversation_appears_after_incoming_message(client, connected) -> None:
     headers, _meta = connected
     listed = client.get("/conversations", headers=headers).json()
     assert len(listed) == 1
+    # The list carries the last message for its preview line.
+    assert listed[0]["last_message"]["sender_type"] == "ai"
+    assert listed[0]["last_message"]["message_type"] == "text"
     detail = client.get(f"/conversations/{listed[0]['id']}", headers=headers).json()
     assert [m["sender_type"] for m in detail["messages"]] == ["customer", "ai"]
     assert detail["messages"][1]["delivery_status"] == "sent"

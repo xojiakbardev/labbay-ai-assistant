@@ -24,6 +24,16 @@ class MessageOut(BaseModel):
     created_at: dt.datetime
 
 
+class LastMessageOut(BaseModel):
+    """The conversation list's preview line."""
+
+    content: str
+    sender_type: str
+    message_type: str
+    attachment_type: str | None = None
+    created_at: dt.datetime
+
+
 class ConversationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -36,6 +46,7 @@ class ConversationOut(BaseModel):
     status: str
     last_message_at: dt.datetime | None
     created_at: dt.datetime
+    last_message: LastMessageOut | None = None
 
 
 class ConversationDetailOut(ConversationOut):

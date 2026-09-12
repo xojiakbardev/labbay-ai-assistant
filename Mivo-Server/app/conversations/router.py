@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.businesses.models import Business
@@ -10,7 +10,13 @@ from app.common.tenancy import get_current_business
 from app.conversations.delivery import DeliveryError, send_outbound
 from app.conversations.locks import conversation_lock
 from app.conversations.models import DELIVERY_PENDING, Conversation, Message
-from app.conversations.schemas import ConversationDetailOut, ConversationOut, ConversationStatus, MessageOut
+from app.conversations.schemas import (
+    ConversationDetailOut,
+    ConversationOut,
+    ConversationStatus,
+    LastMessageOut,
+    MessageOut,
+)
 from app.conversations.service import add_message
 from app.core.db import get_db
 from app.core.security import decrypt_secret
@@ -40,7 +46,10 @@ def _display_name(cust: Customer) -> str:
     return "Instagram foydalanuvchisi"
 
 
-def _out(conv: Conversation, cust: Customer) -> ConversationOut:
+_PREVIEW_CHARS = 120
+
+
+def _out(conv: Conversation, cust: Customer, last: LastMessageOut | None = None) -> ConversationOut:
     return ConversationOut(
         id=conv.id,
         customer_id=conv.customer_id,
@@ -51,6 +60,7 @@ def _out(conv: Conversation, cust: Customer) -> ConversationOut:
         status=conv.status,
         last_message_at=conv.last_message_at,
         created_at=conv.created_at,
+        last_message=last,
     )
 
 
@@ -74,17 +84,38 @@ async def list_conversations(
     business: Business = Depends(get_current_business),
     db: AsyncSession = Depends(get_db),
 ):
-    """Newest activity first, paginated. Profiles are looked up by the
-    message pipeline, never here — a page load must not wait on Meta."""
+    """Newest activity first, paginated, each with its last message for the
+    preview line. Profiles are looked up by the message pipeline, never
+    here — a page load must not wait on Meta."""
+    last = (
+        select(
+            func.left(Message.content, _PREVIEW_CHARS).label("content"),
+            Message.sender_type, Message.message_type, Message.attachment_type, Message.created_at,
+        )
+        .where(Message.conversation_id == Conversation.id)
+        .order_by(Message.created_at.desc())
+        .limit(1)
+        .lateral("last_message")
+    )
     result = await db.execute(
-        select(Conversation, Customer)
+        select(Conversation, Customer, last)
         .join(Customer, Conversation.customer_id == Customer.id)
+        .outerjoin(last, true())
         .where(Conversation.business_id == business.id)
         .order_by(Conversation.last_message_at.desc().nullslast(), Conversation.id)
         .limit(limit)
         .offset(offset)
     )
-    return [_out(conv, cust) for conv, cust in result.all()]
+    out = []
+    for row in result.all():
+        preview = None
+        if row.sender_type is not None:
+            preview = LastMessageOut(
+                content=row.content, sender_type=row.sender_type, message_type=row.message_type,
+                attachment_type=row.attachment_type, created_at=row.created_at,
+            )
+        out.append(_out(row.Conversation, row.Customer, preview))
+    return out
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetailOut)
