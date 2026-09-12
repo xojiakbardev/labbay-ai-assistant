@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.ai.context.builder import build_message_history
 from app.ai.provider.base import LLMProvider
-from app.conversations.models import Message
+from app.conversations.models import MESSAGE_TYPE_REACTION, Message
 
 logger = logging.getLogger("app.ai.closing")
 
@@ -32,16 +32,19 @@ class ClosingDecision(BaseModel):
     reasoning: str = Field(description="One short sentence: why the conversation is or isn't over.")
     conversation_finished: bool = Field(
         description=(
-            "True only if the customer's last message just closes the conversation (thanks, ok, "
-            "agreement, an emoji) and nothing in it needs an answer or moves the sale. False if "
-            "it answers a question you asked, asks something, or carries any new information."
+            "True only if the customer's last message is a friendly close — thanks, ok, "
+            "agreement, a positive emoji — after the conversation has already reached its end, "
+            "and nothing in it needs an answer. False if it answers a question the shop asked, "
+            "asks something, carries new information, or is negative in any way: backing out of "
+            "a purchase, changing their mind, hesitating, complaining or objecting."
         )
     )
     reaction: str | None = Field(
         default=None,
         description=(
-            "When finished: the one emoji a friendly shop assistant would react to their message "
-            "with (for example ❤️, 🔥, 👍, 🙏, 😊), or null to leave it without a reaction."
+            "When finished: the one emoji a friendly shop assistant would react with, matching "
+            "the tone of their message (for example ❤️ or 🙏 for thanks, 🔥 or 😊 for good news), "
+            "or null when no reaction fits."
         ),
     )
 
@@ -49,8 +52,15 @@ class ClosingDecision(BaseModel):
 _SYSTEM_PROMPT = """You watch an Instagram DM between a shop's sales assistant and a customer. \
 Decide whether the customer's latest message has ended the conversation, so that a reply would \
 only be noise — the way a person stops answering "ok" after the goodbye has been said — and, if \
-so, which emoji reaction to leave on their message. Anything that still needs an answer, even a \
-short "ha" to a question the assistant asked, means the conversation is NOT finished."""
+so, which emoji reaction to leave on their message.
+
+The conversation is NOT finished when:
+- the shop's last message asked something — even a one-word "ha" or "M" is an answer to it;
+- the customer backs out, changes their mind or hesitates ("olgim kelmay qoldi", "kerak emas", \
+"keyinroq", "передумал") — a salesperson answers that once, warmly;
+- the message carries a complaint, an objection, a question or anything new.
+
+A reaction has to fit the message's tone; when none clearly does, leave it null."""
 
 
 def may_be_closing(burst: list[Message], last_outbound: Message | None) -> bool:
@@ -79,8 +89,11 @@ def valid_reaction(value: str | None) -> str | None:
 
 
 def _transcript(messages: list[Message]) -> str:
+    # build_message_history drops our reactions; so must this, or the two
+    # lists fall out of step.
+    messages = [m for m in messages if getattr(m, "message_type", None) != MESSAGE_TYPE_REACTION]
     lines = []
-    for m, rendered in zip(messages, build_message_history(messages)):
+    for m, rendered in zip(messages, build_message_history(messages), strict=True):
         content = rendered["content"]
         if isinstance(content, list):
             content = next((part["text"] for part in content if part.get("type") == "text"), "")
@@ -90,7 +103,7 @@ def _transcript(messages: list[Message]) -> str:
 
 
 async def decide_closing(
-    provider: LLMProvider, recent: list[Message], *, business_id: uuid.UUID
+    provider: LLMProvider, recent: list[Message], *, business_id: uuid.UUID | None
 ) -> ClosingDecision:
     """Raises LLMProviderError when the model can't decide; the caller then
     answers normally."""

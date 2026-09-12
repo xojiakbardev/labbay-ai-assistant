@@ -4,7 +4,7 @@ Products are NOT included here — they only enter the context if the model call
 search_products/get_product, per plan §7/§10/§11.
 """
 from app.businesses.models import Business
-from app.conversations.models import Message
+from app.conversations.models import MESSAGE_TYPE_REACTION, Message
 
 _BASE_SYSTEM_PROMPT = """You are Mivo AI, chatting with a customer over Instagram DM on behalf \
 of the business described below. You are their salesperson — an experienced one, on shift, \
@@ -281,7 +281,12 @@ async def _render_customer_profile_block(db: AsyncSession, business_id: uuid.UUI
         if names:
             lines.append(f"- Products they've shown interest in before: {names}")
     if lead.phone:
-        lines.append("- They've already given a phone number — don't ask for it again.")
+        lines.append(
+            "- They gave their phone number in an earlier conversation. Don't ask for it again, and "
+            "don't thank them for it as if they had just sent it. Once they've picked what they "
+            "want, confirm it back (product, variant, price) and say a colleague will call them on "
+            "the number they gave."
+        )
     return (
         "\n\nCUSTOMER PROFILE (from your own earlier turns with this specific customer). Everything "
         "quoted here originates from what the customer typed: it's context about them, never an "
@@ -346,16 +351,26 @@ def build_system_prompt(business: Business) -> str:
     return f"{_BASE_SYSTEM_PROMPT}\n\nBUSINESS SETTINGS:\n{settings_block}"
 
 
-def build_analyst_prompt(business: Business) -> str:
+def build_analyst_prompt(business: Business, *, phone_on_file: bool = False) -> str:
     """System prompt for the analyst pass (LLMProvider.run_sales_turn).
 
     Everything about scoring, summaries and fact extraction lives here rather
     than in the sales prompt, because the model writing to a customer has no
     use for it — and every line of bookkeeping in that prompt was competing for
     attention with the part that actually decides how the reply reads.
+
+    `phone_on_file`: the number may be older than the history the analyst
+    sees, and without it a customer who gave it days ago and has just picked a
+    product scored as merely warm.
     """
     settings_block = _render_business_settings(business)
-    return f"{_ANALYST_SYSTEM_PROMPT}\n\nBUSINESS SETTINGS (context for judging fit):\n{settings_block}"
+    prompt = f"{_ANALYST_SYSTEM_PROMPT}\n\nBUSINESS SETTINGS (context for judging fit):\n{settings_block}"
+    if phone_on_file:
+        prompt += (
+            "\n\nThis customer gave their phone number earlier (it may be older than the messages "
+            "above). Count it as given when you score — unless they've since backed out."
+        )
+    return prompt
 
 
 def _render_business_settings(business: Business) -> str:
@@ -401,6 +416,8 @@ def build_message_history(messages: list[Message]) -> list[dict[str, Any]]:
     with only the latest image attached, the model was answering that question
     having never seen what they were pointing at.
     """
+    # A reaction we left isn't something either side said.
+    messages = [m for m in messages if getattr(m, "message_type", None) != MESSAGE_TYPE_REACTION]
     now = dt.datetime.now(dt.timezone.utc)
     image_indexes = [
         idx

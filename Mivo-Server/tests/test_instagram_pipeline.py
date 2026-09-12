@@ -858,12 +858,17 @@ async def test_closing_message_gets_a_reaction_not_a_reply(db_session, alerts) -
     assert provider.closing_calls == 1 and provider.calls == 0
     assert meta.reactions == [("cl-2", "🔥")]
     assert [s["text"] for s in meta.sent] == ["Rahmat! Hamkasbim tez orada bog'lanadi."]
+    # The dashboard shows the conversation was answered — with the reaction.
+    reaction = (await _messages(db_session, business.id, "c-close"))[-1]
+    assert (reaction.sender_type, reaction.message_type, reaction.content, reaction.delivery_status) == (
+        "ai", "reaction", "🔥", "sent"
+    )
     assert (await _event_row(db_session, "cl-2")).status == "processed"
     conversation = await db_session.scalar(
         select(Conversation).where(Conversation.business_id == business.id).execution_options(populate_existing=True)
     )
-    last = (await _messages(db_session, business.id, "c-close"))[-1]
-    assert conversation.last_answered_customer_message_at == last.created_at
+    last_customer = [m for m in await _messages(db_session, business.id, "c-close") if m.sender_type == "customer"][-1]
+    assert conversation.last_answered_customer_message_at == last_customer.created_at
 
 
 async def test_short_answer_the_model_says_needs_a_reply_is_answered(db_session, alerts) -> None:

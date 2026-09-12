@@ -13,7 +13,7 @@ import re
 from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ from app.ai.tools.executor import build_tool_executor
 from app.businesses.models import Business
 from app.conversations.models import DELIVERY_PENDING, Conversation, Message, is_untranscribed_voice_note
 from app.conversations.service import add_message, get_recent_messages
+from app.leads.models import Lead
 
 FALLBACK_REPLY = "Kechirasiz, hozircha javob bera olmadim — tez orada siz bilan bog'lanamiz."
 
@@ -305,6 +306,13 @@ async def run_turn(
     system_prompt = await build_system_prompt_with_learnings(
         db, business, conversation.customer_id, working_state=conversation.working_state
     )
+    phone_on_file = conversation.customer_id is not None and await db.scalar(
+        select(Lead.phone).where(
+            Lead.business_id == business.id,
+            Lead.customer_id == conversation.customer_id,
+            Lead.phone.is_not(None),
+        )
+    ) is not None
     messages = build_message_history(history)
     executor, escalation_state = build_tool_executor(db, business.id, conversation)
 
@@ -403,7 +411,7 @@ async def run_turn(
             tool_executor=executor,
             fused_schema=ConversationTurnResult,
             analysis_schema=TurnAnalysis,
-            analyst_system_prompt=build_analyst_prompt(business),
+            analyst_system_prompt=build_analyst_prompt(business, phone_on_file=phone_on_file),
             on_reply=_guard_persist_and_deliver,
             business_id=business.id,
         )

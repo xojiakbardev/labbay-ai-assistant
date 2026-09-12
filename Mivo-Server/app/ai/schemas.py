@@ -49,6 +49,7 @@ class SandboxMessageOut(BaseModel):
     id: uuid.UUID | str
     sender_type: str
     content: str
+    message_type: str = "text"
     attachment_url: str | None = None
     created_at: dt.datetime
 

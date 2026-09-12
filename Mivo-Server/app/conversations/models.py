@@ -19,6 +19,12 @@ DELIVERY_PENDING = "pending"
 DELIVERY_SENT = "sent"
 DELIVERY_FAILED = "failed"
 
+# A reaction we left on the customer's last message instead of replying
+# (app/ai/closing.py): its own row, content = the emoji, so the dashboard shows
+# the conversation was answered. Never part of the model's history, and not a
+# reply for the follow-up or the turn counters.
+MESSAGE_TYPE_REACTION = "reaction"
+
 # The stored text of a customer voice note nobody has transcribed yet.
 AUDIO_PLACEHOLDER = "[Ovozli xabar]"
 

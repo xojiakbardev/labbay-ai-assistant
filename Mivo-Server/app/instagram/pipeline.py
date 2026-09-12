@@ -45,7 +45,15 @@ from app.businesses.models import Business
 from app.businesses.service import ai_may_reply
 from app.conversations.delivery import DeliveryError, reconcile_echo, send_outbound, undelivered_reply
 from app.conversations.locks import conversation_lock
-from app.conversations.models import AUDIO_PLACEHOLDER, DELIVERY_PENDING, DELIVERY_SENT, Conversation, Message
+from app.conversations.models import (
+    AUDIO_PLACEHOLDER,
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+    DELIVERY_SENT,
+    MESSAGE_TYPE_REACTION,
+    Conversation,
+    Message,
+)
 from app.conversations.service import add_message, get_or_create_conversation, get_recent_messages
 from app.core.db import async_session_factory
 from app.core.security import decrypt_secret
@@ -563,17 +571,42 @@ async def _closes_the_conversation(db: AsyncSession, ctx: _Context, provider: LL
         return False
 
     ctx.conversation.last_answered_customer_message_at = ctx.message.created_at
-    await db.commit()
     emoji = valid_reaction(decision.reaction)
-    if emoji and ctx.message.external_message_id:
-        try:
-            await ctx.meta_client.send_reaction(
-                access_token=ctx.access_token, recipient_id=ctx.recipient_id,
-                message_id=ctx.message.external_message_id, emoji=emoji,
-            )
-        except MetaAPIError as exc:
-            # Only a courtesy: the conversation is closed either way.
-            logger.warning("[pipeline] reaction not sent in conversation %s: %s", ctx.conversation_id, exc)
+    if emoji is None or not ctx.message.external_message_id:
+        await db.commit()
+        logger.info("[pipeline] conversation %s closed by the customer; no reaction", ctx.conversation_id)
+        return True
+
+    # Recorded before it's sent, like every outbound message, so the owner
+    # sees the conversation was answered (and whether the reaction got out).
+    reaction = await add_message(
+        db, ctx.conversation, sender_type="ai", content=emoji,
+        message_type=MESSAGE_TYPE_REACTION, delivery_status=DELIVERY_PENDING,
+    )
+    await db.commit()
+    try:
+        await ctx.meta_client.send_reaction(
+            access_token=ctx.access_token, recipient_id=ctx.recipient_id,
+            message_id=ctx.message.external_message_id, emoji=emoji,
+        )
+        reaction.delivery_status = DELIVERY_SENT
+    except MetaAPIError as exc:
+        # Only a courtesy: the conversation is closed either way. The row
+        # shows the owner it didn't go out.
+        logger.warning("[pipeline] reaction not sent in conversation %s: %s", ctx.conversation_id, exc)
+        reaction.delivery_status = DELIVERY_FAILED
+        reaction.delivery_error = str(exc)[:500]
+    await db.commit()
+    await broadcaster.broadcast(
+        ctx.business_id,
+        {
+            "type": "conversation_updated",
+            "conversation_id": str(ctx.conversation_id),
+            "customer_id": str(ctx.customer_id),
+            "last_message": emoji,
+            "sender_type": "ai",
+        },
+    )
     logger.info("[pipeline] conversation %s closed by the customer; reaction %s", ctx.conversation_id, emoji)
     return True
 

@@ -150,3 +150,15 @@ def test_unanswered_burst() -> None:
 )
 def test_valid_reaction(value, expected) -> None:
     assert valid_reaction(value) == expected
+
+
+def test_closing_transcript_skips_our_reactions() -> None:
+    from app.ai.closing import _transcript
+
+    text = _transcript([
+        _msg(sender="ai", content="Rahmat! Hamkasbim bog'lanadi."),
+        _msg(content="hop"),
+        _msg(sender="ai", content="🔥", message_type="reaction"),
+        _msg(content="ok"),
+    ])
+    assert text == "Shop: Rahmat! Hamkasbim bog'lanadi.\nCustomer: hop\nCustomer: ok"

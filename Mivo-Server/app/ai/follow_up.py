@@ -23,7 +23,7 @@ from app.businesses.models import Business
 from app.businesses.service import ai_may_reply
 from app.conversations.delivery import DeliveryError, send_outbound
 from app.conversations.locks import conversation_lock
-from app.conversations.models import DELIVERY_PENDING, Conversation, Message
+from app.conversations.models import DELIVERY_PENDING, MESSAGE_TYPE_REACTION, Conversation, Message
 from app.conversations.service import add_message, get_recent_messages
 from app.core.security import decrypt_secret
 from app.customers.models import Customer
@@ -68,7 +68,7 @@ def _last_customer_message_at():
 def _last_sender_type():
     return (
         select(Message.sender_type)
-        .where(Message.conversation_id == Conversation.id)
+        .where(Message.conversation_id == Conversation.id, Message.message_type != MESSAGE_TYPE_REACTION)
         .order_by(Message.created_at.desc())
         .limit(1)
         .correlate(Conversation)
@@ -131,7 +131,10 @@ async def _follow_up_one(db: AsyncSession, conversation_id: uuid.UUID, client: M
 
         # Re-checked under the lock: the customer may have written, or another
         # sweep may have followed up, since the candidate query ran.
-        recent = await get_recent_messages(db, conversation.id, limit=6)
+        recent = [
+            m for m in await get_recent_messages(db, conversation.id, limit=8)
+            if m.message_type != MESSAGE_TYPE_REACTION
+        ]
         if not recent or recent[-1].sender_type != "ai":
             return False
         last_customer = await db.scalar(

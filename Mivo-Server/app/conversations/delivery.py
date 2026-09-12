@@ -19,7 +19,14 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.conversations.models import DELIVERY_FAILED, DELIVERY_PENDING, DELIVERY_SENT, Conversation, Message
+from app.conversations.models import (
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+    DELIVERY_SENT,
+    MESSAGE_TYPE_REACTION,
+    Conversation,
+    Message,
+)
 from app.instagram.client import MetaAPIError, MetaClient
 
 logger = logging.getLogger("app.conversations.delivery")
@@ -139,6 +146,7 @@ async def reconcile_echo(
                 Message.conversation_id == conversation.id,
                 Message.sender_type.in_(("ai", "human")),
                 Message.external_message_id.is_(None),
+                Message.message_type != MESSAGE_TYPE_REACTION,
                 Message.created_at >= since,
                 Message.delivery_status.in_((DELIVERY_PENDING, DELIVERY_FAILED, DELIVERY_SENT)),
             )

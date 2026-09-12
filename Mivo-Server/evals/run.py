@@ -5,6 +5,7 @@
     python -m evals.run --no-judge          # deterministic checks only (free)
     python -m evals.run --json out.json     # machine-readable, for comparing runs
     python -m evals.run metrics             # production quality metrics, read-only
+    python -m evals.run closing             # the is-the-conversation-over decision, no DB needed
 
 Needs a database and OPENROUTER_API_KEY: this drives the real conversation
 engine, the real catalog search and the real model. It creates a throwaway
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from sqlalchemy import delete, func, select
 
 import app.core.models_registry  # noqa: F401  (populate Base.metadata)
+from app.ai.closing import decide_closing, valid_reaction
 from app.ai.context.builder import unseen_shared_media
 from app.ai.orchestrator import handle_customer_message
 from app.ai.provider.factory import get_llm_provider
@@ -35,6 +37,7 @@ from app.leads.models import Lead
 from app.products.models import Product, ProductVariant
 from app.products.search_normalize import normalize_for_search
 from evals.checks import CheckContext, run_checks, summarise
+from evals.closing_cases import CLOSING_CASES
 from evals.judge import judge_turn
 from evals.scenarios import SCENARIOS, Scenario, by_key
 
@@ -269,10 +272,37 @@ async def show_metrics() -> None:
         print("to a conversion number this system has.")
 
 
+async def run_closing_cases() -> int:
+    """The closing decision (app/ai/closing.py) against the real model: no DB,
+    no judge — each case either got the right answer or it didn't."""
+    provider = get_llm_provider()
+    wrong = 0
+    for case in CLOSING_CASES:
+        transcript = [
+            SimpleNamespace(
+                sender_type="customer" if who == "customer" else "ai", content=text,
+                attachment_type=None, attachment_url=None, message_type="text", created_at=None,
+            )
+            for who, text in case.turns
+        ]
+        decision = await decide_closing(provider, transcript, business_id=None)
+        ok = decision.conversation_finished == case.finished
+        wrong += not ok
+        print(
+            f"[{'PASS' if ok else 'FAIL'}]  {case.key}: finished={decision.conversation_finished} "
+            f"(expected {case.finished}) reaction={valid_reaction(decision.reaction)}  — {decision.reasoning}"
+        )
+    print()
+    print(f"{len(CLOSING_CASES) - wrong}/{len(CLOSING_CASES)} closing decisions right")
+    return 0 if wrong == 0 else 1
+
+
 async def main_async(args) -> int:
     if args.command == "metrics":
         await show_metrics()
         return 0
+    if args.command == "closing":
+        return await run_closing_cases()
 
     scenarios = [by_key(k) for k in args.only] if args.only else SCENARIOS
     provider = get_llm_provider()
@@ -296,7 +326,7 @@ async def main_async(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", nargs="?", default="run", choices=["run", "metrics"])
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "metrics", "closing"])
     parser.add_argument("--only", nargs="+", metavar="KEY", help="run only these scenarios")
     parser.add_argument("--no-judge", action="store_true", help="deterministic checks only (no LLM judge calls)")
     parser.add_argument("--json", metavar="PATH", help="also write results as JSON, to compare runs")

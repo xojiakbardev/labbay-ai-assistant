@@ -26,7 +26,7 @@ from app.ai.schemas import (
 )
 from app.businesses.models import Business
 from app.common.tenancy import get_current_business
-from app.conversations.models import Conversation, Message
+from app.conversations.models import MESSAGE_TYPE_REACTION, Conversation, Message
 from app.conversations.service import add_message, get_recent_messages
 from app.core.config import get_settings
 from app.core.db import get_db
@@ -197,6 +197,7 @@ async def get_sandbox_state(
         SandboxMessageOut(
             id=m.id,
             sender_type=m.sender_type,
+            message_type=m.message_type,
             content=m.content,
             attachment_url=getattr(m, "attachment_url", None),
             created_at=m.created_at,
@@ -257,6 +258,11 @@ async def post_sandbox_message(
             decision = None
         if decision is not None and decision.conversation_finished:
             await add_message(db, conversation, sender_type="customer", content=body.content)
+            reaction = valid_reaction(decision.reaction)
+            if reaction:
+                await add_message(
+                    db, conversation, sender_type="ai", content=reaction, message_type=MESSAGE_TYPE_REACTION
+                )
             messages_raw = await get_recent_messages(db, conversation.id, limit=50)
             await db.commit()
             return SandboxTurnResponse(
@@ -268,13 +274,13 @@ async def post_sandbox_message(
                 known_facts=lead.known_facts if lead and lead.known_facts else [],
                 messages=[
                     SandboxMessageOut(
-                        id=m.id, sender_type=m.sender_type, content=m.content,
+                        id=m.id, sender_type=m.sender_type, message_type=m.message_type, content=m.content,
                         attachment_url=getattr(m, "attachment_url", None), created_at=m.created_at,
                     )
                     for m in messages_raw
                 ],
                 conversation_closed=True,
-                reaction=valid_reaction(decision.reaction),
+                reaction=reaction,
             )
 
     escalation_state: dict[str, Any] = {}
@@ -339,6 +345,7 @@ async def post_sandbox_message(
         SandboxMessageOut(
             id=m.id,
             sender_type=m.sender_type,
+            message_type=m.message_type,
             content=m.content,
             attachment_url=getattr(m, "attachment_url", None),
             created_at=m.created_at,
