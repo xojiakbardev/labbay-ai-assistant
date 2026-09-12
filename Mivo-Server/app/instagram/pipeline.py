@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai import limits
 from app.ai.audio import TranscriptionError, transcribe_audio_url
 from app.ai.closing import decide_closing, may_be_closing, unanswered_burst, valid_reaction
-from app.ai.orchestrator import detect_preferred_language, run_turn
+from app.ai.orchestrator import ReplySuperseded, detect_preferred_language, run_turn
 from app.ai.provider.base import LLMProvider, LLMProviderError
 from app.ai.replies import reply_text
 from app.businesses.models import Business
@@ -55,8 +55,14 @@ from app.webhooks.models import (
 logger = logging.getLogger("app.instagram.pipeline")
 
 _settings = get_settings()
-# Wait this long after a customer message so one reply covers a burst.
+# Waiting for the customer's next message so one reply covers a burst — see
+# _debounce_seconds and ReplySuperseded.
 DEBOUNCE_SECONDS = _settings.reply_debounce_seconds
+FRAGMENT_DEBOUNCE_SECONDS = _settings.reply_fragment_debounce_seconds
+DEBOUNCE_MAX_SECONDS = _settings.reply_debounce_max_seconds
+SUPERSEDE_MAX_AGE_SECONDS = _settings.reply_supersede_max_age_seconds
+_FRAGMENT_MAX_WORDS = _settings.reply_fragment_max_words
+SENDER_ACTIONS = _settings.instagram_sender_actions
 # A claimed event whose worker died is taken over after the lease.
 LEASE = dt.timedelta(minutes=_settings.webhook_lease_minutes)
 MAX_ATTEMPTS = _settings.webhook_max_attempts
@@ -521,9 +527,12 @@ async def _process_customer_message(
 
     # Debounce: if they're still typing, the newest message's event replies.
     # The connection and the slot are given back while waiting.
+    burst_started_at = await _burst_started_at(db, conversation, message)
     await db.commit()
-    if DEBOUNCE_SECONDS > 0:
-        await slot.sleep(DEBOUNCE_SECONDS)
+    _sender_action(ctx, "mark_seen")
+    wait = _debounce_seconds(message, burst_started_at, dt.datetime.now(dt.timezone.utc))
+    if wait > 0:
+        await slot.sleep(wait)
     if await _newer_customer_message_exists(db, conversation, message):
         return
     # End the transaction before waiting: a waiter should hold one pooled
@@ -572,7 +581,58 @@ async def _process_customer_message(
 
         if await _closes_the_conversation(db, ctx, resolved):
             return
-        await _run_ai_turn(db, ctx, resolved)
+        _sender_action(ctx, "typing_on")
+        await _run_ai_turn(db, ctx, resolved, burst_started_at)
+
+
+async def _burst_started_at(db: AsyncSession, conversation: Conversation, message: Message) -> dt.datetime:
+    """When the customer's unanswered messages began."""
+    burst, _ = unanswered_burst(await get_recent_messages(db, conversation.id, limit=12))
+    return burst[0].created_at if burst else message.created_at
+
+
+def _looks_unfinished(message: Message) -> bool:
+    """A greeting, a word or two, a photo or a shared post on its own —
+    usually followed by the actual question. A voice note is a whole thought."""
+    text = (message.content or "").strip()
+    if message.attachment_type == "audio":
+        return False
+    if message.attachment_type and not text:
+        return True
+    if message.attachment_type in _CAPTIONED:
+        return True  # the caption is the post's, not the customer's
+    return "?" not in text and len(text.split()) <= _FRAGMENT_MAX_WORDS
+
+
+def _debounce_seconds(message: Message, burst_started_at: dt.datetime, now: dt.datetime) -> float:
+    """How long to wait for the customer's next message: longer after a
+    fragment than after a complete question, and never past
+    DEBOUNCE_MAX_SECONDS from the first message of the burst."""
+    wait = FRAGMENT_DEBOUNCE_SECONDS if _looks_unfinished(message) else DEBOUNCE_SECONDS
+    left = DEBOUNCE_MAX_SECONDS - (now - burst_started_at).total_seconds()
+    return max(0.0, min(wait, left))
+
+
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+def _sender_action(ctx: _Context, action: str) -> None:
+    """Sent in the background: it's a courtesy, and must never delay or fail
+    the reply."""
+    if not SENDER_ACTIONS:
+        return
+
+    async def send() -> None:
+        try:
+            await ctx.meta_client.send_sender_action(
+                access_token=ctx.access_token, recipient_id=ctx.recipient_id, action=action
+            )
+        except MetaAPIError as exc:
+            logger.info("[pipeline] %s not sent in conversation %s: %s", action, ctx.conversation_id, exc)
+
+    task = asyncio.create_task(send())
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
 
 
 async def _closes_the_conversation(db: AsyncSession, ctx: _Context, provider: LLMProvider) -> bool:
@@ -704,13 +764,28 @@ async def _hand_off(db: AsyncSession, ctx: _Context, *, alert_type: str, title: 
     await ctx.send_new(db, reply_text(ctx.business, "handoff", _language(ctx.business, recent)))
 
 
-async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider) -> None:
+async def _run_ai_turn(db: AsyncSession, ctx: _Context, provider: LLMProvider, burst_started_at: dt.datetime) -> None:
+    async def still_current() -> bool:
+        # A young burst is rewritten whole; past that age the customer has
+        # waited long enough and gets this reply now.
+        age = (dt.datetime.now(dt.timezone.utc) - burst_started_at).total_seconds()
+        return age > SUPERSEDE_MAX_AGE_SECONDS or not await _newer_customer_message_exists(
+            db, ctx.conversation, ctx.message
+        )
+
     turn_state: dict = {}
     try:
         result = await run_turn(
             db, provider, ctx.business, ctx.conversation,
             escalation_state_out=turn_state, deliver=lambda messages: ctx.send(db, messages), outbound=True,
+            still_current=still_current,
         )
+    except ReplySuperseded:
+        # Nothing was recorded or sent. The newer message's event, waiting
+        # on this lock, answers the whole burst.
+        await db.rollback()
+        logger.info("[pipeline] conversation %s: customer wrote again, reply rewritten", ctx.conversation_id)
+        return
     except Exception:
         # If the reply (with its "an operator will contact you") was already
         # recorded, the retry will find this message answered and stop — so

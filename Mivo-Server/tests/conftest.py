@@ -63,6 +63,16 @@ def sign_webhook(payload: dict) -> tuple[bytes, dict]:
 
 
 @pytest.fixture(autouse=True)
+def _no_reply_waits(monkeypatch):
+    """No debounce and no "seen"/"typing" calls unless a test asks for them."""
+    from app.instagram import pipeline
+
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(pipeline, "SENDER_ACTIONS", False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_login_throttle():
     auth_service.login_throttle.reset()
     yield

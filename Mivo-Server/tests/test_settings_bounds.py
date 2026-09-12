@@ -30,6 +30,7 @@ def test_defaults_are_consistent() -> None:
         {"webhook_retry_backoff_seconds": []},
         {"webhook_retry_backoff_seconds": [30, -1]},
         {"reply_debounce_seconds": -1},
+        {"reply_debounce_max_seconds": 5},
         {"guard_price_tolerance": 0.5},
         {"llm_writer_temperature": 3},
         {"essential_slots": ["use_case", "shoe_size"]},

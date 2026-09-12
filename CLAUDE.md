@@ -143,8 +143,13 @@ rejected), then `app/instagram/pipeline.py` does the rest in two halves:
      not `ai_suspended`, not deleted, subscription active) and conversation status
      `ai_active`/`active`. Otherwise a phone number is still captured
      (`capture_phone_without_ai_turn`) and, during a handoff, acknowledged.
-  2. Debounce `DEBOUNCE_SECONDS`; bail if a newer customer message exists; commit
-     (a waiter holds one pooled connection, not two).
+  2. `mark_seen`, then debounce (`_debounce_seconds`: Instagram doesn't say when
+     someone is typing, so a fragment — "salom", a photo or share on its own —
+     waits `FRAGMENT_DEBOUNCE_SECONDS`, a complete question `DEBOUNCE_SECONDS`,
+     never past `DEBOUNCE_MAX_SECONDS` from the burst's first message; in prod data
+     bursts were ~5–20 s apart). Bail if a newer customer message exists; commit
+     (a waiter holds one pooled connection, not two). Sender actions go out in the
+     background and never fail the turn; tests turn them and the waits off.
   3. **`conversation_lock`** (`app/conversations/locks.py`, a Postgres advisory
      lock on its own AUTOCOMMIT connection): everything that sends to a customer
      runs under it, so turns never overlap.
@@ -157,7 +162,11 @@ rejected), then `app/instagram/pipeline.py` does the rest in two halves:
      limit → handoff + owner alert), and resolve the LLM provider — the router
      passes a factory, so a misconfigured provider hands off instead of failing
      the webhook.
-  6. `run_turn(..., outbound=True)`: reply parts are persisted as `pending`
+  6. `typing_on`, then `run_turn(..., outbound=True, still_current=...)`. If the
+     customer wrote again while the reply was being written (and the burst is
+     younger than `SUPERSEDE_MAX_AGE_SECONDS`), it raises `ReplySuperseded` before
+     anything is recorded; the event ends and the newer message's event, waiting on
+     the lock, answers the whole burst. Otherwise reply parts are persisted as `pending`
      outbox rows **and** `last_answered_customer_message_at` is set in the same
      commit, then `send_outbound` marks them `sent`/`failed`. A delivery error is
      returned in `escalation_state["delivery_error"]`; the pipeline does the lead

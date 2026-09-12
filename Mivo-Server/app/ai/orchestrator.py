@@ -251,6 +251,11 @@ def merge_known_facts(
     return merged
 
 
+class ReplySuperseded(Exception):
+    """The customer wrote again while the reply was being written: nothing was
+    recorded or sent, and the newer message gets the reply."""
+
+
 async def run_turn(
     db: AsyncSession,
     provider: LLMProvider,
@@ -259,6 +264,7 @@ async def run_turn(
     escalation_state_out: dict | None = None,
     deliver: Callable[[list[Message]], Awaitable[None]] | None = None,
     outbound: bool = False,
+    still_current: Callable[[], Awaitable[bool]] | None = None,
 ) -> ConversationTurnResult:
     """Runs one agentic LLM turn against whatever's already persisted in the
     conversation's message history, and persists the AI's reply. Does NOT
@@ -290,6 +296,9 @@ async def run_turn(
     records the reply, the conversation notes the newest customer message this
     turn saw — a retried event uses it to tell "already answered" from "still
     owed an answer".
+
+    `still_current`, when given, is asked just before the reply is recorded;
+    False raises ReplySuperseded instead.
     """
     history = await get_recent_messages(db, conversation.id)
     # The newest customer message this turn answers. A voice note that landed
@@ -352,6 +361,8 @@ async def run_turn(
         analysis has no say in it.
         """
         nonlocal delivered_reply, flagged_for_review
+        if still_current is not None and not await still_current():
+            raise ReplySuperseded
 
         safe_reply, flagged_for_review = _apply_reply_guards(
             reply_text,

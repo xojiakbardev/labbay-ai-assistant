@@ -94,15 +94,22 @@ def _result(reply="Salom! Yordam bera olamanmi?", **kw) -> ConversationTurnResul
 
 
 class FakeMetaClient:
-    def __init__(self, fail_times: int = 0, *, permanent: bool = False):
+    def __init__(self, fail_times: int = 0, *, permanent: bool = False, actions_fail: bool = False):
         self.sent: list[dict] = []
         self.sent_images: list[str] = []
         self.reactions: list[tuple[str, str]] = []
+        self.actions: list[str] = []
         self._fail_times = fail_times
         self._permanent = permanent
+        self._actions_fail = actions_fail
 
     async def send_reaction(self, *, access_token, recipient_id, message_id, emoji):
         self.reactions.append((message_id, emoji))
+
+    async def send_sender_action(self, *, access_token, recipient_id, action):
+        if self._actions_fail:
+            raise MetaAPIError("sender actions not allowed")
+        self.actions.append(action)
 
     def _maybe_fail(self):
         if self._fail_times:
@@ -466,6 +473,7 @@ async def test_unconfigured_llm_provider_still_records_and_hands_off(db_session,
 
 async def test_burst_of_rapid_messages_gets_one_combined_reply(db_session, alerts, monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0.3)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 0.3)
     business, _ = await _seed(db_session)
     provider, meta = FakeProvider(_result("ok")), FakeMetaClient()
 
@@ -485,7 +493,7 @@ async def test_burst_of_rapid_messages_gets_one_combined_reply(db_session, alert
 async def test_debounce_gives_the_processing_slot_back(db_session, alerts, monkeypatch) -> None:
     """With one slot, a second customer's turn runs while the first customer's
     event is still in its debounce wait."""
-    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0.5)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 0.5)
     monkeypatch.setattr(pipeline, "_PROCESS_SLOTS", asyncio.Semaphore(1))
     await _seed(db_session)
     meta = FakeMetaClient()
@@ -493,7 +501,7 @@ async def test_debounce_gives_the_processing_slot_back(db_session, alerts, monke
     waiting_id = await pipeline.ingest_event(db_session, _event("slot-1", "Salom", customer="slot-a"))
     waiting = asyncio.create_task(pipeline.process_event(waiting_id, provider=FakeProvider(_result("A")), meta_client=meta))
     await asyncio.sleep(0.05)
-    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 0)
     other_id = await pipeline.ingest_event(db_session, _event("slot-2", "Salom", customer="slot-b"))
     await asyncio.wait_for(pipeline.process_event(other_id, provider=FakeProvider(_result("B")), meta_client=meta), 0.3)
 
@@ -504,7 +512,7 @@ async def test_debounce_gives_the_processing_slot_back(db_session, alerts, monke
 
 
 async def test_shutdown_hands_interrupted_events_back(db_session, alerts, monkeypatch) -> None:
-    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 5)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 5)
     await _seed(db_session)
     event_id = await pipeline.ingest_event(db_session, _event("cut-1", "Salom", customer="cut"))
     task = asyncio.create_task(pipeline.process_event(event_id, provider=FakeProvider(_result()), meta_client=FakeMetaClient()))
@@ -521,26 +529,100 @@ async def test_shutdown_hands_interrupted_events_back(db_session, alerts, monkey
     assert pipeline._IN_FLIGHT == set()
 
 
-async def test_message_during_a_running_turn_waits_and_gets_its_own_reply(db_session, alerts) -> None:
-    """Regression: a message that arrived while the previous turn was still in
-    the LLM started a parallel turn. Now the second waits for the first, then
-    answers with the first reply already in its history."""
-    business, _ = await _seed(db_session)
+async def _message_during_a_running_turn(db_session, customer: str):
     slow = FakeProvider(_result("Birinchi"), delay=0.4)
     meta = FakeMetaClient()
-
-    first_id = await pipeline.ingest_event(db_session, _event("par-1", "Salom", customer="par"))
+    first_id = await pipeline.ingest_event(db_session, _event(f"{customer}-1", "Salom", customer=customer))
     first = asyncio.create_task(pipeline.process_event(first_id, provider=slow, meta_client=meta))
     await asyncio.sleep(0.15)  # turn 1 is inside the LLM call
     second_provider = FakeProvider(_result("Ikkinchi"))
-    await _deliver(db_session, second_provider, meta, "par-2", "narxi qancha?", customer="par")
+    await _deliver(db_session, second_provider, meta, f"{customer}-2", "narxi qancha?", customer=customer)
     await first
+    return meta, second_provider
+
+
+async def test_reply_written_while_the_customer_wrote_again_is_rewritten(db_session, alerts) -> None:
+    """The draft for "Salom" is dropped once "narxi qancha?" arrives: the
+    customer gets one reply to both, not one each."""
+    await _seed(db_session)
+    meta, second_provider = await _message_during_a_running_turn(db_session, "sup")
+
+    assert [s["text"] for s in meta.sent] == ["Ikkinchi"]
+    assert [m["content"] for m in second_provider.seen_messages[0]] == ["Salom", "narxi qancha?"]
+    assert (await _event_row(db_session, "sup-1")).status == "processed"
+
+
+async def test_an_old_burst_gets_its_reply_even_if_the_customer_wrote_again(db_session, alerts, monkeypatch) -> None:
+    """Past the supersede age the customer has waited long enough: the first
+    reply goes out, and the new message gets its own."""
+    monkeypatch.setattr(pipeline, "SUPERSEDE_MAX_AGE_SECONDS", 0)
+    await _seed(db_session)
+    meta, second_provider = await _message_during_a_running_turn(db_session, "par")
 
     assert [s["text"] for s in meta.sent] == ["Birinchi", "Ikkinchi"]
     # Chronological, as the customer saw it: their second message landed
     # while the first reply was still being written.
     history = second_provider.seen_messages[0]
     assert [m["content"] for m in history] == ["Salom", "narxi qancha?", "Birinchi"]
+
+
+@pytest.mark.parametrize(
+    ("content", "attachment", "expected"),
+    [
+        ("Salom", None, 8.0),
+        ("42 razmer", None, 8.0),
+        ("Narxi qancha?", None, 3.0),
+        ("Menga qora rangli krossovka kerak edi", None, 3.0),
+        ("", "image", 8.0),
+        ("Yangi kolleksiya", "ig_reel", 8.0),
+        ("[Ovozli xabar]", "audio", 3.0),
+    ],
+)
+def test_fragments_wait_longer_than_questions(monkeypatch, content, attachment, expected) -> None:
+    monkeypatch.setattr(pipeline, "DEBOUNCE_SECONDS", 3.0)
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 8.0)
+    now = dt.datetime.now(dt.timezone.utc)
+    message = Message(content=content, attachment_type=attachment, sender_type="customer")
+    assert pipeline._debounce_seconds(message, now, now) == expected
+
+
+def test_the_wait_never_runs_past_the_cap_from_the_first_message(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "FRAGMENT_DEBOUNCE_SECONDS", 8.0)
+    monkeypatch.setattr(pipeline, "DEBOUNCE_MAX_SECONDS", 15.0)
+    now = dt.datetime.now(dt.timezone.utc)
+    message = Message(content="aka", sender_type="customer")
+    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=12), now) == pytest.approx(3.0)
+    assert pipeline._debounce_seconds(message, now - dt.timedelta(seconds=40), now) == 0.0
+
+
+async def test_seen_then_typing_while_the_ai_answers(db_session, alerts, monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "SENDER_ACTIONS", True)
+    await _seed(db_session)
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("Salom!")), meta, "sa-1", "Salom", customer="c-sa")
+    await asyncio.gather(*pipeline._BACKGROUND)
+    assert meta.actions == ["mark_seen", "typing_on"]
+
+    # A refused sender action changes nothing about the reply.
+    failing = FakeMetaClient(actions_fail=True)
+    await _deliver(db_session, FakeProvider(_result("Bor")), failing, "sa-2", "42 bormi?", customer="c-sa")
+    await asyncio.gather(*pipeline._BACKGROUND)
+    assert [s["text"] for s in failing.sent] == ["Bor"]
+
+
+async def test_no_seen_or_typing_while_a_person_handles_the_chat(db_session, alerts, monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "SENDER_ACTIONS", True)
+    business, _ = await _seed(db_session)
+    await _deliver(db_session, FakeProvider(_result()), FakeMetaClient(), "hm-0", "Salom", customer="c-hm")
+    await db_session.execute(
+        update(Conversation).where(Conversation.business_id == business.id).values(status="human_active")
+    )
+    await db_session.commit()
+
+    meta = FakeMetaClient()
+    await _deliver(db_session, FakeProvider(_result("x")), meta, "hm-1", "narxi?", customer="c-hm")
+    await asyncio.gather(*pipeline._BACKGROUND)
+    assert meta.actions == [] and meta.sent == []
 
 
 # --- echoes -------------------------------------------------------------------------------

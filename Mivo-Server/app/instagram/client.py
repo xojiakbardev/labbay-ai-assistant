@@ -259,6 +259,13 @@ class MetaClient:
             "reaksiya qoldirish",
         )
 
+    async def send_sender_action(self, *, access_token: str, recipient_id: str, action: str) -> None:
+        """"mark_seen" or "typing_on": what a person on the other end would
+        show while reading and writing."""
+        await self._post_message(
+            access_token, {"recipient": {"id": recipient_id}, "sender_action": action}, action
+        )
+
     async def get_user_profile(self, user_id: str, access_token: str) -> dict:
         """Profile (username, name) for a customer's IGSID. Raises
         MetaAPIError when Meta won't return it (privacy settings, deleted

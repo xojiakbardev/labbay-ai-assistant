@@ -161,7 +161,17 @@ class Settings(BaseSettings):
     ai_max_turns_per_conversation_per_hour: PositiveInt = 20
 
     # Conversation tuning.
-    reply_debounce_seconds: NonNegativeFloat = 1.5
+    # Waiting for the customer's next message (Instagram doesn't say they're
+    # typing): short after a complete question, longer after a fragment
+    # ("salom", a photo on its own), never past the max from the burst's
+    # first message. A reply written while they wrote again is dropped and
+    # rewritten for the whole burst, unless the burst is older than the
+    # supersede age.
+    reply_debounce_seconds: NonNegativeFloat = 3.0
+    reply_fragment_debounce_seconds: NonNegativeFloat = 8.0
+    reply_debounce_max_seconds: NonNegativeFloat = 15.0
+    reply_fragment_max_words: PositiveInt = 3
+    reply_supersede_max_age_seconds: NonNegativeFloat = 45.0
     reply_part_delay_seconds: NonNegativeFloat = 0.9
     history_limit: PositiveInt = 20
     max_multimodal_images: NonNegativeInt = 2
@@ -252,6 +262,8 @@ class Settings(BaseSettings):
 
     # Instagram, Telegram, push.
     instagram_graph_version: str = "v21.0"
+    # "Seen" when the AI takes a message, "typing…" while it writes.
+    instagram_sender_actions: bool = True
     instagram_oauth_state_ttl_minutes: PositiveInt = 15
     instagram_token_refresh_window_days: PositiveInt = 10
     instagram_token_min_age_hours: PositiveInt = 24
@@ -334,11 +346,16 @@ class Settings(BaseSettings):
     def _refuse_contradictory_tuning(self) -> "Settings":
         """Each value can be fine alone and still break the app together."""
         problems: list[str] = []
-        if self.webhook_lease_minutes * 60 <= self.conversation_lock_wait_seconds + self.llm_turn_deadline_seconds:
+        event_seconds = (
+            self.reply_debounce_max_seconds + self.conversation_lock_wait_seconds + self.llm_turn_deadline_seconds
+        )
+        if self.webhook_lease_minutes * 60 <= event_seconds:
             problems.append(
-                "WEBHOOK_LEASE_MINUTES must outlast CONVERSATION_LOCK_WAIT_SECONDS + LLM_TURN_DEADLINE_SECONDS, "
-                "or a live turn is taken over by a second worker"
+                "WEBHOOK_LEASE_MINUTES must outlast REPLY_DEBOUNCE_MAX_SECONDS + CONVERSATION_LOCK_WAIT_SECONDS "
+                "+ LLM_TURN_DEADLINE_SECONDS, or a live turn is taken over by a second worker"
             )
+        if self.reply_debounce_max_seconds < max(self.reply_debounce_seconds, self.reply_fragment_debounce_seconds):
+            problems.append("REPLY_DEBOUNCE_MAX_SECONDS must be at least the other debounce waits")
         if self.lead_cold_max_score >= self.lead_warm_max_score:
             problems.append("LEAD_COLD_MAX_SCORE must be below LEAD_WARM_MAX_SCORE")
         if self.reply_split_min_part_chars > self.reply_split_min_total_chars:
